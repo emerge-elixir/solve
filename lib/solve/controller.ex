@@ -1,6 +1,6 @@
-defmodule Bonseki.Controller do
+defmodule Solve.Controller do
   @moduledoc """
-  A behavior and macro for defining Bonseki controllers.
+  A behavior and macro for defining Solve controllers.
 
   Controllers are GenServers that manage state, handle events, and communicate
   directly with their dependents (UIs and other controllers). They maintain a
@@ -18,16 +18,20 @@ defmodule Bonseki.Controller do
   ## Direct Communication
 
   Controllers communicate directly with:
-  - **UIs**: Send `{:bonseki_update, assign_name, controller_name, state}` messages
+  - **UIs**: Send `{:solve_update, assign_name, controller_name, state}` messages
   - **Dependent Controllers**: Send `:refresh_dependencies` cast messages
 
   ## Example
 
       defmodule MyApp.CounterController do
-        use Bonseki.Controller, events: [:increment, :decrement, :reset]
+        use Solve.Controller, events: [:increment, :decrement, :reset]
 
-        def init(_dependencies) do
-          %{count: 0, private_data: "secret"}
+        @impl true
+        def init(_params, _dependencies) do
+          %{
+            count: 0,
+            private_data: "secret"
+          }
         end
 
         def increment(state, _params) do
@@ -39,7 +43,10 @@ defmodule Bonseki.Controller do
         end
 
         def reset(_state, _params) do
-          %{count: 0, private_data: "secret"}
+          %{
+            count: 0,
+            private_data: "secret"
+          }
         end
 
         @impl true
@@ -52,10 +59,10 @@ defmodule Bonseki.Controller do
   ## With Dependencies
 
       defmodule MyApp.ComputedController do
-        use Bonseki.Controller, events: []
+        use Solve.Controller, events: []
 
         @impl true
-        def init(_dependencies) do
+        def init(_params, _dependencies) do
           %{result: 0}
         end
 
@@ -66,20 +73,122 @@ defmodule Bonseki.Controller do
           %{result: source_value * 10}
         end
       end
+
+  ## With Params from Scene
+
+      defmodule MyApp.CurrentUserController do
+        use Solve.Controller, events: [:update_profile]
+
+        @impl true
+        def init(current_user, _dependencies) do
+          # If controller is running, current_user is guaranteed to be truthy
+          %{current_user: current_user}
+        end
+
+        def update_profile(state, params) do
+          updated_user = %{state.current_user | name: params["name"]}
+          %{state | current_user: updated_user}
+        end
+
+        @impl true
+        def expose(state, _dependencies) do
+          state.current_user
+        end
+      end
+
+      # In scene:
+      # scene params do
+      #   controller(:current_user, MyApp.CurrentUserController,
+      #     params: fn _ -> params[:current_user] end)
+      # end
+
+  ## Using Structs for State (Recommended)
+
+  While controllers work with plain maps, using structs is recommended for
+  better documentation, type safety, and tooling support:
+
+      defmodule MyApp.AuthController do
+        use Solve.Controller, events: [:submit, :validate]
+
+        defmodule State do
+          @moduledoc "State for authentication form"
+          defstruct [
+            :email,
+            :password,
+            :errors
+          ]
+
+          @type t :: %__MODULE__{
+            email: String.t(),
+            password: String.t(),
+            errors: map()
+          }
+        end
+
+        @impl true
+        def init(_params, _dependencies) do
+          %State{
+            email: "",
+            password: "",
+            errors: %{}
+          }
+        end
+
+        def validate(state, params) do
+          errors = validate_form(params)
+          %State{state | errors: errors}
+        end
+
+        def submit(%State{} = state, params) do
+          case authenticate(params) do
+            {:ok, user} ->
+              %State{state | errors: %{}}
+
+            {:error, reason} ->
+              %State{state | errors: %{auth: reason}}
+          end
+        end
+
+        @impl true
+        def expose(%State{} = state, _dependencies) do
+          # Expose as map or struct - both work
+          %{
+            email: state.email,
+            errors: state.errors,
+            valid?: map_size(state.errors) == 0
+          }
+        end
+
+        defp validate_form(params), do: %{}
+        defp authenticate(_params), do: {:ok, %{}}
+      end
+
+  Using structs provides:
+  - **Clear documentation** of all state fields
+  - **Compile-time checking** for typos in field names
+  - **Better tooling** (autocomplete, dialyzer)
+  - **Type specifications** for better maintainability
   """
 
   @doc """
-  Exposes the controller's state to UIs. Defaults to returning the full state.
-  Can optionally receive dependencies as second argument.
+  Initializes the controller state.
+  Receives params value from the scene and dependencies (exposed states from other controllers).
+  The params value can be any truthy value (if nil or false, the controller won't start).
   """
-  @callback expose(state :: map(), dependencies :: map()) :: map()
+  @callback init(params :: any(), dependencies :: map()) :: map()
+
+  @doc """
+  Exposes the controller's state to UIs and other controllers.
+  Defaults to returning the full state. Can compute based on dependencies.
+  """
+  @callback expose(state :: map(), dependencies :: map()) :: any()
 
   defmacro __using__(opts) do
     events = Keyword.get(opts, :events, [])
 
     quote do
       use GenServer
-      @behaviour Bonseki.Controller
+      @behaviour Solve.Controller
 
       @events unquote(events)
 
@@ -88,9 +197,14 @@ defmodule Bonseki.Controller do
       end
 
       # Default init - can be overridden
-      # Receives dependencies map (e.g., %{lemons: %{count: 0}, water: %{count: 0}})
-      def init(dependencies) do
-        dependencies
+      # Receives params value from the scene (if true, returns empty map)
+      # and dependencies map (e.g., %{lemons: %{count: 0}, water: %{count: 0}})
+      def init(params, _dependencies) do
+        if params == true do
+          %{}
+        else
+          params
+        end
       end
 
       # Default expose - can be overridden
@@ -99,20 +213,25 @@ defmodule Bonseki.Controller do
         state
       end
 
-      defoverridable init: 1, expose: 2
+      defoverridable init: 2, expose: 2
 
       # GenServer callbacks
       def start_link(opts) do
         app_pid = Keyword.fetch!(opts, :app_pid)
         controller_name = Keyword.fetch!(opts, :controller_name)
         dependency_names = Keyword.get(opts, :dependency_names, [])
-        GenServer.start_link(__MODULE__, {app_pid, controller_name, dependency_names})
+        params = Keyword.get(opts, :params, %{})
+
+        GenServer.start_link(
+          __MODULE__,
+          {app_pid, controller_name, dependency_names, params}
+        )
       end
 
       @impl true
-      def init({app_pid, controller_name, dependency_names}) do
+      def init({app_pid, controller_name, dependency_names, params}) do
         # Initialize with empty dependencies - controllers should handle this gracefully
-        initial_state = init(%{})
+        initial_state = init(params, %{})
 
         # Register with the app as started
         GenServer.cast(app_pid, {:controller_started, controller_name, self()})
@@ -123,8 +242,9 @@ defmodule Bonseki.Controller do
            app_pid: app_pid,
            controller_name: controller_name,
            dependency_names: dependency_names,
-           dependencies: %{a: 1},
-           dependents: []
+           dependencies: %{},
+           dependents: [],
+           params: params
          }, {:continue, :init_with_dependencies}}
       end
 
@@ -134,7 +254,8 @@ defmodule Bonseki.Controller do
         dependencies =
           get_dependencies_state(server_state.app_pid, server_state.dependency_names)
 
-        new_state = init(dependencies)
+        new_state = init(server_state.params, dependencies)
+
         server_state = %{server_state | state: new_state, dependencies: dependencies}
 
         # Notify app that this controller is fully initialized
@@ -191,7 +312,7 @@ defmodule Bonseki.Controller do
             )
           end
 
-          {:reply, :ok, %{server_state | state: new_state}}
+          {:reply, new_state, %{server_state | state: new_state}}
         end
       end
 
@@ -285,7 +406,7 @@ defmodule Bonseki.Controller do
           case dependent.type do
             :ui ->
               send(dependent.pid, {
-                :bonseki_update,
+                :solve_update,
                 dependent.assign_name,
                 server_state.controller_name,
                 exposed_state
@@ -307,7 +428,7 @@ defmodule Bonseki.Controller do
             raise CompileError,
               description:
                 "Event handler #{event}/2 not defined in #{__MODULE__}. " <>
-                  "All events declared in `use Bonseki.Controller` must have a corresponding function."
+                  "All events declared in `use Solve.Controller` must have a corresponding function."
           end
         end
 

@@ -1,4 +1,4 @@
-defmodule Bonseki.DependencyGraph do
+defmodule Solve.DependencyGraph do
   @moduledoc """
   Utilities for building and validating dependency graphs.
   """
