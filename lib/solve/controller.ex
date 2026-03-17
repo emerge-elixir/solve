@@ -1,58 +1,51 @@
 defmodule Solve.Controller do
   @moduledoc """
-  A behavior and macro for defining Solve controllers.
+  In Solve your main building block is the controller. Controllers are composed in the
+  app state graph, and they can depend on each other. UI can subscribe to the controller
+  state. Each controller has its own internal state, and each controller has read access
+  to the exposed state of its dependencies.
 
-  Controllers are GenServers that manage state, handle events, and communicate
-  directly with their dependents (UIs and other controllers). They maintain a
-  list of dependents and notify them automatically when state changes.
+  Controllers are implemented as `GenServer`s.
 
   ## Responsibilities
 
-  - Manage internal state
-  - Handle events from UIs
-  - Track dependents (both UIs and other controllers)
-  - Send state updates directly to dependents
-  - Monitor dependent processes and clean up on termination
-  - Refresh state when dependencies change
+  - Manage internal user state
+  - Handle UI events
+  - Refresh cached dependency state when dependencies change
+  - Track observers (both UIs and other controllers)
+  - Send state updates directly to observers
+  - Monitor observer processes and clean them up
 
   ## Direct Communication
 
-  Controllers communicate directly with:
-  - **UIs**: Send `{:solve_update, assign_name, controller_name, state}` messages
-  - **Dependent Controllers**: Send `:refresh_dependencies` cast messages
+  Controllers communicate directly with subscribers using
+  `{:solve_update, solve_app, controller_name, exposed_state}` messages.
 
-  ## Example
+  ## Example Controller
 
       defmodule MyApp.CounterController do
         use Solve.Controller, events: [:increment, :decrement, :reset]
 
         @impl true
-        def init(_params, _dependencies) do
-          %{
-            count: 0,
-            private_data: "secret"
-          }
-        end
-
-        def increment(state, _params) do
-          %{state | count: state.count + 1}
-        end
-
-        def decrement(state, _params) do
-          %{state | count: state.count - 1}
-        end
-
-        def reset(_state, _params) do
-          %{
-            count: 0,
-            private_data: "secret"
-          }
+        def init(_init_params, _dependencies) do
+          %{count: 0, private_data: "secret"}
         end
 
         @impl true
-        def expose(state, _dependencies) do
-          # Only expose public state
+        def expose(state, _dependencies, _init_params) do
           %{count: state.count}
+        end
+
+        def increment(_payload, state, _dependencies, _callbacks, _init_params) do
+          %{state | count: state.count + 1}
+        end
+
+        def decrement(_payload, state, _dependencies, _callbacks, _init_params) do
+          %{state | count: state.count - 1}
+        end
+
+        def reset(_payload, _state, _dependencies, _callbacks, _init_params) do
+          %{count: 0, private_data: "secret"}
         end
       end
 
@@ -62,378 +55,340 @@ defmodule Solve.Controller do
         use Solve.Controller, events: []
 
         @impl true
-        def init(_params, _dependencies) do
-          %{result: 0}
+        def init(_init_params, _dependencies) do
+          %{multiplier: 10}
         end
 
         @impl true
-        def expose(_state, dependencies) do
-          # Compute based on dependencies
-          source_value = dependencies[:source].value
-          %{result: source_value * 10}
+        def expose(state, dependencies, _init_params) do
+          source_value = dependencies[:source] || 0
+          %{result: source_value * state.multiplier}
         end
       end
 
-  ## With Params from Scene
+  ## Params and Callbacks
 
-      defmodule MyApp.CurrentUserController do
-        use Solve.Controller, events: [:update_profile]
+  `init_params` can have any shape, but it must be truthy. If it is `nil` or `false`, the
+  controller stops with `{:invalid_init_params, controller_name, value}`.
 
-        @impl true
-        def init(current_user, _dependencies) do
-          # If controller is running, current_user is guaranteed to be truthy
-          %{current_user: current_user}
-        end
+  `callbacks` is a plain map passed only to declared event handlers. Event handlers receive
+  all runtime inputs as:
 
-        def update_profile(state, params) do
-          updated_user = %{state.current_user | name: params["name"]}
-          %{state | current_user: updated_user}
-        end
+      event_name(event_payload, state, dependencies, callbacks, init_params)
 
-        @impl true
-        def expose(state, _dependencies) do
-          state.current_user
-        end
-      end
+  ## Subscription Helpers
 
-      # In scene:
-      # scene params do
-      #   controller(:current_user, MyApp.CurrentUserController,
-      #     params: fn _ -> params[:current_user] end)
-      # end
+  - `subscribe(controller, subscriber \\ self())` registers the subscriber and returns the
+    current exposed state synchronously.
+  - `dispatch(controller, event, payload \\ %{})` sends an event to the controller.
 
-  ## Using Structs for State (Recommended)
+  ## Using Structs for State
 
-  While controllers work with plain maps, using structs is recommended for
-  better documentation, type safety, and tooling support:
-
-      defmodule MyApp.AuthController do
-        use Solve.Controller, events: [:submit, :validate]
-
-        defmodule State do
-          @moduledoc "State for authentication form"
-          defstruct [
-            :email,
-            :password,
-            :errors
-          ]
-
-          @type t :: %__MODULE__{
-            email: String.t(),
-            password: String.t(),
-            errors: map()
-          }
-        end
-
-        @impl true
-        def init(_params, _dependencies) do
-          %State{
-            email: "",
-            password: "",
-            errors: %{}
-          }
-        end
-
-        def validate(state, params) do
-          errors = validate_form(params)
-          %State{state | errors: errors}
-        end
-
-        def submit(%State{} = state, params) do
-          case authenticate(params) do
-            {:ok, user} ->
-              %State{state | errors: %{}}
-
-            {:error, reason} ->
-              %State{state | errors: %{auth: reason}}
-          end
-        end
-
-        @impl true
-        def expose(%State{} = state, _dependencies) do
-          # Expose as map or struct - both work
-          %{
-            email: state.email,
-            errors: state.errors,
-            valid?: map_size(state.errors) == 0
-          }
-        end
-
-        defp validate_form(params), do: %{}
-        defp authenticate(_params), do: {:ok, %{}}
-      end
-
-  Using structs provides:
-  - **Clear documentation** of all state fields
-  - **Compile-time checking** for typos in field names
-  - **Better tooling** (autocomplete, dialyzer)
-  - **Type specifications** for better maintainability
+  Controller user state can be any term. Structs are often a good choice because they
+  provide better documentation and tooling, but they are not required.
   """
+
+  require Logger
+
+  @genserver_start_options [:name, :timeout, :debug, :spawn_opt, :hibernate_after]
+
+  @type state :: any()
+  @type dependencies :: map()
+  @type callbacks :: map()
+  @type init_params :: any()
 
   @doc """
-  Initializes the controller state.
-  Receives params value from the scene and dependencies (exposed states from other controllers).
-  The params value can be any truthy value (if nil or false, the controller won't start).
+  Initializes the controller user state.
+
+  `init_params` can have any truthy shape. `dependencies` contains cached exposed state
+  from upstream controllers.
   """
-  @callback init(params :: any(), dependencies :: map()) :: map()
+  @callback init(init_params(), dependencies()) :: state()
 
   @doc """
-  Exposes the controller's state to UIs and other controllers.
-  Defaults to returning the full state. Can compute based on dependencies.
+  Computes the exposed state visible to subscribers and dependent controllers.
+
+  Defaults to returning the full user state.
   """
-  @callback expose(state :: map(), dependencies :: map()) :: any()
+  @callback expose(state(), dependencies(), init_params()) :: any()
+
+  @optional_callbacks expose: 3
 
   defmacro __using__(opts) do
-    events = Keyword.get(opts, :events, [])
+    events = validate_events_option!(opts, __CALLER__)
 
-    quote do
+    quote bind_quoted: [events: events] do
       use GenServer
+
       @behaviour Solve.Controller
+      @before_compile Solve.Controller
+      @solve_controller_events events
 
-      @events unquote(events)
+      @impl Solve.Controller
+      def expose(state, _dependencies, _init_params), do: state
 
-      def definition do
-        @events
+      def __events__, do: @solve_controller_events
+
+      def start_link(opts \\ []) do
+        Solve.Controller.start_link(__MODULE__, opts)
       end
 
-      # Default init - can be overridden
-      # Receives params value from the scene (if true, returns empty map)
-      # and dependencies map (e.g., %{lemons: %{count: 0}, water: %{count: 0}})
-      def init(params, _dependencies) do
-        if params == true do
-          %{}
-        else
-          params
-        end
+      @impl GenServer
+      def init(opts), do: Solve.Controller.__init__(__MODULE__, opts)
+
+      @impl GenServer
+      def handle_call({:subscribe, subscriber}, _from, server_state) do
+        Solve.Controller.__handle_subscribe__(subscriber, server_state)
       end
 
-      # Default expose - can be overridden
-      # Receives state and dependencies
-      def expose(state, _dependencies) do
-        state
+      @impl GenServer
+      def handle_cast({:event, event, payload}, server_state) do
+        Solve.Controller.__handle_event__(event, payload, server_state)
       end
 
-      defoverridable init: 2, expose: 2
-
-      # GenServer callbacks
-      def start_link(opts) do
-        app_pid = Keyword.fetch!(opts, :app_pid)
-        controller_name = Keyword.fetch!(opts, :controller_name)
-        dependency_names = Keyword.get(opts, :dependency_names, [])
-        params = Keyword.get(opts, :params, %{})
-
-        GenServer.start_link(
-          __MODULE__,
-          {app_pid, controller_name, dependency_names, params}
+      @impl GenServer
+      def handle_info({:solve_update, solve_app, dependency_name, exposed_state}, server_state) do
+        Solve.Controller.__handle_dependency_update__(
+          solve_app,
+          dependency_name,
+          exposed_state,
+          server_state
         )
       end
 
-      @impl true
-      def init({app_pid, controller_name, dependency_names, params}) do
-        # Initialize with empty dependencies - controllers should handle this gracefully
-        initial_state = init(params, %{})
-
-        # Register with the app as started
-        GenServer.cast(app_pid, {:controller_started, controller_name, self()})
-
-        {:ok,
-         %{
-           state: initial_state,
-           app_pid: app_pid,
-           controller_name: controller_name,
-           dependency_names: dependency_names,
-           dependencies: %{},
-           dependents: [],
-           params: params
-         }, {:continue, :init_with_dependencies}}
+      @impl GenServer
+      def handle_info({:DOWN, _ref, :process, subscriber, _reason}, server_state) do
+        Solve.Controller.__handle_subscriber_down__(subscriber, server_state)
       end
 
-      @impl true
-      def handle_continue(:init_with_dependencies, server_state) do
-        # Now reinitialize with actual dependencies after all controllers are up
-        dependencies =
-          get_dependencies_state(server_state.app_pid, server_state.dependency_names)
-
-        new_state = init(server_state.params, dependencies)
-
-        server_state = %{server_state | state: new_state, dependencies: dependencies}
-
-        # Notify app that this controller is fully initialized
-        GenServer.cast(
-          server_state.app_pid,
-          {:controller_fully_initialized, server_state.controller_name}
-        )
-
+      @impl GenServer
+      def handle_info(_message, server_state) do
         {:noreply, server_state}
       end
 
-      # Generate event handlers conditionally based on whether events are defined
-      if length(unquote(events)) > 0 do
-        @impl true
-        def handle_cast({:event, event_name, event_params}, server_state) do
-          current_state = server_state.state
-
-          # Call the event handler if it exists in our events list
-          new_state =
-            if event_name in @events do
-              apply(__MODULE__, event_name, [current_state, event_params])
-            else
-              current_state
-            end
-
-          # If state changed, notify all dependents directly
-          if new_state != current_state do
-            notify_dependents(server_state, new_state)
-          end
-
-          {:noreply, %{server_state | state: new_state}}
-        end
-
-        @impl true
-        def handle_call({:event, event_name, event_params}, _from, server_state) do
-          current_state = server_state.state
-
-          # Call the event handler if it exists in our events list
-          new_state =
-            if event_name in @events do
-              apply(__MODULE__, event_name, [current_state, event_params])
-            else
-              current_state
-            end
-
-          # If state changed, notify all dependents directly and trigger App re-evaluation
-          if new_state != current_state do
-            notify_dependents(server_state, new_state)
-
-            # Notify app to re-evaluate on_when conditions for dependents (async to avoid deadlock)
-            GenServer.cast(
-              server_state.app_pid,
-              {:controller_state_changed, server_state.controller_name}
-            )
-          end
-
-          {:reply, new_state, %{server_state | state: new_state}}
-        end
-      end
-
-      @impl true
-      def handle_call(:get_exposed_state, _from, server_state) do
-        # Use cached dependencies to avoid circular calls
-        dependencies = server_state.dependencies
-        exposed_state = expose(server_state.state, dependencies)
-
-        {:reply, exposed_state, %{server_state | state: exposed_state}}
-      end
-
-      @impl true
-      def handle_call(:get_state, _from, server_state) do
-        {:reply, server_state.state, server_state}
-      end
-
-      @impl true
-      def handle_cast(:refresh_dependencies, server_state) do
-        # Refresh cached dependencies when a dependency changes
-        if length(server_state.dependency_names) > 0 do
-          dependencies =
-            get_dependencies_state(server_state.app_pid, server_state.dependency_names)
-
-          new_exposed_state = expose(server_state.state, dependencies)
-
-          # If exposed state changed, notify dependents
-          if new_exposed_state != server_state.state do
-            notify_dependents(%{server_state | dependencies: dependencies}, new_exposed_state)
-          end
-
-          {:noreply, %{server_state | dependencies: dependencies, state: new_exposed_state}}
-        else
-          {:noreply, server_state}
-        end
-      end
-
-      @impl true
-      def handle_call({:subscribe_ui, assign_name}, {ui_pid, _}, server_state) do
-        # Monitor the UI process
-        Process.monitor(ui_pid)
-
-        # Add UI to dependents list
-        dependent = %{type: :ui, pid: ui_pid, assign_name: assign_name}
-        new_dependents = [dependent | server_state.dependents]
-
-        # Get current exposed state and events
-        exposed_state = expose(server_state.state, server_state.dependencies)
-        events = @events
-
-        {:reply, {:ok, exposed_state, events}, %{server_state | dependents: new_dependents}}
-      end
-
-      @impl true
-      def handle_cast({:add_dependent, type, pid, data}, server_state) do
-        # Monitor the dependent process
-        Process.monitor(pid)
-
-        # Add to dependents list
-        dependent = Map.merge(%{type: type, pid: pid}, data)
-        new_dependents = [dependent | server_state.dependents]
-
-        {:noreply, %{server_state | dependents: new_dependents}}
-      end
-
-      @impl true
-      def handle_cast({:remove_dependent, pid}, server_state) do
-        # Remove from dependents list
-        new_dependents = Enum.reject(server_state.dependents, fn dep -> dep.pid == pid end)
-        {:noreply, %{server_state | dependents: new_dependents}}
-      end
-
-      @impl true
-      def handle_info({:DOWN, _ref, :process, pid, _reason}, server_state) do
-        # Remove dependent when it terminates
-        new_dependents = Enum.reject(server_state.dependents, fn dep -> dep.pid == pid end)
-        {:noreply, %{server_state | dependents: new_dependents}}
-      end
-
-      defp get_dependencies_state(_app_pid, []), do: %{}
-
-      defp get_dependencies_state(app_pid, dependency_names) do
-        GenServer.call(app_pid, {:get_dependencies_state, dependency_names}, 100_000)
-      end
-
-      # Helper to notify all dependents of state change
-      defp notify_dependents(server_state, new_state) do
-        exposed_state = expose(new_state, server_state.dependencies)
-
-        Enum.each(server_state.dependents, fn dependent ->
-          case dependent.type do
-            :ui ->
-              send(dependent.pid, {
-                :solve_update,
-                dependent.assign_name,
-                server_state.controller_name,
-                exposed_state
-              })
-
-            :controller ->
-              GenServer.cast(dependent.pid, :refresh_dependencies)
-          end
-        end)
-      end
-
-      # Compile-time validation that all declared events have handlers
-      @after_compile __MODULE__
-
-      def __after_compile__(_env, _bytecode) do
-        # Verify all events have corresponding functions
-        for event <- @events do
-          unless function_exported?(__MODULE__, event, 2) do
-            raise CompileError,
-              description:
-                "Event handler #{event}/2 not defined in #{__MODULE__}. " <>
-                  "All events declared in `use Solve.Controller` must have a corresponding function."
-          end
-        end
-
-        :ok
-      end
+      defoverridable expose: 3
     end
+  end
+
+  defmacro __before_compile__(env) do
+    events = Module.get_attribute(env.module, :solve_controller_events) || []
+    definitions = MapSet.new(Module.definitions_in(env.module))
+
+    missing_callbacks =
+      Enum.reject(events, fn event ->
+        MapSet.member?(definitions, {event, 5})
+      end)
+
+    if missing_callbacks != [] do
+      callbacks = Enum.map_join(missing_callbacks, ", ", &"#{&1}/5")
+
+      raise CompileError,
+        file: env.file,
+        line: 1,
+        description: "#{inspect(env.module)} must define declared event callback(s): #{callbacks}"
+    end
+
+    quote(do: :ok)
+  end
+
+  @doc """
+  Starts a controller GenServer.
+  """
+  @spec start_link(module(), keyword()) :: GenServer.on_start()
+  def start_link(module, opts \\ []) when is_atom(module) and is_list(opts) do
+    GenServer.start_link(module, opts, Keyword.take(opts, @genserver_start_options))
+  end
+
+  @doc """
+  Subscribes a process to controller updates and returns the current exposed state.
+  """
+  @spec subscribe(GenServer.server(), pid()) :: any()
+  def subscribe(controller, subscriber \\ self())
+
+  def subscribe(controller, subscriber) when is_pid(subscriber) do
+    GenServer.call(controller, {:subscribe, subscriber})
+  end
+
+  def subscribe(_controller, subscriber) do
+    raise ArgumentError, "subscribe/2 expects a pid subscriber, got: #{inspect(subscriber)}"
+  end
+
+  @doc """
+  Dispatches an event to a controller.
+  """
+  @spec dispatch(GenServer.server(), term(), term()) :: :ok
+  def dispatch(controller, event, payload \\ %{}) do
+    GenServer.cast(controller, {:event, event, payload})
+  end
+
+  @doc false
+  def __init__(module, opts) when is_atom(module) and is_list(opts) do
+    solve_app = Keyword.get(opts, :solve_app)
+    controller_name = Keyword.get(opts, :controller_name, module)
+    params = Keyword.get(opts, :params)
+
+    if params in [nil, false] do
+      {:stop, {:invalid_init_params, controller_name, params}}
+    else
+      dependencies = normalize_optional_map(Keyword.get(opts, :dependencies))
+      callbacks = normalize_optional_map(Keyword.get(opts, :callbacks))
+      state = module.init(params, dependencies)
+      exposed_state = module.expose(state, dependencies, params)
+
+      {:ok,
+       %{
+         module: module,
+         solve_app: solve_app,
+         controller_name: controller_name,
+         state: state,
+         params: params,
+         dependencies: dependencies,
+         callbacks: callbacks,
+         exposed_state: exposed_state,
+         subscribers: %{}
+       }}
+    end
+  end
+
+  @doc false
+  def __handle_subscribe__(
+        subscriber,
+        %{subscribers: subscribers, exposed_state: exposed_state} = server_state
+      )
+      when is_pid(subscriber) do
+    subscribers = ensure_subscriber(subscribers, subscriber)
+    {:reply, exposed_state, %{server_state | subscribers: subscribers}}
+  end
+
+  @doc false
+  def __handle_event__(
+        event,
+        payload,
+        %{module: module, controller_name: controller_name} = server_state
+      ) do
+    if declared_event?(module, event) do
+      new_state =
+        apply(module, event, [
+          payload,
+          server_state.state,
+          server_state.dependencies,
+          server_state.callbacks,
+          server_state.params
+        ])
+
+      server_state = %{server_state | state: new_state}
+      {:noreply, refresh_exposed_state(server_state)}
+    else
+      Logger.warning(
+        "discarding undeclared Solve controller event #{inspect(event)} for #{inspect(controller_name)}"
+      )
+
+      {:noreply, server_state}
+    end
+  end
+
+  @doc false
+  def __handle_dependency_update__(
+        solve_app,
+        dependency_name,
+        exposed_state,
+        %{solve_app: solve_app} = server_state
+      ) do
+    dependencies = Map.put(server_state.dependencies, dependency_name, exposed_state)
+    server_state = %{server_state | dependencies: dependencies}
+    {:noreply, refresh_exposed_state(server_state)}
+  end
+
+  def __handle_dependency_update__(_solve_app, _dependency_name, _exposed_state, server_state) do
+    {:noreply, server_state}
+  end
+
+  @doc false
+  def __handle_subscriber_down__(subscriber, %{subscribers: subscribers} = server_state) do
+    {:noreply, %{server_state | subscribers: Map.delete(subscribers, subscriber)}}
+  end
+
+  defp validate_events_option!(opts, caller) when is_list(opts) do
+    opts
+    |> Keyword.get(:events, [])
+    |> validate_events!(caller)
+  end
+
+  defp validate_events_option!(opts, caller) do
+    raise CompileError,
+      file: caller.file,
+      line: caller.line,
+      description: "use Solve.Controller expects a keyword list, got: #{inspect(opts)}"
+  end
+
+  defp validate_events!(events, caller) when is_list(events) do
+    cond do
+      not Enum.all?(events, &is_atom/1) ->
+        raise CompileError,
+          file: caller.file,
+          line: caller.line,
+          description:
+            "Solve.Controller events must be a list of unique atoms, got: #{inspect(events)}"
+
+      length(events) != MapSet.size(MapSet.new(events)) ->
+        raise CompileError,
+          file: caller.file,
+          line: caller.line,
+          description:
+            "Solve.Controller events must be a list of unique atoms, got: #{inspect(events)}"
+
+      true ->
+        events
+    end
+  end
+
+  defp validate_events!(events, caller) do
+    raise CompileError,
+      file: caller.file,
+      line: caller.line,
+      description:
+        "Solve.Controller events must be a list of unique atoms, got: #{inspect(events)}"
+  end
+
+  defp normalize_optional_map(nil), do: %{}
+  defp normalize_optional_map(value), do: value
+
+  defp ensure_subscriber(subscribers, subscriber) do
+    if Map.has_key?(subscribers, subscriber) do
+      subscribers
+    else
+      Map.put(subscribers, subscriber, Process.monitor(subscriber))
+    end
+  end
+
+  defp declared_event?(module, event) do
+    event in module.__events__()
+  end
+
+  defp refresh_exposed_state(server_state) do
+    new_exposed_state =
+      server_state.module.expose(
+        server_state.state,
+        server_state.dependencies,
+        server_state.params
+      )
+
+    maybe_broadcast_update(server_state, new_exposed_state)
+  end
+
+  defp maybe_broadcast_update(server_state, new_exposed_state) do
+    if server_state.exposed_state === new_exposed_state do
+      %{server_state | exposed_state: new_exposed_state}
+    else
+      broadcast_update(server_state, new_exposed_state)
+      %{server_state | exposed_state: new_exposed_state}
+    end
+  end
+
+  defp broadcast_update(server_state, new_exposed_state) do
+    message =
+      {:solve_update, server_state.solve_app, server_state.controller_name, new_exposed_state}
+
+    Enum.each(Map.keys(server_state.subscribers), &send(&1, message))
   end
 end
