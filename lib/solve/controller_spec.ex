@@ -10,7 +10,7 @@ defmodule Solve.ControllerSpec do
           module: module(),
           params: term(),
           dependencies: [name()],
-          callbacks: map()
+          callbacks: term()
         }
 
   @enforce_keys [:name, :module]
@@ -19,7 +19,7 @@ defmodule Solve.ControllerSpec do
     :module,
     dependencies: [],
     params: &__MODULE__.default_params/1,
-    callbacks: %{}
+    callbacks: []
   ]
 
   @spec controller!(keyword()) :: t()
@@ -30,7 +30,7 @@ defmodule Solve.ControllerSpec do
   end
 
   @spec default_params(term()) :: true
-  def default_params(%{dependencies: _dependencies, app_params: _app_params}), do: true
+  def default_params(_dependencies), do: true
 
   @spec validate_many(term()) :: {:ok, [t()]} | {:error, term()}
   def validate_many(controller_specs) when is_list(controller_specs) do
@@ -53,9 +53,7 @@ defmodule Solve.ControllerSpec do
   def validate(%__MODULE__{} = controller_spec) do
     with :ok <- validate_name(controller_spec.name),
          :ok <- validate_module(controller_spec.name, controller_spec.module),
-         :ok <- validate_dependencies(controller_spec.name, controller_spec.dependencies),
-         :ok <- validate_params(controller_spec.name, controller_spec.params),
-         :ok <- validate_callbacks(controller_spec.name, controller_spec.callbacks) do
+         :ok <- validate_dependencies(controller_spec.name, controller_spec.dependencies) do
       {:ok, controller_spec}
     end
   end
@@ -86,13 +84,6 @@ defmodule Solve.ControllerSpec do
   defp validate_dependencies(name, dependencies) do
     {:error, {:invalid_dependencies, name, dependencies}}
   end
-
-  defp validate_params(_name, params) when is_function(params, 1), do: :ok
-  defp validate_params(_name, params) when not is_function(params), do: :ok
-  defp validate_params(name, params), do: {:error, {:invalid_params, name, params}}
-
-  defp validate_callbacks(_name, callbacks) when is_map(callbacks), do: :ok
-  defp validate_callbacks(name, callbacks), do: {:error, {:invalid_callbacks, name, callbacks}}
 
   defp find_first_duplicate(values) do
     Enum.reduce_while(values, MapSet.new(), fn value, seen ->
