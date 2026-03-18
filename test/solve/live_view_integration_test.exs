@@ -36,7 +36,7 @@ defmodule Solve.LiveViewIntegrationTest do
     use Solve.LiveView
 
     def mount(_params, _session, socket) do
-      state = solve_state(CounterApp)
+      state = solve_start(CounterApp)
       assigns = solve(state, [:counter])
       {:ok, assign(socket, assigns)}
     end

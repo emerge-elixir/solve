@@ -124,9 +124,9 @@ defmodule Solve.LiveViewTest do
 
   # -- tests --
 
-  test "solve_state/2 stores AppRef in process dict" do
+  test "solve_start/2 stores AppRef in process dict" do
     app = start_app(LiveViewSolve, %{initial: 0})
-    ref = Solve.LiveView.solve_state(app, :myns)
+    ref = Solve.LiveView.solve_start(app, :myns)
 
     assert %Solve.LiveView.AppRef{namespace: :myns, app: ^app} = ref
     assert Process.get({:solve_lv_app, :myns}) == ref
@@ -134,7 +134,7 @@ defmodule Solve.LiveViewTest do
 
   test "solve/2 returns namespace-wrapped flat map with JS events" do
     app = start_app(LiveViewSolve, %{initial: 5})
-    app_ref = Solve.LiveView.solve_state(app, :ls)
+    app_ref = Solve.LiveView.solve_start(app, :ls)
 
     assigns = Solve.LiveView.solve(app_ref, [:counter])
 
@@ -151,7 +151,7 @@ defmodule Solve.LiveViewTest do
 
   test "JS events carry correct metadata" do
     app = start_app(LiveViewSolve, %{initial: 0})
-    app_ref = Solve.LiveView.solve_state(app, :ls)
+    app_ref = Solve.LiveView.solve_start(app, :ls)
 
     %{ls: %{counter: counter_map}} = Solve.LiveView.solve(app_ref, [:counter])
 
@@ -165,7 +165,7 @@ defmodule Solve.LiveViewTest do
 
   test "to_assigns returns nil for stopped controllers" do
     app = start_app(LiveViewSolve, %{initial: 0})
-    app_ref = Solve.LiveView.solve_state(app, :ls)
+    app_ref = Solve.LiveView.solve_start(app, :ls)
 
     # Subscribe first so Lookup has a ref
     _assigns = Solve.LiveView.solve(app_ref, [:counter])
@@ -181,7 +181,7 @@ defmodule Solve.LiveViewTest do
 
   test "solve/2 subscribes to multiple controllers" do
     app = start_app(LiveViewSolve, %{initial: 3, seconds: 10})
-    app_ref = Solve.LiveView.solve_state(app, :ls)
+    app_ref = Solve.LiveView.solve_start(app, :ls)
 
     assigns = Solve.LiveView.solve(app_ref, [:counter, :timer])
 
@@ -194,7 +194,7 @@ defmodule Solve.LiveViewTest do
 
   test "__handle_info__ updates socket assigns" do
     app = start_app(LiveViewSolve, %{initial: 1})
-    app_ref = Solve.LiveView.solve_state(app, :ls)
+    app_ref = Solve.LiveView.solve_start(app, :ls)
 
     # Initial subscribe
     %{ls: %{counter: _}} = Solve.LiveView.solve(app_ref, [:counter])
@@ -212,7 +212,7 @@ defmodule Solve.LiveViewTest do
 
   test "__handle_info__ preserves other controllers in namespace" do
     app = start_app(LiveViewSolve, %{initial: 1, seconds: 5})
-    app_ref = Solve.LiveView.solve_state(app, :ls)
+    app_ref = Solve.LiveView.solve_start(app, :ls)
 
     %{ls: controllers} = Solve.LiveView.solve(app_ref, [:counter, :timer])
 
@@ -228,7 +228,7 @@ defmodule Solve.LiveViewTest do
 
   test "__handle_event__ dispatches to correct controller" do
     app = start_app(LiveViewSolve, %{initial: 0})
-    app_ref = Solve.LiveView.solve_state(app, :ls)
+    app_ref = Solve.LiveView.solve_start(app, :ls)
 
     _assigns = Solve.LiveView.solve(app_ref, [:counter])
 
@@ -249,7 +249,7 @@ defmodule Solve.LiveViewTest do
 
   test "__handle_event__ passes form data as payload" do
     app = start_app(LiveViewSolve, %{initial: 0})
-    app_ref = Solve.LiveView.solve_state(app, :ls)
+    app_ref = Solve.LiveView.solve_start(app, :ls)
 
     _assigns = Solve.LiveView.solve(app_ref, [:counter])
 
@@ -273,8 +273,8 @@ defmodule Solve.LiveViewTest do
     app1 = start_app(LiveViewSolve, %{initial: 10, seconds: 0})
     app2 = start_app(SecondSolve, %{initial: 20})
 
-    ref1 = Solve.LiveView.solve_state(app1, :ns1)
-    ref2 = Solve.LiveView.solve_state(app2, :ns2)
+    ref1 = Solve.LiveView.solve_start(app1, :ns1)
+    ref2 = Solve.LiveView.solve_start(app2, :ns2)
 
     assigns1 = Solve.LiveView.solve(ref1, [:counter])
     assigns2 = Solve.LiveView.solve(ref2, [:counter])
@@ -295,7 +295,7 @@ defmodule Solve.LiveViewTest do
 
   test "form change, validate, and submit flow" do
     app = start_app(FormSolve, %{})
-    app_ref = Solve.LiveView.solve_state(app, :app)
+    app_ref = Solve.LiveView.solve_start(app, :app)
 
     assigns = Solve.LiveView.solve(app_ref, [:registration])
 
@@ -359,7 +359,7 @@ defmodule Solve.LiveViewTest do
   test "__handle_info__ ignores unknown apps" do
     socket = fake_socket(%{some: :data})
 
-    # No solve_state called, so no namespace found
+    # No solve_start called, so no namespace found
     result = Solve.LiveView.__handle_info__(socket, :unknown_app, :counter, %{count: 1})
     assert result == socket
   end

@@ -65,7 +65,7 @@ defmodule Solve.LiveViewFormIntegrationTest do
     use Solve.LiveView
 
     def mount(_params, _session, socket) do
-      state = solve_state(FormApp)
+      state = solve_start(FormApp)
       assigns = solve(state, [:registration])
       {:ok, assign(socket, assigns)}
     end

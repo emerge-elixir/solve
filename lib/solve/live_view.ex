@@ -12,7 +12,7 @@ defmodule Solve.LiveView do
         use Solve.LiveView
 
         def mount(_, _, socket) do
-          solve_app = solve_state(MyApp.State, :ls)
+          solve_app = solve_start(MyApp.State, :ls)
           assigns = solve(solve_app, [:counter])
           {:ok, assign(socket, assigns)}
         end
@@ -26,7 +26,7 @@ defmodule Solve.LiveView do
         end
       end
 
-  `solve_state/2` binds a Solve app to a namespace atom. `solve/2` subscribes to
+  `solve_start/2` binds a Solve app to a namespace atom. `solve/2` subscribes to
   controllers and returns a map suitable for `assign/2`, with data and `JS.push`
   event commands merged flat under `namespace.controller_name`.
 
@@ -45,7 +45,7 @@ defmodule Solve.LiveView do
 
   defmacro __using__(_opts \\ []) do
     quote do
-      import Solve.LiveView, only: [solve_state: 1, solve_state: 2, solve: 2]
+      import Solve.LiveView, only: [solve_start: 1, solve_start: 2, solve: 2]
       import Solve.Lookup, only: [dispatch: 2, dispatch: 3, dispatch: 4]
 
       def handle_info({:solve_update, app, controller_name, exposed_value}, socket) do
@@ -63,8 +63,8 @@ defmodule Solve.LiveView do
 
   Returns an `AppRef` used by `solve/2`.
   """
-  @spec solve_state(GenServer.server(), atom()) :: AppRef.t()
-  def solve_state(app, namespace \\ :state) when is_atom(namespace) do
+  @spec solve_start(GenServer.server(), atom()) :: AppRef.t()
+  def solve_start(app, namespace \\ :state) when is_atom(namespace) do
     tap(%AppRef{namespace: namespace, app: app}, &Process.put({:solve_lv_app, namespace}, &1))
   end
 
