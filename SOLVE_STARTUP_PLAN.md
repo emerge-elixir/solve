@@ -206,11 +206,18 @@ Add:
 
 - `Solve.subscribe(app, controller_name, subscriber \\ self())`
 - `Solve.controller_pid(app, controller_name)`
+- `Solve.dispatch(app, controller_name, event, payload \\ %{})`
 
 `Solve.subscribe/3` behavior:
 
 - running controller -> delegate to `Solve.Controller.subscribe/2`
 - stopped controller -> return `nil`
+
+`Solve.dispatch/4` behavior:
+
+- running controller -> forward to `Solve.Controller.dispatch/3`
+- stopped or unknown controller -> silent no-op
+- this is the default public dispatch API; callers should not need controller pids
 
 ## Supporting Changes
 

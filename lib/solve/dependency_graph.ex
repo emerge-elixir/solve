@@ -111,6 +111,14 @@ defmodule Solve.DependencyGraph do
     "invalid controller graph in #{inspect(module)}: controller #{inspect(name)} dependencies must be a list of atoms, got #{inspect(dependencies)}"
   end
 
+  defp format_error(module, {:invalid_params, name, params}) do
+    "invalid controller graph in #{inspect(module)}: controller #{inspect(name)} params must be a literal value or a unary function, got #{inspect(params)}"
+  end
+
+  defp format_error(module, {:invalid_callbacks, name, callbacks}) do
+    "invalid controller graph in #{inspect(module)}: controller #{inspect(name)} callbacks must be a map, got #{inspect(callbacks)}"
+  end
+
   defp format_error(module, {:duplicate_dependency, controller, dependency}) do
     "invalid controller graph in #{inspect(module)}: controller #{inspect(controller)} lists dependency #{inspect(dependency)} more than once"
   end
