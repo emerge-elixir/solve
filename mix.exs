@@ -9,6 +9,7 @@ defmodule Solve.MixProject do
       app: :solve,
       version: @version,
       elixir: "~> 1.18",
+      elixirc_paths: elixirc_paths(Mix.env()),
       name: "Solve",
       start_permanent: Mix.env() == :prod,
       description: description(),
@@ -26,10 +27,15 @@ defmodule Solve.MixProject do
     ]
   end
 
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_), do: ["lib"]
+
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
       {:phoenix_live_view, "~> 1.1", optional: true},
+      {:jason, "~> 1.4", only: :test},
+      {:lazy_html, "~> 0.1", only: :test},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false, warn_if_outdated: true}
     ]
   end
@@ -44,7 +50,7 @@ defmodule Solve.MixProject do
       source_ref: "readme",
       extras: [
         "README.md",
-        "ARCHITECTURE.md",
+        "ARCHITECTURE.md"
       ],
       groups_for_modules: [
         {"Core", [Solve]},
