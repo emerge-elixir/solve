@@ -75,16 +75,14 @@ defmodule Solve.LookupTest do
       {:noreply, state}
     end
 
-    @impl Solve.Lookup
-    def handle_solve_updated(updated, state) do
-      send(state.test_pid, {:solve_updated, updated, solve(state.app, :counter)})
-      {:ok, state}
+    def render(state) do
+      send(state.test_pid, {:rendered, solve(state.app, :counter)})
     end
   end
 
   defmodule ManualLookupWorker do
     use GenServer
-    use Solve.Lookup, handle_info: :manual
+    use Solve.Lookup, handle_info: false
 
     def start_link(app, test_pid) do
       GenServer.start_link(__MODULE__, {app, test_pid})
@@ -111,30 +109,24 @@ defmodule Solve.LookupTest do
     end
 
     @impl true
-    def handle_info(nil, state) do
-      {:noreply, state}
-    end
-
-    def handle_info(%Solve.Message{} = message, %{app: app} = state) do
-      case handle_message(message) do
-        %{^app => controllers} ->
-          if :counter in controllers,
-            do: {:noreply, render(state)},
-            else: {:noreply, state}
-
-        %{} ->
-          {:noreply, state}
-      end
-    end
-
     def handle_info(message, state) do
-      {:noreply, %{state | unhandled: [message | state.unhandled]}}
+      case handle_solve_lookup(message, state) do
+        {:handled, state} -> {:noreply, state}
+        :unhandled -> {:noreply, %{state | unhandled: [message | state.unhandled]}}
+      end
     end
 
     def render(state) do
       send(state.test_pid, {:manual_rendered, solve(state.app, :counter)})
-      state
     end
+  end
+
+  defmodule NoRenderLookupWorker do
+    use GenServer
+    use Solve.Lookup, on_update: nil
+
+    @impl true
+    def init(state), do: {:ok, state}
   end
 
   test "solve/2 returns exposed map with nested events and tracks updates" do
@@ -145,45 +137,19 @@ defmodule Solve.LookupTest do
 
     assert counter.count == 1
 
-    assert Solve.Lookup.events(counter).increment ==
-             %Solve.Message{
-               type: :dispatch,
-               payload: %Solve.Dispatch{
-                 app: app,
-                 controller_name: :counter,
-                 event: :increment,
-                 payload: %{}
-               }
-             }
+    assert Solve.Lookup.events(counter).increment == %Solve.Lookup.Dispatch{
+             app: app,
+             controller_name: :counter,
+             event: :increment,
+             payload: %{}
+           }
 
     assert Solve.controller_events(app, :counter) == [:increment]
 
     assert :ok = GenServer.cast(worker, {:send_event, :counter, :increment})
 
     assert await_lookup_count(worker) == 2
-    assert_receive {:solve_updated, %{^app => [:counter]}, %{count: 2, events_: events}}
-    assert Map.has_key?(events, :increment)
-  end
-
-  test "lookup cache stays fresh when app is addressed by registered name" do
-    name = unique_name("NamedLookup")
-    assert {:ok, app} = LookupSolve.start_link(name: name, params: %{initial: 1})
-
-    on_exit(fn ->
-      if Process.alive?(app) do
-        stop_process(app)
-      end
-    end)
-
-    assert {:ok, worker} = AutoLookupWorker.start_link(name, self())
-
-    counter = GenServer.call(worker, {:solve, :counter})
-    assert counter.count == 1
-
-    send(worker, Solve.Lookup.events(counter).increment)
-
-    assert await_lookup_count(worker) == 2
-    assert_receive {:solve_updated, %{^app => [:counter]}, %{count: 2, events_: events}}
+    assert_receive {:rendered, %{count: 2, events_: events}}
     assert Map.has_key?(events, :increment)
   end
 
@@ -194,11 +160,9 @@ defmodule Solve.LookupTest do
     assert Solve.Lookup.events(nil) == nil
 
     send(worker, nil)
-    send(worker, Solve.Lookup.events(nil)[:increment])
-
     assert Process.alive?(worker)
     assert GenServer.call(worker, {:solve, :counter}).count == 1
-    refute_receive {:solve_updated, _, _}, 50
+    refute_receive {:rendered, _}, 50
   end
 
   test "manual handle_info forwarding works when lookup auto wiring is disabled" do
@@ -206,10 +170,6 @@ defmodule Solve.LookupTest do
     assert {:ok, worker} = ManualLookupWorker.start_link(app, self())
 
     assert GenServer.call(worker, {:solve, :counter}).count == 1
-
-    send(worker, nil)
-    refute_receive {:manual_rendered, _}, 50
-
     assert :ok = GenServer.cast(worker, {:send_event, :counter, :increment})
     assert await_lookup_count(worker) == 2
     assert_receive {:manual_rendered, %{count: 2, events_: events}}
@@ -221,34 +181,10 @@ defmodule Solve.LookupTest do
     assert GenServer.call(worker, :unhandled) == [{:custom, :message}]
   end
 
-  test "handle_message/1 updates local lookup cache for update envelopes" do
-    app = start_app(LookupSolve, %{initial: 1})
+  test "default use Solve.Lookup requires render/1 and on_update nil does not" do
+    module = unique_name("MissingRender")
 
-    assert %{^app => [:counter]} =
-             Solve.Lookup.handle_message(Solve.Message.update(app, :counter, %{count: 5}))
-
-    assert Solve.Lookup.solve(app, :counter).count == 5
-  end
-
-  test "handle_message/1 returns empty map for dispatch envelopes" do
-    app = start_app(LookupSolve, %{initial: 1})
-
-    assert %{} ==
-             Solve.Lookup.handle_message(Solve.Message.dispatch(app, :counter, :increment, %{}))
-
-    assert await_counter_value(app, 2) == 2
-  end
-
-  test "handle_message/1 accepts only Solve.Message" do
-    assert_raise FunctionClauseError, fn ->
-      apply(Solve.Lookup, :handle_message, [nil])
-    end
-  end
-
-  test "compile-time requirements follow handle_info mode" do
-    module = unique_name("MissingCallback")
-
-    assert_raise CompileError, ~r/must define handle_solve_updated\/2/, fn ->
+    assert_raise CompileError, ~r/must define render\/1/, fn ->
       Code.compile_string("""
       defmodule #{inspect(module)} do
         use GenServer
@@ -259,29 +195,16 @@ defmodule Solve.LookupTest do
       """)
     end
 
-    module = unique_name("ManualNoCallback")
+    module = unique_name("NilOnUpdate")
 
     Code.compile_string("""
     defmodule #{inspect(module)} do
       use GenServer
-      use Solve.Lookup, handle_info: :manual
+      use Solve.Lookup, on_update: nil
 
       def init(state), do: {:ok, state}
     end
     """)
-
-    module = unique_name("InvalidHandleInfo")
-
-    assert_raise CompileError, ~r/must be :auto or :manual/, fn ->
-      Code.compile_string("""
-      defmodule #{inspect(module)} do
-        use GenServer
-        use Solve.Lookup, handle_info: false
-
-        def init(state), do: {:ok, state}
-      end
-      """)
-    end
   end
 
   test "lookup raises when controller expose map collides with events_ key" do
@@ -306,23 +229,6 @@ defmodule Solve.LookupTest do
       _counter ->
         Process.sleep(10)
         await_lookup_count(worker, attempts - 1)
-    end
-  end
-
-  defp await_counter_value(app, value, attempts \\ 50)
-
-  defp await_counter_value(_app, _value, 0) do
-    flunk("counter value did not update in time")
-  end
-
-  defp await_counter_value(app, value, attempts) do
-    case Solve.Lookup.solve(app, :counter) do
-      %{count: ^value} ->
-        value
-
-      _ ->
-        Process.sleep(10)
-        await_counter_value(app, value, attempts - 1)
     end
   end
 

@@ -40,11 +40,10 @@ defmodule Solve.MixProject do
   defp docs do
     [
       main: "Solve",
-      source_ref: "main",
+      source_ref: "readme",
       extras: [
+        "README.md",
         "ARCHITECTURE.md",
-        "AUTOMATIC_EVENT_TARGETING.md",
-        "CONTROLLERS_ATTRIBUTE_FEATURE.md"
       ],
       groups_for_modules: [
         {"Core", [Solve]},

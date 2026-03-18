@@ -61,7 +61,7 @@ defmodule Solve.Controller do
 
         @impl true
         def expose(state, dependencies, _init_params) do
-          source_value = dependencies[:source] || 0
+          source_value = get_in(dependencies, [:source, :count]) || 0
           %{result: source_value * state.multiplier}
         end
       end
@@ -81,6 +81,16 @@ defmodule Solve.Controller do
   - `subscribe(controller, subscriber \\ self())` registers the subscriber and returns the
     current exposed state synchronously.
   - `dispatch(controller, event, payload \\ %{})` sends an event to the controller.
+
+  In normal app code, prefer `Solve.dispatch/4` so dispatch goes through the `Solve`
+  runtime and stays aligned with controller lifecycle changes. `Solve.Controller.dispatch/3`
+  is the low-level primitive for callers that already have a controller pid.
+
+  ## Exposed State
+
+  A running controller must expose a plain map. `nil` is reserved for the Solve runtime
+  to mean that a controller is currently off/stopped. The `:events_` key is reserved for
+  `Solve.Lookup` augmentation and should not be returned from `expose/3`.
 
   ## Using Structs for State
 
@@ -108,9 +118,9 @@ defmodule Solve.Controller do
   @doc """
   Computes the exposed state visible to subscribers and dependent controllers.
 
-  Defaults to returning the full user state.
+  Defaults to returning the full user state. Running controllers must return a plain map.
   """
-  @callback expose(state(), dependencies(), init_params()) :: any()
+  @callback expose(state(), dependencies(), init_params()) :: map()
 
   @optional_callbacks expose: 3
 
@@ -233,7 +243,13 @@ defmodule Solve.Controller do
       dependencies = normalize_optional_map(Keyword.get(opts, :dependencies))
       callbacks = normalize_optional_map(Keyword.get(opts, :callbacks))
       state = module.init(params, dependencies)
-      exposed_state = module.expose(state, dependencies, params)
+
+      exposed_state =
+        validate_exposed_state!(
+          module.expose(state, dependencies, params),
+          module,
+          controller_name
+        )
 
       {:ok,
        %{
@@ -372,6 +388,7 @@ defmodule Solve.Controller do
         server_state.dependencies,
         server_state.params
       )
+      |> validate_exposed_state!(server_state.module, server_state.controller_name)
 
     maybe_broadcast_update(server_state, new_exposed_state)
   end
@@ -390,5 +407,15 @@ defmodule Solve.Controller do
       {:solve_update, server_state.solve_app, server_state.controller_name, new_exposed_state}
 
     Enum.each(Map.keys(server_state.subscribers), &send(&1, message))
+  end
+
+  defp validate_exposed_state!(exposed_state, _module, _controller_name)
+       when is_map(exposed_state) and not is_struct(exposed_state) do
+    exposed_state
+  end
+
+  defp validate_exposed_state!(exposed_state, module, controller_name) do
+    raise ArgumentError,
+          "#{inspect(module)} expose/3 for #{inspect(controller_name)} must return a plain map, got: #{inspect(exposed_state)}"
   end
 end

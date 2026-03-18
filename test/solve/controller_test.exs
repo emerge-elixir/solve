@@ -9,7 +9,7 @@ defmodule Solve.ControllerTest do
     @impl true
     def init(%{initial: initial, test_pid: test_pid} = init_params, dependencies) do
       send(test_pid, {:counter_init, dependencies, init_params})
-      initial
+      %{count: initial}
     end
 
     def increment(payload, state, dependencies, callbacks, init_params) do
@@ -18,7 +18,7 @@ defmodule Solve.ControllerTest do
         {:increment_args, payload, state, dependencies, callbacks, init_params}
       )
 
-      state + payload
+      %{state | count: state.count + payload}
     end
   end
 
@@ -44,7 +44,7 @@ defmodule Solve.ControllerTest do
     def init(_init_params, _dependencies), do: :first
 
     @impl true
-    def expose(_state, _dependencies, _init_params), do: :stable
+    def expose(_state, _dependencies, _init_params), do: %{mode: :stable}
 
     def flip(_payload, _state, _dependencies, _callbacks, _init_params), do: :second
   end
@@ -57,7 +57,7 @@ defmodule Solve.ControllerTest do
       defmodule #{inspect(module)} do
         use Solve.Controller, events: [:increment, :increment]
 
-        def init(params, dependencies), do: {params, dependencies}
+        def init(_params, _dependencies), do: %{}
 
         def increment(payload, state, dependencies, callbacks, init_params) do
           {payload, state, dependencies, callbacks, init_params}
@@ -75,7 +75,7 @@ defmodule Solve.ControllerTest do
       defmodule #{inspect(module)} do
         use Solve.Controller, events: [:increment]
 
-        def init(params, dependencies), do: {params, dependencies}
+        def init(_params, _dependencies), do: %{}
       end
       """)
     end
@@ -95,7 +95,7 @@ defmodule Solve.ControllerTest do
              )
 
     assert_receive {:counter_init, %{}, ^params}
-    assert Solve.Controller.subscribe(pid) == 2
+    assert Solve.Controller.subscribe(pid) == %{count: 2}
   end
 
   test "dispatch/3 passes payload, state, dependencies, callbacks, and init params to events" do
@@ -107,17 +107,17 @@ defmodule Solve.ControllerTest do
                solve_app: :app,
                controller_name: :counter,
                params: params,
-               dependencies: %{source: 10},
+               dependencies: %{source: %{value: 10}},
                callbacks: callbacks
              )
 
-    assert_receive {:counter_init, %{source: 10}, ^params}
-    assert Solve.Controller.subscribe(pid) == 3
+    assert_receive {:counter_init, %{source: %{value: 10}}, ^params}
+    assert Solve.Controller.subscribe(pid) == %{count: 3}
 
     assert :ok = Solve.Controller.dispatch(pid, :increment, 4)
 
-    assert_receive {:increment_args, 4, 3, %{source: 10}, ^callbacks, ^params}
-    assert_receive {:solve_update, :app, :counter, 7}
+    assert_receive {:increment_args, 4, %{count: 3}, %{source: %{value: 10}}, ^callbacks, ^params}
+    assert_receive {:solve_update, :app, :counter, %{count: 7}}
   end
 
   test "init stops when params are falsy" do
@@ -147,9 +147,11 @@ defmodule Solve.ControllerTest do
 
     assert Solve.Controller.subscribe(pid) == %{state: :ready, source: nil, tag: :demo}
 
-    send(pid, {:solve_update, :app, :source, 42})
+    send(pid, {:solve_update, :app, :source, %{value: 42}})
 
-    assert_receive {:solve_update, :app, :derived, %{state: :ready, source: 42, tag: :demo}}
+    assert_receive {:solve_update, :app, :derived,
+                    %{state: :ready, source: %{value: 42}, tag: :demo}}
+
     refute_receive {:derived_init, _}
   end
 
@@ -166,7 +168,7 @@ defmodule Solve.ControllerTest do
              )
 
     assert_receive {:counter_init, %{}, ^params}
-    assert Solve.Controller.subscribe(pid) == 5
+    assert Solve.Controller.subscribe(pid) == %{count: 5}
 
     log =
       capture_log(fn ->
@@ -176,7 +178,7 @@ defmodule Solve.ControllerTest do
 
     assert log =~ "discarding undeclared Solve controller event :unknown for :counter"
     refute_receive {:solve_update, :app, :counter, _}
-    assert Solve.Controller.subscribe(pid) == 5
+    assert Solve.Controller.subscribe(pid) == %{count: 5}
   end
 
   test "state changes that do not affect expose/3 are not rebroadcast" do
@@ -189,7 +191,7 @@ defmodule Solve.ControllerTest do
                callbacks: %{}
              )
 
-    assert Solve.Controller.subscribe(pid) == :stable
+    assert Solve.Controller.subscribe(pid) == %{mode: :stable}
     assert :ok = Solve.Controller.dispatch(pid, :flip, :ignored)
     :sys.get_state(pid)
 
@@ -212,7 +214,7 @@ defmodule Solve.ControllerTest do
 
     subscriber = spawn(fn -> Process.sleep(:infinity) end)
 
-    assert Solve.Controller.subscribe(pid, subscriber) == 1
+    assert Solve.Controller.subscribe(pid, subscriber) == %{count: 1}
 
     Process.exit(subscriber, :shutdown)
     Process.sleep(10)
