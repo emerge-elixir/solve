@@ -33,7 +33,7 @@ defmodule Solve.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:phoenix_live_view, "~> 1.1", only: :test},
+      {:phoenix_live_view, "~> 1.1", optional: true},
       {:jason, "~> 1.4", only: :test},
       {:lazy_html, "~> 0.1", only: :test},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false, warn_if_outdated: true}
