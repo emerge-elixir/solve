@@ -72,7 +72,7 @@ defmodule Solve.LiveViewFormIntegrationTest do
 
     def render(assigns) do
       ~H"""
-      <form phx-change={@state.registration.validate} phx-submit={@state.registration.submit} id="form">
+      <form phx-change={@state.registration[:validate]} phx-submit={@state.registration[:submit]} id="form">
         <input type="text" name="form[name]" value={@state.registration.name} id="name" />
         <%= if @state.registration.errors[:name] do %>
           <span class="error" id="name-error">{@state.registration.errors[:name]}</span>

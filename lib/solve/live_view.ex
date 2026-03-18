@@ -19,9 +19,9 @@ defmodule Solve.LiveView do
 
         def render(assigns) do
           ~H\"\"\"
-          <button phx-click={@ls.counter.increment}>+</button>
+          <button phx-click={@ls.counter[:increment]}>+</button>
           <h1>{@ls.counter.count}</h1>
-          <button phx-click={@ls.counter.decrement}>-</button>
+          <button phx-click={@ls.counter[:decrement]}>-</button>
           \"\"\"
         end
       end
@@ -122,6 +122,22 @@ defmodule Solve.LiveView do
     socket
   end
 
+  defmodule Assigns do
+    @moduledoc false
+    defstruct []
+
+    @behaviour Access
+
+    @impl Access
+    def fetch(assigns, key), do: assigns |> Map.fetch!(:events_) |> Map.fetch(key)
+
+    @impl Access
+    def get_and_update(_, _, _), do: raise("Solve.LiveView.Assigns is read-only")
+
+    @impl Access
+    def pop(_, _), do: raise("Solve.LiveView.Assigns is read-only")
+  end
+
   defp to_assigns(_namespace, _controller_name, nil), do: nil
 
   defp to_assigns(namespace, controller_name, lookup_result) do
@@ -130,11 +146,8 @@ defmodule Solve.LiveView do
     |> Map.new(fn {event_name, %Solve.Lookup.Dispatch{}} ->
       {event_name, push_event(namespace, controller_name, event_name)}
     end)
-    |> then(fn js_events ->
-      lookup_result
-      |> Map.delete(:events_)
-      |> Map.merge(js_events)
-    end)
+    |> then(&Map.put(lookup_result, :events_, &1))
+    |> Map.put(:__struct__, Assigns)
   end
 
   defp find_namespace_for_app(app) do

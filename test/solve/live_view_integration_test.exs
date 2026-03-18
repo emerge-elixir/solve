@@ -43,9 +43,9 @@ defmodule Solve.LiveViewIntegrationTest do
 
     def render(assigns) do
       ~H"""
-      <button phx-click={@state.counter.increment} id="inc">+</button>
+      <button phx-click={@state.counter[:increment]} id="inc">+</button>
       <h1 id="count">{@state.counter.count}</h1>
-      <button phx-click={@state.counter.decrement} id="dec">-</button>
+      <button phx-click={@state.counter[:decrement]} id="dec">-</button>
       """
     end
   end

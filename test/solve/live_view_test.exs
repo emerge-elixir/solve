@@ -141,12 +141,12 @@ defmodule Solve.LiveViewTest do
     assert %{ls: %{counter: counter_map}} = assigns
     assert counter_map.count == 5
 
-    # Events are JS.push structs
-    assert %JS{} = counter_map.increment
-    assert %JS{} = counter_map.decrement
+    # Events accessible via bracket access
+    assert %JS{} = counter_map[:increment]
+    assert %JS{} = counter_map[:decrement]
 
-    # No :events_ key — it's been stripped
-    refute Map.has_key?(counter_map, :events_)
+    # Events live inside :events_
+    assert %{increment: %JS{}, decrement: %JS{}} = counter_map.events_
   end
 
   test "JS events carry correct metadata" do
@@ -156,7 +156,7 @@ defmodule Solve.LiveViewTest do
     %{ls: %{counter: counter_map}} = Solve.LiveView.solve(app_ref, [:counter])
 
     # Inspect the JS struct ops to verify metadata
-    assert %JS{ops: ops} = counter_map.increment
+    assert %JS{ops: ops} = counter_map[:increment]
     assert [["push", %{event: "solve_event", value: value}]] = ops
     assert value["_sn"] == :ls
     assert value["_sc"] == :counter
@@ -188,8 +188,8 @@ defmodule Solve.LiveViewTest do
     assert %{ls: %{counter: counter, timer: timer}} = assigns
     assert counter.count == 3
     assert timer.elapsed == 10
-    assert %JS{} = counter.increment
-    assert %JS{} = timer.tick
+    assert %JS{} = counter[:increment]
+    assert %JS{} = timer[:tick]
   end
 
   test "__handle_info__ updates socket assigns" do
@@ -207,7 +207,7 @@ defmodule Solve.LiveViewTest do
 
     assert %{ls: %{counter: counter}} = updated_socket.assigns
     assert counter.count == 42
-    assert %JS{} = counter.increment
+    assert %JS{} = counter[:increment]
   end
 
   test "__handle_info__ preserves other controllers in namespace" do
@@ -286,10 +286,10 @@ defmodule Solve.LiveViewTest do
     %{ns1: %{counter: c1}} = assigns1
     %{ns2: %{counter: c2}} = assigns2
 
-    assert %JS{ops: [[_, %{value: v1}]]} = c1.increment
+    assert %JS{ops: [[_, %{value: v1}]]} = c1[:increment]
     assert v1["_sn"] == :ns1
 
-    assert %JS{ops: [[_, %{value: v2}]]} = c2.increment
+    assert %JS{ops: [[_, %{value: v2}]]} = c2[:increment]
     assert v2["_sn"] == :ns2
   end
 
@@ -302,9 +302,9 @@ defmodule Solve.LiveViewTest do
     assert %{app: %{registration: reg}} = assigns
     assert reg.name == ""
     assert reg.email == ""
-    assert %JS{} = reg.change
-    assert %JS{} = reg.validate
-    assert %JS{} = reg.submit
+    assert %JS{} = reg[:change]
+    assert %JS{} = reg[:validate]
+    assert %JS{} = reg[:submit]
 
     socket = fake_socket(assigns)
 
