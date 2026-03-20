@@ -20,7 +20,7 @@
 │  • Send updates directly to dependents                       │
 └─────────────────────────────────────────────────────────────┘
          │                              ▲
-         │ {:solve_update, ...}         │ {:event, ...}
+         │ %Solve.Message{type: :update, ...} │ {:event, ...}
          │                              │
          ▼                              │
 ┌─────────────────────────────────────────────────────────────┐
@@ -59,7 +59,7 @@
 │  computed: 50     │
 └──────────────────┘
          │
-         │ {:solve_update, ...}
+         │ %Solve.Message{type: :update, ...}
          ▼
     ┌────────────┐
     │  LiveView  │
@@ -85,7 +85,7 @@
 3. **LiveView receives update:**
    ```elixir
    # In LiveView handle_info
-   {:solve_update, :counter, :counter, %{count: 1}}
+   %Solve.Message{type: :update, payload: %Solve.Update{app: :counter, controller_name: :counter, exposed_state: %{count: 1}}}
    ```
 
 ### Source Controller → Dependent Controller → LiveView
@@ -173,4 +173,3 @@ LiveComponents provide reusable UI components that subscribe to controllers from
 - 📈 **Scalability**: No central bottleneck
 - 🎯 **Clarity**: Each module has one job
 - 🔄 **Real-time**: Direct updates enable instant reactivity
-

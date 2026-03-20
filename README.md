@@ -65,7 +65,7 @@ end
 Start the app like any other GenServer:
 
 ```elixir
-{:ok, _pid} = MyApp.State.start_link(name: MyApp.State)
+{:ok, app} = MyApp.State.start_link(name: MyApp.State)
 ```
 
 ### 3. Use it from another process with `Solve.Lookup`
@@ -75,34 +75,77 @@ defmodule MyApp.CounterWorker do
   use GenServer
   use Solve.Lookup
 
-  def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
-  end
-
-  @impl true
-  def init(_opts) do
-    {:ok, %{}}
+  def start_link(app) do
+    GenServer.start_link(__MODULE__, app, name: __MODULE__)
   end
 
   def increment do
-    counter = solve(MyApp.State, :counter)
-    send(self(), events(counter)[:increment])
+    GenServer.cast(__MODULE__, :increment)
   end
 
   def decrement do
-    counter = solve(MyApp.State, :counter)
+    GenServer.cast(__MODULE__, :decrement)
+  end
+
+  @impl true
+  def init(app) do
+    {:ok, %{app: app}}
+  end
+
+  @impl true
+  def handle_cast(:increment, state) do
+    counter = solve(state.app, :counter)
+    send(self(), events(counter)[:increment])
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_cast(:decrement, state) do
+    counter = solve(state.app, :counter)
     send(self(), events(counter)[:decrement])
+    {:noreply, state}
   end
 
   def render(state) do
-    counter = solve(MyApp.State, :counter)
+    counter = solve(state.app, :counter)
     IO.inspect(counter, label: "counter")
     state
+  end
+
+  @impl Solve.Lookup
+  def handle_solve_updated(_updated, state) do
+    {:ok, render(state)}
   end
 end
 ```
 
-`use Solve.Lookup` defaults to `on_update: :render`, so `render/1` is called after lookup cache updates.
+`use Solve.Lookup` defaults to `handle_info: :auto`, so `%Solve.Message{}` update envelopes
+refresh the local lookup cache and trigger `handle_solve_updated/2`.
+
+For manual control, use `handle_info: :manual` and process `%Solve.Message{}` yourself:
+
+```elixir
+def handle_info(nil, state) do
+  {:noreply, state}
+end
+
+def handle_info(%Solve.Message{} = message, %{app: app} = state) do
+  case handle_message(message) do
+    %{^app => controllers} ->
+      if :counter in controllers,
+        do: {:noreply, render(state)},
+        else: {:noreply, state}
+
+    %{} ->
+      {:noreply, state}
+  end
+end
+
+def handle_info(_message, state), do: {:noreply, state}
+```
+
+`handle_message/1` returns a map keyed by the actual Solve app ref/pid, so manual handlers
+typically match the `app` stored in state.
 
 ### 4. Dispatch directly through `Solve`
 
@@ -120,8 +163,8 @@ counter = Solve.subscribe(MyApp.State, :counter)
 %{
   count: 2,
   events_: %{
-    increment: %Solve.Lookup.Dispatch{...},
-    decrement: %Solve.Lookup.Dispatch{...}
+    increment: %Solve.Message{type: :dispatch, payload: %Solve.Dispatch{...}},
+    decrement: %Solve.Message{type: :dispatch, payload: %Solve.Dispatch{...}}
   }
 }
 ```
@@ -129,11 +172,13 @@ counter = Solve.subscribe(MyApp.State, :counter)
 Use `events/1` to read that key safely:
 
 ```elixir
-counter = solve(MyApp.State, :counter)
+counter = solve(app, :counter)
 send(self(), events(counter)[:increment])
 ```
 
-If the controller is off, `solve/2` returns `nil` and `events(nil)` also returns `nil`, so the same pattern stays safe.
+If the controller is off, `solve/2` returns `nil` and `events(nil)` also returns `nil`. Auto
+mode ignores that `nil`, and manual mode can do the same with the `handle_info(nil, state)`
+clause shown above.
 
 ## Key Rules
 

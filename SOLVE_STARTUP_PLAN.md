@@ -13,8 +13,8 @@ try to preserve older markdown design docs.
   lifetime.
 - Evaluate controller params inside `Solve`.
 - Support start, stop, restart, and atomic replacement of controllers.
-- Keep controller-to-controller updates using:
-  `{:solve_update, solve_app, controller_name, exposed_state}`.
+- Keep controller-to-controller updates using `%Solve.Message{}` envelopes with
+  `%Solve.Update{}` payloads.
 
 ## Solve State
 
@@ -100,7 +100,7 @@ callbacks: callbacks
 6. If the returned dependency snapshot differs from the startup snapshot, send:
 
 ```elixir
-{:solve_update, self(), dependency_name, exposed_state}
+Solve.Message.update(self(), dependency_name, exposed_state)
 ```
 
    to the newly started controller.
@@ -123,7 +123,7 @@ When `Solve` intentionally stops a controller:
 - set exposed state to `nil`
 - set status to `:stopped`
 - keep params cache aligned with the newly evaluated value
-- send synthetic `{:solve_update, solve_app, controller_name, nil}` to currently
+- send synthetic `Solve.Message.update(solve_app, controller_name, nil)` to currently
   running direct dependents
 
 Planned `:normal` stops do not count toward restart budget.
@@ -138,8 +138,8 @@ For `truthy -> truthy` with changed params:
 3. Subscribe `Solve` to it and capture its current exposed state.
 4. Swap `Solve` runtime maps from old pid to new pid.
 5. Subscribe currently running direct dependents to the new pid.
-6. Send one synthetic `{:solve_update, solve_app, controller_name,
-   new_exposed_state}` to direct dependents.
+6. Send one synthetic `Solve.Message.update(solve_app, controller_name,
+   new_exposed_state)` to direct dependents.
 7. Stop the old controller with `:normal`.
 8. Reconcile descendants.
 
@@ -151,7 +151,7 @@ controller.
 `Solve` handles:
 
 ```elixir
-{:solve_update, solve_app, controller_name, exposed_state}
+%Solve.Message{type: :update, payload: %Solve.Update{app: solve_app, controller_name: controller_name, exposed_state: exposed_state}}
 ```
 
 When the update belongs to the current `Solve` instance:

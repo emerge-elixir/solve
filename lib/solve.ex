@@ -20,6 +20,8 @@ defmodule Solve do
   alias Solve.Controller
   alias Solve.ControllerSpec
   alias Solve.DependencyGraph
+  alias Solve.Message
+  alias Solve.Update
 
   @max_restart_attempts 3
   @restart_window_ms 5_000
@@ -187,7 +189,17 @@ defmodule Solve do
   end
 
   @doc false
-  def __handle_info__({:solve_update, solve_app, controller_name, exposed_state}, state)
+  def __handle_info__(
+        %Message{
+          type: :update,
+          payload: %Update{
+            app: solve_app,
+            controller_name: controller_name,
+            exposed_state: exposed_state
+          }
+        },
+        state
+      )
       when solve_app == self() do
     if Map.get(state.controller_status_by_name, controller_name) == :started do
       state = put_controller_exposed_state(controller_name, exposed_state, state)
@@ -201,7 +213,7 @@ defmodule Solve do
     end
   end
 
-  def __handle_info__({:solve_update, _solve_app, _controller_name, _exposed_state}, state) do
+  def __handle_info__(%Message{type: :update, payload: %Update{}}, state) do
     {:noreply, state}
   end
 
@@ -352,7 +364,7 @@ defmodule Solve do
     dependent_pid = Map.get(state.controller_pids_by_name, dependent_name)
 
     if is_pid(dependent_pid) do
-      send(dependent_pid, {:solve_update, self(), source_name, nil})
+      send(dependent_pid, Message.update(self(), source_name, nil))
     end
 
     state
@@ -371,7 +383,7 @@ defmodule Solve do
       exposed_state = subscribe_controller_safely(source_pid, dependent_pid)
 
       if exposed_state != :subscription_failed do
-        send(dependent_pid, {:solve_update, self(), source_name, exposed_state})
+        send(dependent_pid, Message.update(self(), source_name, exposed_state))
       end
     end
 
@@ -585,7 +597,7 @@ defmodule Solve do
           exposed_state = Controller.subscribe(dependency_pid, pid)
 
           if Map.get(dependencies_snapshot, dependency_name) != exposed_state do
-            send(pid, {:solve_update, self(), dependency_name, exposed_state})
+            send(pid, Message.update(self(), dependency_name, exposed_state))
           end
       end
     end)
@@ -691,7 +703,7 @@ defmodule Solve do
         exposed_state = subscribe_controller_safely(pid, subscriber)
 
         if exposed_state != :subscription_failed do
-          send(subscriber, {:solve_update, self(), controller_name, exposed_state})
+          send(subscriber, Message.update(self(), controller_name, exposed_state))
         end
       end
     )
@@ -703,7 +715,7 @@ defmodule Solve do
     Enum.each(
       Map.get(state.subscribers_by_controller_name, controller_name, MapSet.new()),
       fn subscriber ->
-        send(subscriber, {:solve_update, self(), controller_name, exposed_state})
+        send(subscriber, Message.update(self(), controller_name, exposed_state))
       end
     )
   end

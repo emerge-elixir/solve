@@ -206,15 +206,30 @@ defmodule Solve.RuntimeTest do
 
     assert :ok = Solve.dispatch(app, :derived, :ignored, :payload)
     assert :ok = Solve.dispatch(app, :missing, :ignored, :payload)
-    refute_receive {:solve_update, ^app, :derived, _}, 50
+
+    refute_receive %Solve.Message{
+                     type: :update,
+                     payload: %Solve.Update{
+                       app: ^app,
+                       controller_name: :derived,
+                       exposed_state: _
+                     }
+                   },
+                   50
 
     assert :ok = Solve.dispatch(app, :source, :set, 1)
 
     assert_receive {:derived_init, 1, %{source: %{value: 1}}, %{label: 1, test_pid: test_pid}}
     assert test_pid == self()
 
-    assert_receive {:solve_update, ^app, :derived,
-                    %{label: 1, source: %{value: 1}, state: {:derived_state, 1}}}
+    assert_receive %Solve.Message{
+      type: :update,
+      payload: %Solve.Update{
+        app: ^app,
+        controller_name: :derived,
+        exposed_state: %{label: 1, source: %{value: 1}, state: {:derived_state, 1}}
+      }
+    }
 
     derived_pid = await_controller_pid(app, :derived)
 
@@ -223,14 +238,34 @@ defmodule Solve.RuntimeTest do
     assert_receive {:derived_init, 2, %{source: %{value: 2}}, %{label: 2, test_pid: test_pid}}
     assert test_pid == self()
 
-    assert_receive {:solve_update, ^app, :derived,
-                    %{label: 2, source: %{value: 2}, state: {:derived_state, 2}}}
+    assert_receive %Solve.Message{
+      type: :update,
+      payload: %Solve.Update{
+        app: ^app,
+        controller_name: :derived,
+        exposed_state: %{label: 2, source: %{value: 2}, state: {:derived_state, 2}}
+      }
+    }
 
-    refute_receive {:solve_update, ^app, :derived, nil}, 50
+    refute_receive %Solve.Message{
+                     type: :update,
+                     payload: %Solve.Update{
+                       app: ^app,
+                       controller_name: :derived,
+                       exposed_state: nil
+                     }
+                   },
+                   50
+
     refute await_pid_change(app, :derived, derived_pid) == derived_pid
 
     assert :ok = Solve.dispatch(app, :source, :set, 0)
-    assert_receive {:solve_update, ^app, :derived, nil}
+
+    assert_receive %Solve.Message{
+      type: :update,
+      payload: %Solve.Update{app: ^app, controller_name: :derived, exposed_state: nil}
+    }
+
     assert await_controller_stop(app, :derived) == nil
 
     assert :ok = Solve.dispatch(app, :derived, :ignored, :payload)
@@ -239,8 +274,14 @@ defmodule Solve.RuntimeTest do
     assert_receive {:derived_init, 1, %{source: %{value: 1}}, %{label: 1, test_pid: test_pid}}
     assert test_pid == self()
 
-    assert_receive {:solve_update, ^app, :derived,
-                    %{label: 1, source: %{value: 1}, state: {:derived_state, 1}}}
+    assert_receive %Solve.Message{
+      type: :update,
+      payload: %Solve.Update{
+        app: ^app,
+        controller_name: :derived,
+        exposed_state: %{label: 1, source: %{value: 1}, state: {:derived_state, 1}}
+      }
+    }
   end
 
   test "truthy params that stay equal keep the current controller instance" do
@@ -264,8 +305,14 @@ defmodule Solve.RuntimeTest do
 
     assert :ok = Solve.dispatch(app, :source, :set, 2)
 
-    assert_receive {:solve_update, ^app, :stable,
-                    %{mode: :positive, source: %{value: 2}, state: :stable}}
+    assert_receive %Solve.Message{
+      type: :update,
+      payload: %Solve.Update{
+        app: ^app,
+        controller_name: :stable,
+        exposed_state: %{mode: :positive, source: %{value: 2}, state: :stable}
+      }
+    }
 
     refute_receive {:stable_init, _, _, _}, 50
     assert Solve.controller_pid(app, :stable) == stable_pid
@@ -282,9 +329,17 @@ defmodule Solve.RuntimeTest do
     capture_log(fn ->
       assert :ok = Solve.dispatch(app, :crashy, :crash, :boom)
 
-      assert_receive {:solve_update, ^app, :crashy, nil}
+      assert_receive %Solve.Message{
+        type: :update,
+        payload: %Solve.Update{app: ^app, controller_name: :crashy, exposed_state: nil}
+      }
+
       assert_receive {:crashy_init, 1}
-      assert_receive {:solve_update, ^app, :crashy, %{value: 1}}
+
+      assert_receive %Solve.Message{
+        type: :update,
+        payload: %Solve.Update{app: ^app, controller_name: :crashy, exposed_state: %{value: 1}}
+      }
     end)
 
     refute await_pid_change(app, :crashy, pid) == pid
@@ -304,14 +359,26 @@ defmodule Solve.RuntimeTest do
       Enum.each(1..3, fn attempt ->
         assert :ok = Solve.dispatch(app, :crashy, :crash, attempt)
 
-        assert_receive {:solve_update, ^app, :crashy, nil}
+        assert_receive %Solve.Message{
+          type: :update,
+          payload: %Solve.Update{app: ^app, controller_name: :crashy, exposed_state: nil}
+        }
+
         assert_receive {:crashy_init, 1}
-        assert_receive {:solve_update, ^app, :crashy, %{value: 1}}
+
+        assert_receive %Solve.Message{
+          type: :update,
+          payload: %Solve.Update{app: ^app, controller_name: :crashy, exposed_state: %{value: 1}}
+        }
       end)
 
       assert :ok = Solve.dispatch(app, :crashy, :crash, :final)
 
-      assert_receive {:solve_update, ^app, :crashy, nil}
+      assert_receive %Solve.Message{
+        type: :update,
+        payload: %Solve.Update{app: ^app, controller_name: :crashy, exposed_state: nil}
+      }
+
       assert_receive {:EXIT, ^app, {:controller_restart_limit_exceeded, :crashy, _reason}}, 1_000
     end)
   end
