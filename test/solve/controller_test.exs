@@ -117,7 +117,11 @@ defmodule Solve.ControllerTest do
     assert :ok = Solve.Controller.dispatch(pid, :increment, 4)
 
     assert_receive {:increment_args, 4, %{count: 3}, %{source: %{value: 10}}, ^callbacks, ^params}
-    assert_receive {:solve_update, :app, :counter, %{count: 7}}
+
+    assert_receive %Solve.Message{
+      type: :update,
+      payload: %Solve.Update{app: :app, controller_name: :counter, exposed_state: %{count: 7}}
+    }
   end
 
   test "init stops when params are falsy" do
@@ -147,10 +151,16 @@ defmodule Solve.ControllerTest do
 
     assert Solve.Controller.subscribe(pid) == %{state: :ready, source: nil, tag: :demo}
 
-    send(pid, {:solve_update, :app, :source, %{value: 42}})
+    send(pid, Solve.Message.update(:app, :source, %{value: 42}))
 
-    assert_receive {:solve_update, :app, :derived,
-                    %{state: :ready, source: %{value: 42}, tag: :demo}}
+    assert_receive %Solve.Message{
+      type: :update,
+      payload: %Solve.Update{
+        app: :app,
+        controller_name: :derived,
+        exposed_state: %{state: :ready, source: %{value: 42}, tag: :demo}
+      }
+    }
 
     refute_receive {:derived_init, _}
   end
@@ -177,7 +187,12 @@ defmodule Solve.ControllerTest do
       end)
 
     assert log =~ "discarding undeclared Solve controller event :unknown for :counter"
-    refute_receive {:solve_update, :app, :counter, _}
+
+    refute_receive %Solve.Message{
+      type: :update,
+      payload: %Solve.Update{app: :app, controller_name: :counter, exposed_state: _}
+    }
+
     assert Solve.Controller.subscribe(pid) == %{count: 5}
   end
 
@@ -195,7 +210,10 @@ defmodule Solve.ControllerTest do
     assert :ok = Solve.Controller.dispatch(pid, :flip, :ignored)
     :sys.get_state(pid)
 
-    refute_receive {:solve_update, :app, :static, _}
+    refute_receive %Solve.Message{
+      type: :update,
+      payload: %Solve.Update{app: :app, controller_name: :static, exposed_state: _}
+    }
   end
 
   test "dead subscribers are removed from the controller state" do

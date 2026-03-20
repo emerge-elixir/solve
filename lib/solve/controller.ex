@@ -18,8 +18,8 @@ defmodule Solve.Controller do
 
   ## Direct Communication
 
-  Controllers communicate directly with subscribers using
-  `{:solve_update, solve_app, controller_name, exposed_state}` messages.
+  Controllers communicate directly with subscribers using `%Solve.Message{}` envelopes
+  with `%Solve.Update{}` payloads.
 
   ## Example Controller
 
@@ -99,6 +99,7 @@ defmodule Solve.Controller do
   """
 
   require Logger
+  alias Solve.Message
 
   @genserver_start_options [:name, :timeout, :debug, :spawn_opt, :hibernate_after]
 
@@ -157,7 +158,17 @@ defmodule Solve.Controller do
       end
 
       @impl GenServer
-      def handle_info({:solve_update, solve_app, dependency_name, exposed_state}, server_state) do
+      def handle_info(
+            %Solve.Message{
+              type: :update,
+              payload: %Solve.Update{
+                app: solve_app,
+                controller_name: dependency_name,
+                exposed_state: exposed_state
+              }
+            },
+            server_state
+          ) do
         Solve.Controller.__handle_dependency_update__(
           solve_app,
           dependency_name,
@@ -404,7 +415,7 @@ defmodule Solve.Controller do
 
   defp broadcast_update(server_state, new_exposed_state) do
     message =
-      {:solve_update, server_state.solve_app, server_state.controller_name, new_exposed_state}
+      Message.update(server_state.solve_app, server_state.controller_name, new_exposed_state)
 
     Enum.each(Map.keys(server_state.subscribers), &send(&1, message))
   end
