@@ -43,7 +43,7 @@ defmodule Solve.MixProject do
       source_ref: "readme",
       extras: [
         "README.md",
-        "ARCHITECTURE.md",
+        "ARCHITECTURE.md"
       ],
       groups_for_modules: [
         {"Core", [Solve]},
