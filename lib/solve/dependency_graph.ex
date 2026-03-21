@@ -47,10 +47,16 @@ defmodule Solve.DependencyGraph do
   def compile(other), do: {:error, {:invalid_controller_specs, other}}
 
   defp ensure_controllers_callback(module) do
-    if function_exported?(module, :controllers, 0) do
-      :ok
-    else
-      {:error, :missing_controllers_callback}
+    case Code.ensure_compiled(module) do
+      {:module, ^module} ->
+        if function_exported?(module, :controllers, 0) do
+          :ok
+        else
+          {:error, :missing_controllers_callback}
+        end
+
+      {:error, reason} ->
+        {:error, {:module_not_compiled, module, reason}}
     end
   end
 
@@ -85,6 +91,10 @@ defmodule Solve.DependencyGraph do
 
   defp format_error(module, :missing_controllers_callback) do
     "#{inspect(module)} must implement controllers/0"
+  end
+
+  defp format_error(_module, {:module_not_compiled, target_module, reason}) do
+    "unable to compile #{inspect(target_module)} while validating controllers: #{inspect(reason)}"
   end
 
   defp format_error(module, {:invalid_controllers_return, value}) do

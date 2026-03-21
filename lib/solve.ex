@@ -543,29 +543,35 @@ defmodule Solve do
          opts,
          state
        ) do
-    cond do
-      not function_exported?(controller_module, :start_link, 1) ->
-        {:error, {:missing_controller_start_link, controller_module}, state}
+    case Code.ensure_loaded(controller_module) do
+      {:module, ^controller_module} ->
+        cond do
+          not function_exported?(controller_module, :start_link, 1) ->
+            {:error, {:missing_controller_start_link, controller_module}, state}
 
-      true ->
-        case controller_module.start_link(opts) do
-          {:ok, pid} ->
-            case finalize_started_controller_instance(
-                   pid,
-                   dependency_names,
-                   dependencies_snapshot,
-                   state
-                 ) do
-              {:ok, exposed_state} -> {:ok, pid, exposed_state, state}
-              {:error, reason} -> {:error, reason, state}
+          true ->
+            case controller_module.start_link(opts) do
+              {:ok, pid} ->
+                case finalize_started_controller_instance(
+                       pid,
+                       dependency_names,
+                       dependencies_snapshot,
+                       state
+                     ) do
+                  {:ok, exposed_state} -> {:ok, pid, exposed_state, state}
+                  {:error, reason} -> {:error, reason, state}
+                end
+
+              {:error, reason} ->
+                {:error, reason, state}
+
+              other ->
+                {:error, {:invalid_controller_start, controller_module, other}, state}
             end
-
-          {:error, reason} ->
-            {:error, reason, state}
-
-          other ->
-            {:error, {:invalid_controller_start, controller_module, other}, state}
         end
+
+      {:error, reason} ->
+        {:error, {:controller_module_not_loaded, controller_module, reason}, state}
     end
   catch
     :exit, reason -> {:error, reason, state}
