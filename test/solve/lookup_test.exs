@@ -165,6 +165,28 @@ defmodule Solve.LookupTest do
     assert Map.has_key?(events, :increment)
   end
 
+  test "lookup cache stays fresh when app is addressed by registered name" do
+    name = unique_name("NamedLookup")
+    assert {:ok, app} = LookupSolve.start_link(name: name, params: %{initial: 1})
+
+    on_exit(fn ->
+      if Process.alive?(app) do
+        stop_process(app)
+      end
+    end)
+
+    assert {:ok, worker} = AutoLookupWorker.start_link(name, self())
+
+    counter = GenServer.call(worker, {:solve, :counter})
+    assert counter.count == 1
+
+    send(worker, Solve.Lookup.events(counter).increment)
+
+    assert await_lookup_count(worker) == 2
+    assert_receive {:solve_updated, %{^app => [:counter]}, %{count: 2, events_: events}}
+    assert Map.has_key?(events, :increment)
+  end
+
   test "events(nil) returns nil and injected nil handle_info is a no-op" do
     app = start_app(LookupSolve, %{initial: 1})
     assert {:ok, worker} = AutoLookupWorker.start_link(app, self())

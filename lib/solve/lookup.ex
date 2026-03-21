@@ -238,15 +238,14 @@ defmodule Solve.Lookup do
       when is_atom(controller_name) do
     app = resolve_app!(app)
 
-    ref =
-      Process.get(ref_key(app, controller_name)) || build_lookup_ref(app, controller_name, nil)
+    ref = lookup_ref(app, controller_name) || build_lookup_ref(app, controller_name, nil)
 
     put_lookup_ref(%{ref | value: validate_lookup_value!(exposed_value), subscribed?: true})
     %{app => [controller_name]}
   end
 
   defp ensure_lookup_ref(app, controller_name) do
-    case Process.get(ref_key(app, controller_name)) do
+    case lookup_ref(app, controller_name) do
       %Ref{} = ref ->
         ref
 
@@ -304,12 +303,51 @@ defmodule Solve.Lookup do
           "Solve.Lookup expects exposed controller values to be plain maps or nil, got: #{inspect(value)}"
   end
 
+  defp lookup_ref(app, controller_name) do
+    app
+    |> ref_keys(controller_name)
+    |> Enum.find_value(&Process.get/1)
+  end
+
   defp put_lookup_ref(%Ref{} = ref) do
-    Process.put(ref_key(ref.app, ref.controller_name), ref)
+    ref_keys(ref.app, ref.controller_name)
+    |> Enum.each(&Process.put(&1, ref))
+
     ref
   end
 
   defp ref_key(app, controller_name), do: {:solve_lookup_ref, app, controller_name}
+
+  defp ref_keys(app, controller_name) do
+    [app | app_aliases(app)]
+    |> Enum.uniq()
+    |> Enum.map(&ref_key(&1, controller_name))
+  end
+
+  defp app_aliases(app) do
+    pid = app_pid(app)
+
+    case {app, pid} do
+      {_app, nil} ->
+        []
+
+      {app, pid} when is_pid(app) ->
+        registered_name_aliases(pid)
+
+      {_app, pid} ->
+        [pid | registered_name_aliases(pid)]
+    end
+  end
+
+  defp app_pid(app) when is_pid(app), do: app
+  defp app_pid(app), do: GenServer.whereis(app)
+
+  defp registered_name_aliases(pid) do
+    case Process.info(pid, :registered_name) do
+      {:registered_name, name} when is_atom(name) -> [name]
+      _ -> []
+    end
+  end
 
   defp resolve_app!(nil) do
     case Process.get(:solve_app) do
