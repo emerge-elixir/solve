@@ -1,27 +1,12 @@
-# Solve
+# Counter Lookup Example
 
-Solve manages a graph of controller processes.
+This example shows the smallest end-to-end Solve setup:
 
-- Controllers are `GenServer`s.
-- A running controller exposes a plain map.
-- `nil` means a controller is off/stopped.
-- `Solve.Lookup` is the main process-facing API.
+- a controller implemented as a `GenServer`
+- a `Solve` app that starts and manages that controller
+- another process using `Solve.Lookup` to read state and dispatch events
 
-## Installation
-
-If [available in Hex](https://hex.pm/docs/publish), add `solve` to your dependencies:
-
-```elixir
-def deps do
-  [
-    {:solve, "~> 0.1.0"}
-  ]
-end
-```
-
-## Getting Started
-
-### 1. Define a controller
+## Controller
 
 ```elixir
 defmodule MyApp.CounterController do
@@ -32,19 +17,21 @@ defmodule MyApp.CounterController do
     %{count: 0}
   end
 
-  def increment(_payload, state, _dependencies, _callbacks, _params) do
+  def increment(_payload, state, _dependencies, _callbacks, _init_params) do
     %{state | count: state.count + 1}
   end
 
-  def decrement(_payload, state, _dependencies, _callbacks, _params) do
+  def decrement(_payload, state, _dependencies, _callbacks, _init_params) do
     %{state | count: state.count - 1}
   end
 end
 ```
 
-This controller uses the default `expose/3`, so its internal state is also the exposed map.
+This controller uses the default `expose/3`, so its internal state is also the exposed state.
+Because running controllers must expose plain maps, `%{count: 0}` is both valid internal state
+and valid exposed state.
 
-### 2. Define a Solve app
+## Solve App
 
 ```elixir
 defmodule MyApp.State do
@@ -68,7 +55,7 @@ Start the app like any other GenServer:
 {:ok, app} = MyApp.State.start_link(name: MyApp.State)
 ```
 
-### 3. Use it from another process with `Solve.Lookup`
+## GenServer Using `Solve.Lookup`
 
 ```elixir
 defmodule MyApp.CounterWorker do
@@ -119,10 +106,19 @@ defmodule MyApp.CounterWorker do
 end
 ```
 
-`use Solve.Lookup` defaults to `handle_info: :auto`, so `%Solve.Message{}` update envelopes
-refresh the local lookup cache and trigger `handle_solve_updated/2`.
+`use Solve.Lookup` defaults to:
 
-For manual control, use `handle_info: :manual` and process `%Solve.Message{}` yourself:
+- `handle_info: :auto`
+
+That means:
+
+- the first `solve/2` call subscribes this process to the controller
+- the latest exposed map is cached in the process dictionary
+- every `%Solve.Message{type: :update, ...}` refreshes that cache
+- non-empty updates are passed to `handle_solve_updated/2`
+
+If you prefer explicit handling, use `handle_info: :manual` and match `%Solve.Message{}`
+yourself:
 
 ```elixir
 def handle_info(nil, state) do
@@ -141,27 +137,21 @@ def handle_info(%Solve.Message{} = message, %{app: app} = state) do
   end
 end
 
-def handle_info(_message, state), do: {:noreply, state}
+def handle_info(_message, state) do
+  {:noreply, state}
+end
 ```
 
 `handle_message/1` returns a map keyed by the actual Solve app ref/pid, so manual handlers
 typically match the `app` stored in state.
 
-### 4. Dispatch directly through `Solve`
-
-```elixir
-:ok = Solve.dispatch(MyApp.State, :counter, :increment, %{})
-counter = Solve.subscribe(MyApp.State, :counter)
-# => %{count: 1}
-```
-
 ## What `solve/2` returns
 
-`solve(app, controller_name)` returns the controller's exposed map augmented with an `:events_` key.
+`solve(app, :counter)` returns the controller's exposed map augmented with `:events_`.
 
 ```elixir
 %{
-  count: 2,
+  count: 0,
   events_: %{
     increment: %Solve.Message{type: :dispatch, payload: %Solve.Dispatch{...}},
     decrement: %Solve.Message{type: :dispatch, payload: %Solve.Dispatch{...}}
@@ -169,7 +159,7 @@ counter = Solve.subscribe(MyApp.State, :counter)
 }
 ```
 
-Use `events/1` to read that key safely:
+Use `events/1` to access those refs safely:
 
 ```elixir
 counter = solve(app, :counter)
@@ -180,15 +170,43 @@ If the controller is off, `solve/2` returns `nil` and `events(nil)` also returns
 mode ignores that `nil`, and manual mode can do the same with the `handle_info(nil, state)`
 clause shown above.
 
+## Starting Everything
+
+```elixir
+{:ok, app} = MyApp.State.start_link(name: MyApp.State)
+{:ok, _worker_pid} = MyApp.CounterWorker.start_link(app)
+
+MyApp.CounterWorker.increment()
+MyApp.CounterWorker.increment()
+MyApp.CounterWorker.decrement()
+```
+
+The worker will print something like:
+
+```elixir
+counter: %{count: 1, events_: %{decrement: %Solve.Message{...}, increment: %Solve.Message{...}}}
+counter: %{count: 2, events_: %{decrement: %Solve.Message{...}, increment: %Solve.Message{...}}}
+counter: %{count: 1, events_: %{decrement: %Solve.Message{...}, increment: %Solve.Message{...}}}
+```
+
+## Process-Local Cache
+
+`Solve.Lookup` keeps one private ref per app/controller in the process dictionary under:
+
+```elixir
+{:solve_lookup_ref, app, controller_name}
+```
+
+That ref contains:
+
+- the current raw exposed map or `nil`
+- prebuilt event dispatch envelopes
+- subscription bookkeeping for the current process
+
 ## Key Rules
 
 - Running controllers must expose plain maps.
-- `nil` means a controller is off/stopped.
-- `:events_` is reserved in exposed maps for lookup augmentation.
+- `nil` means the controller is off/stopped.
+- `:events_` is reserved for lookup augmentation.
 - `Solve.subscribe/3` returns raw exposed state.
 - `Solve.Lookup.solve/2` returns the augmented process-local view.
-
-## More Example Code
-
-See `examples/counter_lookup_example.md` for a full end-to-end example with a controller, a
-`Solve` app, and a GenServer using `Solve.Lookup`.
