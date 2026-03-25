@@ -3,7 +3,7 @@
 This is the main `Solve.Lookup` style to copy.
 
 - read state in `render/1`
-- read event refs with `events/1`
+- build UI handlers with `event/2` and `event/3`
 - rerender from `handle_solve_updated/2`
 
 It mirrors the `EmergeDemo` pattern used in the local Emerge example app.
@@ -18,13 +18,12 @@ defmodule EmergeDemo do
   @impl Viewport
   def render(_state) do
     counter = solve(EmergeDemo.State, :counter)
-    counter_events = events(counter)
 
     column([], [
       row([], [
-        button("+", counter_events[:increment]),
+        button("+", event(counter, :increment)),
         el([], text("Count: #{counter.count}")),
-        button("-", counter_events[:decrement])
+        button("-", event(counter, :decrement))
       ])
     ])
   end
@@ -40,8 +39,12 @@ Why this feels good:
 
 - the first `solve/2` call subscribes the viewport process
 - later `solve/2` calls read from the local lookup cache
-- `events(counter)` gives you dispatch refs without wiring callback functions by hand
+- `event(counter, :increment)` gives you an Emerge-ready `{pid, message}` tuple
 - `handle_solve_updated/2` can stay tiny and just trigger a rerender
+
+Use `event(controller, event_name)` when Emerge should provide the payload later, like
+`Event.on_change(event(form, :set_title))`. Use `event(controller, event_name, payload)` when the
+payload is fixed at render time.
 
 ## Collection Lookup Uses The Same Pattern
 
@@ -52,7 +55,7 @@ def render(_state) do
   columns = collection(MyApp.State, :column)
 
   row([], Enum.map(columns, fn {_id, column} ->
-    column_widget(column.title, events(column)[:rename])
+    Input.text([Event.on_change(event(column, :rename))], column.title)
   end))
 end
 ```
@@ -64,13 +67,14 @@ Each item is a normal lookup result:
 
 ```elixir
 column = solve(MyApp.State, {:column, 1})
-send(self(), events(column)[:rename])
+Input.text([Event.on_change(event(column, :rename))], column.title)
 ```
 
 Important rules:
 
 - `events(collection(...))` returns `nil`
 - events live on the items inside the collection
+- `event/2` and `event/3` only work on lookup item maps, not the collection wrapper
 - `solve(app, :column)` is for singletons only; use `collection(app, :column)` for collection sources
 
 ## Collection Source Definition

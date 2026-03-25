@@ -79,12 +79,11 @@ defmodule EmergeDemo do
   @impl Viewport
   def render(_state) do
     counter = solve(EmergeDemo.State, :counter)
-    counter_events = events(counter)
 
     row([], [
-      button("+", counter_events[:increment]),
+      button("+", event(counter, :increment)),
       el([], text("Count: #{counter.count}")),
-      button("-", counter_events[:decrement])
+      button("-", event(counter, :decrement))
     ])
   end
 
@@ -98,8 +97,13 @@ end
 `use Solve.Lookup` defaults to `handle_info: :auto`, so `%Solve.Message{}` update envelopes
 refresh the local lookup cache and trigger `handle_solve_updated/2`.
 
+Use `event(controller, event_name)` for UI handlers that should send directly to the current
+controller pid. Use `event(controller, event_name, payload)` when you want to bake in a fixed
+payload. `events/1` still exposes the lower-level `%Solve.Message{}` dispatch refs.
+
 This is the most natural way to use Solve from a UI process: read with `solve/2` inside
-`render/1`, read event refs with `events/1`, and rerender on `handle_solve_updated/2`.
+`render/1`, build handler tuples with `event/2` or `event/3`, and rerender on
+`handle_solve_updated/2`.
 
 For a full Emerge walkthrough, see `examples/emerge_lookup_example.md`.
 
@@ -195,7 +199,7 @@ def render(_state) do
   columns = collection(MyApp.State, :column)
 
   row([], Enum.map(columns, fn {_id, column} ->
-    button(column.title, events(column)[:rename])
+    Input.text([Event.on_change(event(column, :rename))], column.title)
   end))
 end
 ```
@@ -225,6 +229,19 @@ If the controller is off, `solve/2` returns `nil` and `events(nil)` also returns
 mode ignores that `nil`, and manual mode can do the same with the `handle_info(nil, state)`
 clause shown above.
 
+For Emerge-style event attrs, prefer `event/2` and `event/3`:
+
+```elixir
+counter = solve(app, :counter)
+
+button("+", event(counter, :increment))
+Input.text([Event.on_change(event(counter, :set_title))], counter.title)
+button("Reset", event(counter, :set_mode, :all))
+```
+
+`event/2` returns a `{pid, message}` tuple that Emerge can send directly. The helper resolves the
+current controller pid from the lookup ref at render time.
+
 ## What `collection/2` returns
 
 Use `collection(app, source_name)` for collection sources and `solve(app, {source_name, id})` for
@@ -234,11 +251,12 @@ one collected child.
 columns = collection(app, :column)
 
 Enum.map(columns, fn {id, column} ->
-  {id, column.title, events(column)[:rename]}
+  {id, column.title, Event.on_change(event(column, :rename))}
 end)
 
 column = solve(app, {:column, 1})
-send(self(), events(column)[:rename])
+{pid, message} = event(column, :rename, "Backlog")
+send(pid, message)
 ```
 
 `collection/2` returns a `%Solve.Collection{}` whose items are the normal lookup item maps:
