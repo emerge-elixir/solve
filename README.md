@@ -1,10 +1,11 @@
 # Solve
 
-Solve manages a graph of controller processes.
+Solve manages a graph of controller processes and collection sources.
 
 - Controllers are `GenServer`s.
-- A running controller exposes a plain map.
-- `nil` means a controller is off/stopped.
+- A running controller instance exposes a plain map.
+- Collection sources materialize as `%Solve.Collection{ids, items}`.
+- `nil` means a singleton or collected child is off/stopped.
 - `Solve.Lookup` is the main process-facing API.
 
 ## Installation
@@ -68,59 +69,42 @@ Start the app like any other GenServer:
 {:ok, app} = MyApp.State.start_link(name: MyApp.State)
 ```
 
-### 3. Use it from another process with `Solve.Lookup`
+### 3. Read state from render code with `Solve.Lookup`
 
 ```elixir
-defmodule MyApp.CounterWorker do
-  use GenServer
+defmodule EmergeDemo do
+  use Emerge
   use Solve.Lookup
 
-  def start_link(app) do
-    GenServer.start_link(__MODULE__, app, name: __MODULE__)
-  end
+  @impl Viewport
+  def render(_state) do
+    counter = solve(EmergeDemo.State, :counter)
+    counter_events = events(counter)
 
-  def increment do
-    GenServer.cast(__MODULE__, :increment)
-  end
-
-  def decrement do
-    GenServer.cast(__MODULE__, :decrement)
-  end
-
-  @impl true
-  def init(app) do
-    {:ok, %{app: app}}
-  end
-
-  @impl true
-  def handle_cast(:increment, state) do
-    counter = solve(state.app, :counter)
-    send(self(), events(counter)[:increment])
-    {:noreply, state}
-  end
-
-  @impl true
-  def handle_cast(:decrement, state) do
-    counter = solve(state.app, :counter)
-    send(self(), events(counter)[:decrement])
-    {:noreply, state}
-  end
-
-  def render(state) do
-    counter = solve(state.app, :counter)
-    IO.inspect(counter, label: "counter")
-    state
+    row([], [
+      button("+", counter_events[:increment]),
+      el([], text("Count: #{counter.count}")),
+      button("-", counter_events[:decrement])
+    ])
   end
 
   @impl Solve.Lookup
   def handle_solve_updated(_updated, state) do
-    {:ok, render(state)}
+    {:ok, Viewport.rerender(state)}
   end
 end
 ```
 
 `use Solve.Lookup` defaults to `handle_info: :auto`, so `%Solve.Message{}` update envelopes
 refresh the local lookup cache and trigger `handle_solve_updated/2`.
+
+This is the most natural way to use Solve from a UI process: read with `solve/2` inside
+`render/1`, read event refs with `events/1`, and rerender on `handle_solve_updated/2`.
+
+For a full Emerge walkthrough, see `examples/emerge_lookup_example.md`.
+
+If you are not using Emerge and want the smaller raw `GenServer` pattern, see
+`examples/counter_lookup_example.md`.
 
 For manual control, use `handle_info: :manual` and process `%Solve.Message{}` yourself:
 
@@ -131,8 +115,8 @@ end
 
 def handle_info(%Solve.Message{} = message, %{app: app} = state) do
   case handle_message(message) do
-    %{^app => controllers} ->
-      if :counter in controllers,
+    %{^app => %Solve.Lookup.Updated{refs: refs}} ->
+      if :counter in refs,
         do: {:noreply, render(state)},
         else: {:noreply, state}
 
@@ -153,6 +137,67 @@ typically match the `app` stored in state.
 :ok = Solve.dispatch(MyApp.State, :counter, :increment, %{})
 counter = Solve.subscribe(MyApp.State, :counter)
 # => %{count: 1}
+```
+
+### 5. Define a collection source
+
+Collection sources let Solve manage a dynamic ordered set of child controllers.
+
+```elixir
+defmodule MyApp.ColumnController do
+  use Solve.Controller, events: [:rename]
+
+  @impl true
+  def init(%{id: id, title: title}, _dependencies) do
+    %{id: id, title: title}
+  end
+
+  def rename(title, state, _dependencies, _callbacks, _params) do
+    %{state | title: title}
+  end
+
+  @impl true
+  def expose(state, _dependencies, _params) do
+    %{id: state.id, title: state.title}
+  end
+end
+
+defmodule MyApp.State do
+  use Solve
+
+  @impl true
+  def controllers do
+    [
+      controller!(
+        name: :column,
+        module: MyApp.ColumnController,
+        variant: :collection,
+        collect: fn %{app_params: %{columns: columns}} ->
+          Enum.map(columns, fn %{id: id, title: title} ->
+            {id, [params: %{id: id, title: title}]}
+          end)
+        end
+      )
+    ]
+  end
+end
+```
+
+`collect/1` returns ordered `{id, opts}` tuples. Solve diffs those ids, compares child `params`
+for each `id`, starts or stops child controllers like `{:column, 1}`, and materializes the source
+as `%Solve.Collection{}`. Callback changes do not force replacement; Solve updates callbacks in
+place when params stay the same.
+
+The lookup side still reads naturally from render code:
+
+```elixir
+def render(_state) do
+  columns = collection(MyApp.State, :column)
+
+  row([], Enum.map(columns, fn {_id, column} ->
+    button(column.title, events(column)[:rename])
+  end))
+end
 ```
 
 ## What `solve/2` returns
@@ -180,15 +225,55 @@ If the controller is off, `solve/2` returns `nil` and `events(nil)` also returns
 mode ignores that `nil`, and manual mode can do the same with the `handle_info(nil, state)`
 clause shown above.
 
+## What `collection/2` returns
+
+Use `collection(app, source_name)` for collection sources and `solve(app, {source_name, id})` for
+one collected child.
+
+```elixir
+columns = collection(app, :column)
+
+Enum.map(columns, fn {id, column} ->
+  {id, column.title, events(column)[:rename]}
+end)
+
+column = solve(app, {:column, 1})
+send(self(), events(column)[:rename])
+```
+
+`collection/2` returns a `%Solve.Collection{}` whose items are the normal lookup item maps:
+
+```elixir
+%Solve.Collection{
+  ids: [1, 2],
+  items: %{
+    1 => %{
+      id: 1,
+      title: "Todo",
+      events_: %{rename: %Solve.Message{type: :dispatch, payload: %Solve.Dispatch{...}}}
+    },
+    2 => %{
+      id: 2,
+      title: "Doing",
+      events_: %{rename: %Solve.Message{type: :dispatch, payload: %Solve.Dispatch{...}}}
+    }
+  }
+}
+```
+
+`events/1` returns `nil` for the collection wrapper itself; events live on each item.
+
 ## Key Rules
 
-- Running controllers must expose plain maps.
-- `nil` means a controller is off/stopped.
+- Running controller instances must expose plain maps.
+- Collection sources expose `%Solve.Collection{ids, items}` through `Solve.subscribe/3` and `Solve.Lookup.collection/2`.
+- `nil` means a singleton or collected child is off/stopped.
 - `:events_` is reserved in exposed maps for lookup augmentation.
-- `Solve.subscribe/3` returns raw exposed state.
-- `Solve.Lookup.solve/2` returns the augmented process-local view.
+- `Solve.subscribe/3` returns raw exposed state for both singleton targets and collection sources.
+- `Solve.Lookup.solve/2` returns augmented singleton or collected-child views.
+- `Solve.Lookup.collection/2` returns an augmented collection view.
 
 ## More Example Code
 
-See `examples/counter_lookup_example.md` for a full end-to-end example with a controller, a
-`Solve` app, and a GenServer using `Solve.Lookup`.
+- `examples/emerge_lookup_example.md` shows the primary render-driven `Solve.Lookup` flow
+- `examples/counter_lookup_example.md` shows the smaller non-Emerge and manual `handle_info` flow

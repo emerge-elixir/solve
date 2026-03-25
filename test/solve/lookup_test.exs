@@ -1,6 +1,8 @@
 defmodule Solve.LookupTest do
   use ExUnit.Case, async: false
 
+  alias Solve.Collection
+
   defmodule CounterController do
     use Solve.Controller, events: [:increment]
 
@@ -47,6 +49,60 @@ defmodule Solve.LookupTest do
           name: :collision,
           module: Solve.LookupTest.CollisionController,
           params: fn %{app_params: _app_params} -> %{ok: true} end
+        )
+      ]
+    end
+  end
+
+  defmodule CatalogController do
+    use Solve.Controller, events: [:set_columns]
+
+    @impl true
+    def init(%{columns: columns}, _dependencies), do: %{columns: columns}
+
+    def set_columns(columns, _state, _dependencies, _callbacks, _init_params) do
+      %{columns: columns}
+    end
+
+    @impl true
+    def expose(state, _dependencies, _init_params), do: %{columns: state.columns}
+  end
+
+  defmodule ColumnController do
+    use Solve.Controller, events: [:rename]
+
+    @impl true
+    def init(%{id: id, title: title}, _dependencies), do: %{id: id, title: title}
+
+    def rename(title, state, _dependencies, _callbacks, _init_params) do
+      %{state | title: title}
+    end
+
+    @impl true
+    def expose(state, _dependencies, _init_params), do: %{id: state.id, title: state.title}
+  end
+
+  defmodule CollectionLookupSolve do
+    use Solve
+
+    @impl true
+    def controllers do
+      [
+        controller!(
+          name: :catalog,
+          module: Solve.LookupTest.CatalogController,
+          params: fn %{app_params: app_params} -> %{columns: app_params.columns} end
+        ),
+        controller!(
+          name: :column,
+          module: Solve.LookupTest.ColumnController,
+          variant: :collection,
+          dependencies: [:catalog],
+          collect: fn %{dependencies: %{catalog: %{columns: columns}}} ->
+            Enum.map(columns, fn %{id: id, title: title} ->
+              {id, [params: %{id: id, title: title}]}
+            end)
+          end
         )
       ]
     end
@@ -117,8 +173,8 @@ defmodule Solve.LookupTest do
 
     def handle_info(%Solve.Message{} = message, %{app: app} = state) do
       case handle_message(message) do
-        %{^app => controllers} ->
-          if :counter in controllers,
+        %{^app => %Solve.Lookup.Updated{refs: refs}} ->
+          if :counter in refs,
             do: {:noreply, render(state)},
             else: {:noreply, state}
 
@@ -161,7 +217,11 @@ defmodule Solve.LookupTest do
     assert :ok = GenServer.cast(worker, {:send_event, :counter, :increment})
 
     assert await_lookup_count(worker) == 2
-    assert_receive {:solve_updated, %{^app => [:counter]}, %{count: 2, events_: events}}
+
+    assert_receive {:solve_updated,
+                    %{^app => %Solve.Lookup.Updated{refs: [:counter], collections: []}},
+                    %{count: 2, events_: events}}
+
     assert Map.has_key?(events, :increment)
   end
 
@@ -183,7 +243,11 @@ defmodule Solve.LookupTest do
     send(worker, Solve.Lookup.events(counter).increment)
 
     assert await_lookup_count(worker) == 2
-    assert_receive {:solve_updated, %{^app => [:counter]}, %{count: 2, events_: events}}
+
+    assert_receive {:solve_updated,
+                    %{^app => %Solve.Lookup.Updated{refs: [:counter], collections: []}},
+                    %{count: 2, events_: events}}
+
     assert Map.has_key?(events, :increment)
   end
 
@@ -224,7 +288,7 @@ defmodule Solve.LookupTest do
   test "handle_message/1 updates local lookup cache for update envelopes" do
     app = start_app(LookupSolve, %{initial: 1})
 
-    assert %{^app => [:counter]} =
+    assert %{^app => %Solve.Lookup.Updated{refs: [:counter], collections: []}} =
              Solve.Lookup.handle_message(Solve.Message.update(app, :counter, %{count: 5}))
 
     assert Solve.Lookup.solve(app, :counter).count == 5
@@ -290,6 +354,82 @@ defmodule Solve.LookupTest do
     assert_raise ArgumentError, ~r/reserves :events_/, fn ->
       Solve.Lookup.solve(app, :collision)
     end
+  end
+
+  test "collection/2 returns a Solve.Collection with events_ added to each item" do
+    app =
+      start_app(CollectionLookupSolve, %{
+        columns: [%{id: 1, title: "Todo"}, %{id: 2, title: "Doing"}]
+      })
+
+    columns = Solve.Lookup.collection(app, :column)
+
+    assert columns == %Collection{
+             ids: [1, 2],
+             items: %{
+               1 => %{id: 1, title: "Todo", events_: %{rename: columns.items[1].events_.rename}},
+               2 => %{id: 2, title: "Doing", events_: %{rename: columns.items[2].events_.rename}}
+             }
+           }
+
+    assert match?(
+             %Solve.Message{payload: %Solve.Dispatch{controller_name: {:column, 1}}},
+             columns.items[1].events_.rename
+           )
+  end
+
+  test "events/1 returns nil for Solve.Collection" do
+    app = start_app(CollectionLookupSolve, %{columns: [%{id: 1, title: "Todo"}]})
+
+    assert Solve.Lookup.events(Solve.Lookup.collection(app, :column)) == nil
+  end
+
+  test "solve/2 on a collection source raises and points callers to collection/2" do
+    app = start_app(CollectionLookupSolve, %{columns: [%{id: 1, title: "Todo"}]})
+
+    assert_raise ArgumentError, ~r/use collection\/2/, fn ->
+      Solve.Lookup.solve(app, :column)
+    end
+  end
+
+  test "solve/2 on a collected child ref returns one item with events_" do
+    app = start_app(CollectionLookupSolve, %{columns: [%{id: 1, title: "Todo"}]})
+
+    column = Solve.Lookup.solve(app, {:column, 1})
+
+    assert column.id == 1
+    assert column.title == "Todo"
+
+    assert match?(
+             %Solve.Message{payload: %Solve.Dispatch{controller_name: {:column, 1}}},
+             column.events_.rename
+           )
+  end
+
+  test "handle_message/1 reports collection source updates in Updated.collections" do
+    app = start_app(CollectionLookupSolve, %{columns: [%{id: 1, title: "Todo"}]})
+
+    updated =
+      Solve.Lookup.handle_message(
+        Solve.Message.update(app, :column, %Collection{
+          ids: [1],
+          items: %{1 => %{id: 1, title: "Todo"}}
+        })
+      )
+
+    assert %{^app => %Solve.Lookup.Updated{refs: [], collections: [:column]}} = updated
+  end
+
+  test "handle_message/1 reports collected child updates in Updated.refs" do
+    app = start_app(CollectionLookupSolve, %{columns: [%{id: 1, title: "Todo"}]})
+
+    updated =
+      Solve.Lookup.handle_message(
+        Solve.Message.update(app, {:column, 1}, %{id: 1, title: "Backlog"})
+      )
+
+    assert %{^app => %Solve.Lookup.Updated{refs: [{:column, 1}], collections: []}} = updated
+    assert Solve.Lookup.solve(app, {:column, 1}).title == "Backlog"
   end
 
   defp await_lookup_count(worker, attempts \\ 50)

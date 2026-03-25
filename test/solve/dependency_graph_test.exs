@@ -3,7 +3,7 @@ defmodule Solve.DependencyGraphTest do
 
   alias Solve.DependencyGraph
 
-  import Solve.ControllerSpec, only: [controller!: 1]
+  import Solve.ControllerSpec, only: [controller!: 1, collection: 1]
 
   defmodule RootController do
   end
@@ -24,6 +24,9 @@ defmodule Solve.DependencyGraphTest do
   end
 
   defmodule CController do
+  end
+
+  defmodule CollectionController do
   end
 
   defmodule NoControllersModule do
@@ -116,6 +119,68 @@ defmodule Solve.DependencyGraphTest do
     assert length(cycle) == 3
     assert hd(cycle) == List.last(cycle)
     assert MapSet.new(Enum.drop(cycle, -1)) == MapSet.new([:a, :b])
+  end
+
+  test "compile/1 builds edges from source names for collection bindings" do
+    specs = [
+      controller!(name: :board, module: RootController),
+      controller!(
+        name: :column,
+        module: CollectionController,
+        variant: :collection,
+        dependencies: [:board],
+        collect: fn _ctx -> [] end
+      ),
+      controller!(
+        name: :summary,
+        module: LeafController,
+        dependencies: [columns: collection(:column)]
+      )
+    ]
+
+    assert {:ok, graph} = DependencyGraph.compile(specs)
+
+    assert_before(graph.sorted_controller_names, :board, :column)
+    assert_before(graph.sorted_controller_names, :column, :summary)
+
+    assert sort_dependents(graph.dependents_map) == %{
+             board: [:column],
+             column: [:summary],
+             summary: []
+           }
+  end
+
+  test "compile/1 rejects plain dependencies on collection sources" do
+    specs = [
+      controller!(
+        name: :column,
+        module: CollectionController,
+        variant: :collection,
+        collect: fn _ctx -> [] end
+      ),
+      controller!(
+        name: :summary,
+        module: LeafController,
+        dependencies: [:column]
+      )
+    ]
+
+    assert {:error, {:plain_dependency_on_collection, :summary, :column}} =
+             DependencyGraph.compile(specs)
+  end
+
+  test "compile/1 rejects collection bindings to singleton sources" do
+    specs = [
+      controller!(name: :board, module: RootController),
+      controller!(
+        name: :summary,
+        module: LeafController,
+        dependencies: [columns: collection(:board)]
+      )
+    ]
+
+    assert {:error, {:collection_dependency_on_singleton, :summary, :columns, :board}} =
+             DependencyGraph.compile(specs)
   end
 
   test "resolve_module!/2 raises ArgumentError when controllers/0 is missing" do
