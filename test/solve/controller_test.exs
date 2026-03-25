@@ -199,6 +199,49 @@ defmodule Solve.ControllerTest do
     }
   end
 
+  test "direct solve_event messages invoke controller events" do
+    params = %{initial: 3, test_pid: self()}
+    callbacks = %{audit: fn _ -> :ok end}
+
+    assert {:ok, pid} =
+             CounterController.start_link(
+               solve_app: :app,
+               controller_name: :counter,
+               params: params,
+               dependencies: %{source: %{value: 10}},
+               callbacks: callbacks
+             )
+
+    assert_receive {:counter_init, %{source: %{value: 10}}, ^params}
+    assert Solve.Controller.subscribe(pid) == %{count: 3}
+
+    send(pid, {:solve_event, :increment, 4})
+
+    assert_receive {:increment_args, 4, %{count: 3}, %{source: %{value: 10}}, ^callbacks, ^params}
+
+    assert_receive %Solve.Message{
+      type: :update,
+      payload: %Solve.Update{app: :app, controller_name: :counter, exposed_state: %{count: 7}}
+    }
+  end
+
+  test "direct solve_event messages use empty map payload when omitted" do
+    assert {:ok, pid} =
+             StaticExposeController.start_link(
+               solve_app: :app,
+               controller_name: :static,
+               params: %{ok: true},
+               dependencies: %{},
+               callbacks: %{}
+             )
+
+    assert Solve.Controller.subscribe(pid) == %{mode: :stable}
+
+    send(pid, {:solve_event, :flip})
+
+    assert :sys.get_state(pid).state == :second
+  end
+
   test "update_callbacks/2 changes callbacks for later events without restarting" do
     params = %{initial: 3, test_pid: self()}
 

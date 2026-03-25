@@ -37,6 +37,8 @@ defmodule Solve.Lookup do
           solve: 2,
           collection: 1,
           collection: 2,
+          event: 2,
+          event: 3,
           dispatch: 2,
           dispatch: 3,
           dispatch: 4,
@@ -145,6 +147,29 @@ defmodule Solve.Lookup do
     app
     |> resolve_app!()
     |> Solve.dispatch(controller_name, event, payload)
+  end
+
+  @doc """
+  Builds a direct `{pid, message}` event tuple for a lookup item.
+
+  This is useful for UI frameworks like Emerge that expect event attrs to point at a pid and raw
+  message.
+  """
+  @spec event(map() | nil | Solve.Collection.t(any()), atom()) :: {pid(), term()} | nil
+  def event(controller, event_name) when is_atom(event_name) do
+    with {:ok, pid} <- resolve_event_pid(controller, event_name) do
+      {pid, {:solve_event, event_name}}
+    end
+  end
+
+  @doc """
+  Builds a direct `{pid, message}` event tuple with a fixed payload for a lookup item.
+  """
+  @spec event(map() | nil | Solve.Collection.t(any()), atom(), term()) :: {pid(), term()} | nil
+  def event(controller, event_name, payload) when is_atom(event_name) do
+    with {:ok, pid} <- resolve_event_pid(controller, event_name) do
+      {pid, {:solve_event, event_name, payload}}
+    end
   end
 
   @spec events(map() | nil | Solve.Collection.t(any())) :: map() | nil
@@ -295,6 +320,19 @@ defmodule Solve.Lookup do
             "Solve.Lookup reserves #{inspect(@events_key)} in exposed controller maps"
     else
       value
+    end
+  end
+
+  defp resolve_event_pid(controller, event_name) do
+    case events(controller) do
+      %{^event_name => %Solve.Message{payload: %Solve.Dispatch{} = dispatch}} ->
+        case Solve.controller_pid(resolve_app!(dispatch.app), dispatch.controller_name) do
+          pid when is_pid(pid) -> {:ok, pid}
+          _ -> nil
+        end
+
+      _ ->
+        nil
     end
   end
 

@@ -176,6 +176,16 @@ defmodule Solve.Controller do
       end
 
       @impl GenServer
+      def handle_info({:solve_event, event}, server_state) when is_atom(event) do
+        Solve.Controller.__handle_direct_event__(event, %{}, server_state)
+      end
+
+      @impl GenServer
+      def handle_info({:solve_event, event, payload}, server_state) when is_atom(event) do
+        Solve.Controller.__handle_direct_event__(event, payload, server_state)
+      end
+
+      @impl GenServer
       def handle_info(
             %Solve.Message{
               type: :update,
@@ -395,6 +405,11 @@ defmodule Solve.Controller do
   @doc false
   def __handle_callbacks_update__(callbacks, server_state) when is_map(callbacks) do
     {:noreply, %{server_state | callbacks: callbacks}}
+  end
+
+  @doc false
+  def __handle_direct_event__(event, payload, server_state) when is_atom(event) do
+    __handle_event__(event, payload, server_state)
   end
 
   @doc false

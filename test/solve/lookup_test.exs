@@ -225,6 +225,31 @@ defmodule Solve.LookupTest do
     assert Map.has_key?(events, :increment)
   end
 
+  test "event/3 returns a direct controller tuple for singleton lookups" do
+    app = start_app(LookupSolve, %{initial: 1})
+
+    counter = Solve.Lookup.solve(app, :counter)
+
+    assert {pid, {:solve_event, :increment, 1}} = Solve.Lookup.event(counter, :increment, 1)
+    assert pid == Solve.controller_pid(app, :counter)
+
+    send(pid, {:solve_event, :increment, 1})
+
+    assert_receive %Solve.Message{
+                     type: :update,
+                     payload: %Solve.Update{
+                       app: ^app,
+                       controller_name: :counter,
+                       exposed_state: %{count: 2}
+                     }
+                   } = message
+
+    assert %{^app => %Solve.Lookup.Updated{refs: [:counter], collections: []}} =
+             Solve.Lookup.handle_message(message)
+
+    assert Solve.Lookup.solve(app, :counter).count == 2
+  end
+
   test "lookup cache stays fresh when app is addressed by registered name" do
     name = unique_name("NamedLookup")
     assert {:ok, app} = LookupSolve.start_link(name: name, params: %{initial: 1})
@@ -256,6 +281,7 @@ defmodule Solve.LookupTest do
     assert {:ok, worker} = AutoLookupWorker.start_link(app, self())
 
     assert Solve.Lookup.events(nil) == nil
+    assert Solve.Lookup.event(nil, :increment) == nil
 
     send(worker, nil)
     send(worker, Solve.Lookup.events(nil)[:increment])
@@ -384,6 +410,16 @@ defmodule Solve.LookupTest do
     assert Solve.Lookup.events(Solve.Lookup.collection(app, :column)) == nil
   end
 
+  test "event/2 returns nil for Solve.Collection and missing events" do
+    app = start_app(CollectionLookupSolve, %{columns: [%{id: 1, title: "Todo"}]})
+
+    columns = Solve.Lookup.collection(app, :column)
+    column = Solve.Lookup.solve(app, {:column, 1})
+
+    assert Solve.Lookup.event(columns, :rename) == nil
+    assert Solve.Lookup.event(column, :missing) == nil
+  end
+
   test "solve/2 on a collection source raises and points callers to collection/2" do
     app = start_app(CollectionLookupSolve, %{columns: [%{id: 1, title: "Todo"}]})
 
@@ -404,6 +440,34 @@ defmodule Solve.LookupTest do
              %Solve.Message{payload: %Solve.Dispatch{controller_name: {:column, 1}}},
              column.events_.rename
            )
+  end
+
+  test "event/2 and event/3 return direct controller tuples for collected children" do
+    app = start_app(CollectionLookupSolve, %{columns: [%{id: 1, title: "Todo"}]})
+
+    column = Solve.Lookup.solve(app, {:column, 1})
+
+    assert {pid, {:solve_event, :rename}} = Solve.Lookup.event(column, :rename)
+    assert pid == Solve.controller_pid(app, {:column, 1})
+
+    assert {^pid, {:solve_event, :rename, "Backlog"}} =
+             Solve.Lookup.event(column, :rename, "Backlog")
+
+    send(pid, {:solve_event, :rename, "Backlog"})
+
+    assert_receive %Solve.Message{
+                     type: :update,
+                     payload: %Solve.Update{
+                       app: ^app,
+                       controller_name: {:column, 1},
+                       exposed_state: %{id: 1, title: "Backlog"}
+                     }
+                   } = message
+
+    assert %{^app => %Solve.Lookup.Updated{refs: [{:column, 1}], collections: []}} =
+             Solve.Lookup.handle_message(message)
+
+    assert Solve.Lookup.solve(app, {:column, 1}).title == "Backlog"
   end
 
   test "handle_message/1 reports collection source updates in Updated.collections" do
