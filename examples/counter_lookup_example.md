@@ -53,7 +53,12 @@ defmodule MyApp.CounterWorker do
   @impl true
   def handle_cast(:increment, state) do
     counter = solve(state.app, :counter)
-    send(self(), events(counter)[:increment])
+
+    case events(counter)[:increment] do
+      {pid, message} -> send(pid, message)
+      nil -> :ok
+    end
+
     {:noreply, state}
   end
 
@@ -117,8 +122,8 @@ end
 %{
   count: 1,
   events_: %{
-    increment: %Solve.Message{type: :dispatch, payload: %Solve.Dispatch{...}},
-    decrement: %Solve.Message{type: :dispatch, payload: %Solve.Dispatch{...}}
+    increment: {#PID<...>, {:solve_event, :increment}},
+    decrement: {#PID<...>, {:solve_event, :decrement}}
   }
 }
 ```
@@ -127,7 +132,8 @@ Use `events/1` to read those refs safely:
 
 ```elixir
 counter = solve(app, :counter)
-send(self(), events(counter)[:increment])
+{pid, message} = events(counter)[:increment]
+send(pid, message)
 ```
 
 If the controller is off, `solve/2` returns `nil` and `events(nil)` also returns `nil`.

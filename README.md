@@ -97,9 +97,9 @@ end
 `use Solve.Lookup` defaults to `handle_info: :auto`, so `%Solve.Message{}` update envelopes
 refresh the local lookup cache and trigger `handle_solve_updated/2`.
 
-Use `event(controller, event_name)` for UI handlers that should send directly to the current
-controller pid. Use `event(controller, event_name, payload)` when you want to bake in a fixed
-payload. `events/1` still exposes the lower-level `%Solve.Message{}` dispatch refs.
+`events/1` exposes direct `{pid, message}` event tuples from lookup items. Use
+`event(controller, event_name)` as a convenience wrapper for one event, and
+`event(controller, event_name, payload)` when you want to bake in a fixed payload.
 
 This is the most natural way to use Solve from a UI process: read with `solve/2` inside
 `render/1`, build handler tuples with `event/2` or `event/3`, and rerender on
@@ -212,8 +212,8 @@ end
 %{
   count: 2,
   events_: %{
-    increment: %Solve.Message{type: :dispatch, payload: %Solve.Dispatch{...}},
-    decrement: %Solve.Message{type: :dispatch, payload: %Solve.Dispatch{...}}
+    increment: {#PID<...>, {:solve_event, :increment}},
+    decrement: {#PID<...>, {:solve_event, :decrement}}
   }
 }
 ```
@@ -222,7 +222,8 @@ Use `events/1` to read that key safely:
 
 ```elixir
 counter = solve(app, :counter)
-send(self(), events(counter)[:increment])
+{pid, message} = events(counter)[:increment]
+send(pid, message)
 ```
 
 If the controller is off, `solve/2` returns `nil` and `events(nil)` also returns `nil`. Auto
@@ -239,8 +240,8 @@ Input.text([Event.on_change(event(counter, :set_title))], counter.title)
 button("Reset", event(counter, :set_mode, :all))
 ```
 
-`event/2` returns a `{pid, message}` tuple that Emerge can send directly. The helper resolves the
-current controller pid from the lookup ref at render time.
+`event/2` returns the same direct `{pid, message}` tuple as `events(counter)[:increment]`, and
+`event/3` adds a fixed payload to that tuple.
 
 ## What `collection/2` returns
 
@@ -268,12 +269,12 @@ send(pid, message)
     1 => %{
       id: 1,
       title: "Todo",
-      events_: %{rename: %Solve.Message{type: :dispatch, payload: %Solve.Dispatch{...}}}
+      events_: %{rename: {#PID<...>, {:solve_event, :rename}}}
     },
     2 => %{
       id: 2,
       title: "Doing",
-      events_: %{rename: %Solve.Message{type: :dispatch, payload: %Solve.Dispatch{...}}}
+      events_: %{rename: {#PID<...>, {:solve_event, :rename}}}
     }
   }
 }

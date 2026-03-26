@@ -150,15 +150,15 @@ defmodule Solve.Lookup do
   end
 
   @doc """
-  Builds a direct `{pid, message}` event tuple for a lookup item.
+  Reads one direct `{pid, message}` event tuple from a lookup item.
 
-  This is useful for UI frameworks like Emerge that expect event attrs to point at a pid and raw
-  message.
+  This is a convenience wrapper over `events(controller)[event_name]`.
   """
   @spec event(map() | nil | Solve.Collection.t(any()), atom()) :: {pid(), term()} | nil
   def event(controller, event_name) when is_atom(event_name) do
-    with {:ok, pid} <- resolve_event_pid(controller, event_name) do
-      {pid, {:solve_event, event_name}}
+    case events(controller) do
+      nil -> nil
+      events -> Map.get(events, event_name)
     end
   end
 
@@ -167,8 +167,9 @@ defmodule Solve.Lookup do
   """
   @spec event(map() | nil | Solve.Collection.t(any()), atom(), term()) :: {pid(), term()} | nil
   def event(controller, event_name, payload) when is_atom(event_name) do
-    with {:ok, pid} <- resolve_event_pid(controller, event_name) do
-      {pid, {:solve_event, event_name, payload}}
+    case event(controller, event_name) do
+      {pid, {:solve_event, ^event_name}} -> {pid, {:solve_event, event_name, payload}}
+      _ -> nil
     end
   end
 
@@ -274,15 +275,19 @@ defmodule Solve.Lookup do
   defp build_events_for_kind(_app, _controller_name, :collection), do: nil
 
   defp build_events_for_kind(app, controller_name, :item),
-    do: build_dispatches(app, controller_name)
+    do: build_direct_events(app, controller_name)
 
-  defp build_dispatches(app, controller_name) do
-    app
-    |> Solve.controller_events(controller_name)
-    |> Kernel.||([])
-    |> Map.new(fn event ->
-      {event, Solve.Message.dispatch(app, controller_name, event, %{})}
-    end)
+  defp build_direct_events(app, controller_name) do
+    case Solve.controller_pid(app, controller_name) do
+      pid when is_pid(pid) ->
+        app
+        |> Solve.controller_events(controller_name)
+        |> Kernel.||([])
+        |> Map.new(fn event -> {event, {pid, {:solve_event, event}}} end)
+
+      _ ->
+        %{}
+    end
   end
 
   defp augment_collection_value(_app, _controller_name, nil) do
@@ -292,7 +297,7 @@ defmodule Solve.Lookup do
   defp augment_collection_value(app, controller_name, %Solve.Collection{} = collection) do
     items =
       Map.new(collection.items, fn {id, value} ->
-        {id, Map.put(value, @events_key, build_dispatches(app, {controller_name, id}))}
+        {id, Map.put(value, @events_key, build_direct_events(app, {controller_name, id}))}
       end)
 
     %Solve.Collection{collection | items: items}
@@ -320,19 +325,6 @@ defmodule Solve.Lookup do
             "Solve.Lookup reserves #{inspect(@events_key)} in exposed controller maps"
     else
       value
-    end
-  end
-
-  defp resolve_event_pid(controller, event_name) do
-    case events(controller) do
-      %{^event_name => %Solve.Message{payload: %Solve.Dispatch{} = dispatch}} ->
-        case Solve.controller_pid(resolve_app!(dispatch.app), dispatch.controller_name) do
-          pid when is_pid(pid) -> {:ok, pid}
-          _ -> nil
-        end
-
-      _ ->
-        nil
     end
   end
 

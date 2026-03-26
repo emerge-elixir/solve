@@ -39,6 +39,60 @@ defmodule Solve.LookupTest do
     end
   end
 
+  defmodule RefreshDriverController do
+    use Solve.Controller, events: [:set_initial]
+
+    @impl true
+    def init(%{initial: initial}, _dependencies), do: %{initial: initial}
+
+    def set_initial(initial, _state, _dependencies, _callbacks, _init_params) do
+      %{initial: initial}
+    end
+
+    @impl true
+    def expose(state, _dependencies, _init_params), do: %{initial: state.initial}
+  end
+
+  defmodule RefreshCounterController do
+    use Solve.Controller, events: [:increment]
+
+    @impl true
+    def init(%{initial: initial, test_pid: test_pid}, _dependencies) do
+      send(test_pid, {:refresh_counter_init, self(), initial})
+      %{count: initial}
+    end
+
+    def increment(_payload, state, _dependencies, _callbacks, _init_params) do
+      %{state | count: state.count + 1}
+    end
+
+    @impl true
+    def expose(state, _dependencies, _init_params), do: %{count: state.count}
+  end
+
+  defmodule RefreshLookupSolve do
+    use Solve
+
+    @impl true
+    def controllers do
+      [
+        controller!(
+          name: :driver,
+          module: Solve.LookupTest.RefreshDriverController,
+          params: fn %{app_params: app_params} -> %{initial: app_params.initial} end
+        ),
+        controller!(
+          name: :counter,
+          module: Solve.LookupTest.RefreshCounterController,
+          dependencies: [:driver],
+          params: fn %{dependencies: %{driver: %{initial: initial}}, app_params: app_params} ->
+            %{initial: initial, test_pid: app_params.test_pid}
+          end
+        )
+      ]
+    end
+  end
+
   defmodule CollisionSolve do
     use Solve
 
@@ -127,7 +181,12 @@ defmodule Solve.LookupTest do
     @impl true
     def handle_cast({:send_event, controller_name, event_name}, state) do
       controller = solve(state.app, controller_name)
-      send(self(), events(controller)[event_name])
+
+      case events(controller)[event_name] do
+        {pid, message} -> send(pid, message)
+        nil -> :ok
+      end
+
       {:noreply, state}
     end
 
@@ -162,7 +221,12 @@ defmodule Solve.LookupTest do
     @impl true
     def handle_cast({:send_event, controller_name, event_name}, state) do
       controller = solve(state.app, controller_name)
-      send(self(), events(controller)[event_name])
+
+      case events(controller)[event_name] do
+        {pid, message} -> send(pid, message)
+        nil -> :ok
+      end
+
       {:noreply, state}
     end
 
@@ -201,16 +265,8 @@ defmodule Solve.LookupTest do
 
     assert counter.count == 1
 
-    assert Solve.Lookup.events(counter).increment ==
-             %Solve.Message{
-               type: :dispatch,
-               payload: %Solve.Dispatch{
-                 app: app,
-                 controller_name: :counter,
-                 event: :increment,
-                 payload: %{}
-               }
-             }
+    assert {pid, {:solve_event, :increment}} = Solve.Lookup.events(counter).increment
+    assert pid == Solve.controller_pid(app, :counter)
 
     assert Solve.controller_events(app, :counter) == [:increment]
 
@@ -250,6 +306,37 @@ defmodule Solve.LookupTest do
     assert Solve.Lookup.solve(app, :counter).count == 2
   end
 
+  test "events/1 refreshes direct pid refs after controller replacement" do
+    app = start_app(RefreshLookupSolve, %{initial: 1, test_pid: self()})
+
+    assert_receive {:refresh_counter_init, initial_pid, 1}
+
+    counter = Solve.Lookup.solve(app, :counter)
+    assert {^initial_pid, {:solve_event, :increment}} = Solve.Lookup.events(counter).increment
+
+    assert :ok = Solve.dispatch(app, :driver, :set_initial, 5)
+
+    assert_receive {:refresh_counter_init, replacement_pid, 5}
+    refute replacement_pid == initial_pid
+
+    assert_receive %Solve.Message{
+                     type: :update,
+                     payload: %Solve.Update{
+                       app: ^app,
+                       controller_name: :counter,
+                       exposed_state: %{count: 5}
+                     }
+                   } = message
+
+    assert %{^app => %Solve.Lookup.Updated{refs: [:counter], collections: []}} =
+             Solve.Lookup.handle_message(message)
+
+    refreshed = Solve.Lookup.solve(app, :counter)
+
+    assert {^replacement_pid, {:solve_event, :increment}} =
+             Solve.Lookup.events(refreshed).increment
+  end
+
   test "lookup cache stays fresh when app is addressed by registered name" do
     name = unique_name("NamedLookup")
     assert {:ok, app} = LookupSolve.start_link(name: name, params: %{initial: 1})
@@ -265,7 +352,8 @@ defmodule Solve.LookupTest do
     counter = GenServer.call(worker, {:solve, :counter})
     assert counter.count == 1
 
-    send(worker, Solve.Lookup.events(counter).increment)
+    assert {pid, message} = Solve.Lookup.events(counter).increment
+    send(pid, message)
 
     assert await_lookup_count(worker) == 2
 
@@ -398,10 +486,8 @@ defmodule Solve.LookupTest do
              }
            }
 
-    assert match?(
-             %Solve.Message{payload: %Solve.Dispatch{controller_name: {:column, 1}}},
-             columns.items[1].events_.rename
-           )
+    assert {pid, {:solve_event, :rename}} = columns.items[1].events_.rename
+    assert pid == Solve.controller_pid(app, {:column, 1})
   end
 
   test "events/1 returns nil for Solve.Collection" do
@@ -436,10 +522,8 @@ defmodule Solve.LookupTest do
     assert column.id == 1
     assert column.title == "Todo"
 
-    assert match?(
-             %Solve.Message{payload: %Solve.Dispatch{controller_name: {:column, 1}}},
-             column.events_.rename
-           )
+    assert {pid, {:solve_event, :rename}} = column.events_.rename
+    assert pid == Solve.controller_pid(app, {:column, 1})
   end
 
   test "event/2 and event/3 return direct controller tuples for collected children" do

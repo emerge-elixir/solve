@@ -82,10 +82,12 @@ Solve treats exposed state as the shared boundary between processes.
 
 ### Messages
 
-External communication uses `%Solve.Message{}` envelopes:
+External update communication uses `%Solve.Message{}` envelopes:
 
 - `%Solve.Message{type: :update, payload: %Solve.Update{...}}`
 - `%Solve.Message{type: :dispatch, payload: %Solve.Dispatch{...}}`
+
+Lookup item event refs also expose direct `{pid, {:solve_event, ...}}` tuples for immediate sends.
 
 Internal controller-to-controller dependency updates use `%Solve.DependencyUpdate{}`.
 
@@ -240,7 +242,7 @@ It caches three shapes:
 - collected child item lookups via `solve(app, {:column, 1})`
 - collection source lookups via `collection(app, :column)`
 
-Item lookups are augmented with `:events_` dispatch refs. Collection lookups return
+Item lookups are augmented with `:events_` direct event tuples. Collection lookups return
 `%Solve.Collection{}` whose items are augmented item maps. The collection wrapper itself has no
 events.
 
@@ -330,8 +332,9 @@ The runtime depends on a few fixed rules:
 
 ### Event Dispatch
 
-1. A process calls `Solve.dispatch/4` or sends a dispatch envelope produced by `Solve.Lookup`.
-2. Solve resolves the current singleton or collected-child pid and forwards the event.
+1. A process either calls `Solve.dispatch/4`, sends a deferred dispatch envelope, or sends a direct
+   `{pid, {:solve_event, ...}}` tuple produced by `Solve.Lookup`.
+2. The event reaches the current singleton or collected-child controller.
 3. The controller updates internal state and recomputes `expose/3`.
 4. If the exposed map changed, the controller broadcasts an update envelope.
 
