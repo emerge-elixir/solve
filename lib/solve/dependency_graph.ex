@@ -31,8 +31,10 @@ defmodule Solve.DependencyGraph do
 
   @spec compile([ControllerSpec.t()]) :: {:ok, compiled_graph()} | {:error, term()}
   def compile(controller_specs) when is_list(controller_specs) do
-    with {:ok, controller_specs_by_name} <- index_controller_specs(controller_specs),
+    with {:ok, validated_specs} <- ControllerSpec.validate_many(controller_specs),
+         {:ok, controller_specs_by_name} <- index_controller_specs(validated_specs),
          :ok <- validate_dependency_references(controller_specs_by_name),
+         :ok <- validate_dependency_binding_variants(controller_specs_by_name),
          :ok <- validate_self_dependencies(controller_specs_by_name),
          {:ok, sorted_controller_names} <- topological_sort(controller_specs_by_name) do
       {:ok,
@@ -118,7 +120,7 @@ defmodule Solve.DependencyGraph do
   end
 
   defp format_error(module, {:invalid_dependencies, name, dependencies}) do
-    "invalid controller graph in #{inspect(module)}: controller #{inspect(name)} dependencies must be a list of atoms, got #{inspect(dependencies)}"
+    "invalid controller graph in #{inspect(module)}: controller #{inspect(name)} dependencies must be a list of dependency specs, got #{inspect(dependencies)}"
   end
 
   defp format_error(module, {:invalid_params, name, params}) do
@@ -133,8 +135,40 @@ defmodule Solve.DependencyGraph do
     "invalid controller graph in #{inspect(module)}: controller #{inspect(controller)} lists dependency #{inspect(dependency)} more than once"
   end
 
+  defp format_error(module, {:duplicate_dependency_key, controller, key}) do
+    "invalid controller graph in #{inspect(module)}: controller #{inspect(controller)} lists dependency key #{inspect(key)} more than once"
+  end
+
+  defp format_error(module, {:invalid_variant, controller, variant}) do
+    "invalid controller graph in #{inspect(module)}: controller #{inspect(controller)} variant must be :singleton or :collection, got #{inspect(variant)}"
+  end
+
+  defp format_error(module, {:missing_collect, controller}) do
+    "invalid controller graph in #{inspect(module)}: collection controller #{inspect(controller)} must define collect/1"
+  end
+
+  defp format_error(module, {:invalid_collect, controller, collect}) do
+    "invalid controller graph in #{inspect(module)}: collection controller #{inspect(controller)} collect must be a unary function, got #{inspect(collect)}"
+  end
+
+  defp format_error(module, {:unexpected_collect, controller}) do
+    "invalid controller graph in #{inspect(module)}: singleton controller #{inspect(controller)} cannot define collect"
+  end
+
+  defp format_error(module, {:invalid_collection_filter, key, source, filter}) do
+    "invalid controller graph in #{inspect(module)}: dependency #{inspect(key)} on collection #{inspect(source)} must use a binary filter function, got #{inspect(filter)}"
+  end
+
   defp format_error(module, {:unknown_dependency, controller, dependency}) do
     "invalid controller graph in #{inspect(module)}: controller #{inspect(controller)} depends on unknown controller #{inspect(dependency)}"
+  end
+
+  defp format_error(module, {:plain_dependency_on_collection, controller, dependency}) do
+    "invalid controller graph in #{inspect(module)}: controller #{inspect(controller)} must use collection(...) to depend on collection source #{inspect(dependency)}"
+  end
+
+  defp format_error(module, {:collection_dependency_on_singleton, controller, key, dependency}) do
+    "invalid controller graph in #{inspect(module)}: controller #{inspect(controller)} dependency #{inspect(key)} uses collection(...) but #{inspect(dependency)} is not a collection source"
   end
 
   defp format_error(module, {:self_dependency, controller}) do
@@ -211,6 +245,30 @@ defmodule Solve.DependencyGraph do
 
         dependency_name ->
           {:halt, {:error, {:unknown_dependency, controller_name, dependency_name}}}
+      end
+    end)
+  end
+
+  defp validate_dependency_binding_variants(controller_specs_by_name) do
+    Enum.reduce_while(controller_specs_by_name, :ok, fn {controller_name, controller_spec}, :ok ->
+      case Enum.find_value(controller_spec.dependency_bindings, fn binding ->
+             case Map.get(controller_specs_by_name, binding.source) do
+               nil ->
+                 nil
+
+               %ControllerSpec{variant: :collection} when binding.kind == :single ->
+                 {:plain_dependency_on_collection, controller_name, binding.source}
+
+               %ControllerSpec{variant: :singleton} when binding.kind == :collection ->
+                 {:collection_dependency_on_singleton, controller_name, binding.key,
+                  binding.source}
+
+               _ ->
+                 nil
+             end
+           end) do
+        nil -> {:cont, :ok}
+        reason -> {:halt, {:error, reason}}
       end
     end)
   end

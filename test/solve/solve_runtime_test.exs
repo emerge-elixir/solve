@@ -12,7 +12,7 @@ defmodule Solve.RuntimeTest do
       %{value: value}
     end
 
-    def set(value, _state, _dependencies, _callbacks, _init_params), do: %{value: value}
+    def set(value), do: %{value: value}
   end
 
   defmodule LifecycleDerivedController do
@@ -54,7 +54,7 @@ defmodule Solve.RuntimeTest do
       %{value: value}
     end
 
-    def crash(reason, _state, _dependencies, _callbacks, _init_params) do
+    def crash(reason) do
       raise "crash: #{inspect(reason)}"
     end
   end
@@ -165,6 +165,288 @@ defmodule Solve.RuntimeTest do
           name: :boot,
           module: Solve.RuntimeTest.BootRetryController,
           params: fn %{app_params: app_params} -> app_params end
+        )
+      ]
+    end
+  end
+
+  defmodule CatalogController do
+    use Solve.Controller, events: [:set_columns]
+
+    @impl true
+    def init(%{columns: columns, test_pid: test_pid}, _dependencies) do
+      send(test_pid, {:catalog_init, columns})
+      %{columns: columns}
+    end
+
+    def set_columns(columns) do
+      %{columns: columns}
+    end
+
+    @impl true
+    def expose(state, _dependencies, _init_params), do: %{columns: state.columns}
+  end
+
+  defmodule ColumnItemController do
+    use Solve.Controller, events: [:rename, :set_visible]
+
+    @impl true
+    def init(%{id: id, title: title, visible?: visible?, test_pid: test_pid}, dependencies) do
+      send(test_pid, {:column_init, id, dependencies})
+      %{title: title, visible?: visible?}
+    end
+
+    def rename(title, state) do
+      %{state | title: title}
+    end
+
+    def set_visible(visible?, state) do
+      %{state | visible?: visible?}
+    end
+
+    @impl true
+    def expose(state, _dependencies, %{id: id}) do
+      %{id: id, title: state.title, visible?: state.visible?}
+    end
+  end
+
+  defmodule CollectionProjectionController do
+    use Solve.Controller, events: []
+
+    @impl true
+    def init(%{label: label, test_pid: test_pid}, dependencies) do
+      send(test_pid, {:collection_projection_init, label, dependencies})
+      %{label: label}
+    end
+
+    @impl true
+    def expose(state, %{columns: columns}, _init_params) do
+      %{label: state.label, titles: Enum.map(columns, fn {_id, item} -> item.title end)}
+    end
+  end
+
+  defmodule VisibleProjectionController do
+    use Solve.Controller, events: []
+
+    @impl true
+    def init(%{test_pid: test_pid}, dependencies) do
+      send(test_pid, {:visible_projection_init, dependencies})
+      :visible
+    end
+
+    @impl true
+    def expose(_state, %{visible_columns: columns}, _init_params) do
+      %{visible_ids: Enum.map(columns, fn {id, _item} -> id end)}
+    end
+  end
+
+  defmodule CallbackCatalogController do
+    use Solve.Controller, events: [:set_callback_tag, :rename_item]
+
+    @impl true
+    def init(%{items: items, callback_tag: callback_tag, test_pid: test_pid}, _dependencies) do
+      send(test_pid, {:callback_catalog_init, items, callback_tag})
+      %{items: items, callback_tag: callback_tag}
+    end
+
+    def set_callback_tag(callback_tag, state) do
+      %{state | callback_tag: callback_tag}
+    end
+
+    def rename_item(%{id: id, title: title}, state) do
+      items =
+        Enum.map(state.items, fn item ->
+          if item.id == id do
+            %{item | title: title}
+          else
+            item
+          end
+        end)
+
+      %{state | items: items}
+    end
+
+    @impl true
+    def expose(state, _dependencies, _init_params) do
+      %{items: state.items, callback_tag: state.callback_tag}
+    end
+  end
+
+  defmodule CallbackItemController do
+    use Solve.Controller, events: [:report]
+
+    @impl true
+    def init(%{id: id, title: title, test_pid: test_pid}, _dependencies) do
+      send(test_pid, {:callback_item_init, id, title})
+      %{id: id, title: title, test_pid: test_pid}
+    end
+
+    def report(payload, state, _dependencies, callbacks) do
+      send(state.test_pid, {:callback_item_report, state.id, payload, callbacks})
+      state
+    end
+
+    @impl true
+    def expose(state, _dependencies, _init_params) do
+      %{id: state.id, title: state.title}
+    end
+  end
+
+  defmodule TodoListController do
+    use Solve.Controller, events: [:create_todo]
+
+    @impl true
+    def init(%{test_pid: test_pid}, _dependencies) do
+      send(test_pid, :todo_list_init)
+      %{items: [], test_pid: test_pid}
+    end
+
+    def create_todo(payload, state) do
+      send(state.test_pid, {:todo_created, payload})
+      %{state | items: state.items ++ [payload]}
+    end
+
+    @impl true
+    def expose(state, _dependencies, _init_params) do
+      %{items: state.items}
+    end
+  end
+
+  defmodule CreateTodoController do
+    use Solve.Controller, events: [:submit]
+
+    @impl true
+    def init(%{test_pid: test_pid}, _dependencies) do
+      send(test_pid, :create_todo_init)
+      %{test_pid: test_pid}
+    end
+
+    def submit(payload, state, _dependencies, callbacks) do
+      callbacks.submit.(payload)
+      send(state.test_pid, {:create_todo_submitted, payload})
+      state
+    end
+
+    @impl true
+    def expose(state, _dependencies, _init_params) do
+      %{ready?: true, test_pid: state.test_pid}
+    end
+  end
+
+  defmodule ImplicitDispatchSolve do
+    use Solve
+
+    @impl true
+    def controllers do
+      [
+        controller!(
+          name: :todo_list,
+          module: Solve.RuntimeTest.TodoListController,
+          params: fn %{app_params: app_params} -> %{test_pid: app_params.test_pid} end
+        ),
+        controller!(
+          name: :create_todo,
+          module: Solve.RuntimeTest.CreateTodoController,
+          params: fn %{app_params: app_params} -> %{test_pid: app_params.test_pid} end,
+          callbacks: %{
+            submit: fn payload -> dispatch(:todo_list, :create_todo, payload) end
+          }
+        )
+      ]
+    end
+  end
+
+  defmodule CallbackCollectionSolve do
+    use Solve
+
+    @impl true
+    def controllers do
+      [
+        controller!(
+          name: :callback_catalog,
+          module: Solve.RuntimeTest.CallbackCatalogController,
+          params: fn %{app_params: app_params} ->
+            %{
+              items: app_params.items,
+              callback_tag: app_params.callback_tag,
+              test_pid: app_params.test_pid
+            }
+          end
+        ),
+        controller!(
+          name: :callback_item,
+          module: Solve.RuntimeTest.CallbackItemController,
+          variant: :collection,
+          dependencies: [:callback_catalog],
+          collect: fn %{
+                        dependencies: %{callback_catalog: %{items: items, callback_tag: tag}},
+                        app_params: app_params
+                      } ->
+            Enum.map(items, fn %{id: id, title: title} ->
+              {id,
+               [
+                 params: %{id: id, title: title, test_pid: app_params.test_pid},
+                 callbacks: %{tag: tag}
+               ]}
+            end)
+          end
+        )
+      ]
+    end
+  end
+
+  defmodule CollectionSolve do
+    use Solve
+
+    @impl true
+    def controllers do
+      [
+        controller!(
+          name: :catalog,
+          module: Solve.RuntimeTest.CatalogController,
+          params: fn %{app_params: app_params} ->
+            %{columns: app_params.columns, test_pid: app_params.test_pid}
+          end
+        ),
+        controller!(
+          name: :column,
+          module: Solve.RuntimeTest.ColumnItemController,
+          variant: :collection,
+          dependencies: [:catalog],
+          collect: fn %{dependencies: %{catalog: %{columns: columns}}, app_params: app_params} ->
+            Enum.map(columns, fn %{id: id, title: title, visible?: visible?} ->
+              {id,
+               [
+                 params: %{
+                   id: id,
+                   title: title,
+                   visible?: visible?,
+                   test_pid: app_params.test_pid
+                 }
+               ]}
+            end)
+          end
+        ),
+        controller!(
+          name: :projection,
+          module: Solve.RuntimeTest.CollectionProjectionController,
+          dependencies: [columns: collection(:column)],
+          params: fn %{app_params: app_params} ->
+            %{label: :all, test_pid: app_params.test_pid}
+          end
+        ),
+        controller!(
+          name: :visible_projection,
+          module: Solve.RuntimeTest.VisibleProjectionController,
+          dependencies: [
+            visible_columns:
+              collection(:column, fn _id, item ->
+                item.visible?
+              end)
+          ],
+          params: fn %{app_params: app_params} ->
+            %{test_pid: app_params.test_pid}
+          end
         )
       ]
     end
@@ -414,6 +696,168 @@ defmodule Solve.RuntimeTest do
     assert_receive {:boot_retry_attempt, 4}
   end
 
+  test "subscribe returns the materialized collection for a collection source" do
+    app =
+      start_app(CollectionSolve, %{columns: initial_columns(), test_pid: self()})
+
+    assert_receive {:catalog_init, columns}
+    assert columns == initial_columns()
+
+    assert_receive {:column_init, 1, %{catalog: %{columns: columns}}}
+    assert columns == initial_columns()
+    assert_receive {:column_init, 2, %{catalog: %{columns: columns}}}
+    assert columns == initial_columns()
+
+    assert Solve.subscribe(app, :column) == %Solve.Collection{
+             ids: [1, 2],
+             items: %{
+               1 => %{id: 1, title: "Todo", visible?: true},
+               2 => %{id: 2, title: "Doing", visible?: false}
+             }
+           }
+
+    assert Solve.controller_pid(app, :column) == nil
+    assert is_pid(Solve.controller_pid(app, {:column, 1}))
+    assert Solve.subscribe(app, {:column, 1}) == %{id: 1, title: "Todo", visible?: true}
+  end
+
+  test "raw collection dependencies receive direct item updates without restarting the dependent" do
+    app = start_app(CollectionSolve, %{columns: initial_columns(), test_pid: self()})
+
+    assert_receive {:catalog_init, _}
+    assert_receive {:column_init, 1, _}
+    assert_receive {:column_init, 2, _}
+    assert_receive {:collection_projection_init, :all, %{columns: %Solve.Collection{ids: [1, 2]}}}
+    assert_receive {:visible_projection_init, %{visible_columns: %Solve.Collection{ids: [1]}}}
+
+    assert Solve.subscribe(app, :projection) == %{label: :all, titles: ["Todo", "Doing"]}
+
+    projection_pid = Solve.controller_pid(app, :projection)
+
+    assert :ok = Solve.dispatch(app, {:column, 1}, :rename, "Backlog")
+
+    assert_receive %Solve.Message{
+      type: :update,
+      payload: %Solve.Update{
+        app: ^app,
+        controller_name: :projection,
+        exposed_state: %{label: :all, titles: ["Backlog", "Doing"]}
+      }
+    }
+
+    assert Solve.controller_pid(app, :projection) == projection_pid
+    refute_receive {:collection_projection_init, _, _}, 50
+  end
+
+  test "filtered collection dependencies keep only matching items" do
+    app = start_app(CollectionSolve, %{columns: initial_columns(), test_pid: self()})
+
+    assert_receive {:catalog_init, _}
+    assert_receive {:column_init, 1, _}
+    assert_receive {:column_init, 2, _}
+    assert_receive {:collection_projection_init, :all, _}
+    assert_receive {:visible_projection_init, %{visible_columns: %Solve.Collection{ids: [1]}}}
+
+    assert Solve.subscribe(app, :visible_projection) == %{visible_ids: [1]}
+
+    assert :ok = Solve.dispatch(app, {:column, 1}, :set_visible, false)
+
+    assert_receive %Solve.Message{
+      type: :update,
+      payload: %Solve.Update{
+        app: ^app,
+        controller_name: :visible_projection,
+        exposed_state: %{visible_ids: []}
+      }
+    }
+
+    assert :ok = Solve.dispatch(app, {:column, 2}, :set_visible, true)
+
+    assert_receive %Solve.Message{
+      type: :update,
+      payload: %Solve.Update{
+        app: ^app,
+        controller_name: :visible_projection,
+        exposed_state: %{visible_ids: [2]}
+      }
+    }
+  end
+
+  test "collection callback changes update the running item without replacement" do
+    app =
+      start_app(CallbackCollectionSolve, %{
+        items: callback_items(),
+        callback_tag: :initial,
+        test_pid: self()
+      })
+
+    assert_receive {:callback_catalog_init, [%{id: 1, title: "Todo"}], :initial}
+    assert_receive {:callback_item_init, 1, "Todo"}
+
+    item_pid = await_controller_pid(app, {:callback_item, 1})
+
+    assert :ok = Solve.dispatch(app, {:callback_item, 1}, :report, :before)
+    assert_receive {:callback_item_report, 1, :before, %{tag: :initial}}
+
+    assert :ok = Solve.dispatch(app, :callback_catalog, :set_callback_tag, :updated)
+    assert await_target_callbacks(app, {:callback_item, 1}, %{tag: :updated}) == %{tag: :updated}
+    assert :ok = Solve.dispatch(app, {:callback_item, 1}, :report, :after)
+
+    assert_receive {:callback_item_report, 1, :after, %{tag: :updated}}
+    assert Solve.controller_pid(app, {:callback_item, 1}) == item_pid
+    refute_receive {:callback_item_init, 1, _title}, 50
+  end
+
+  test "controller spec callbacks can dispatch through the current app during event handling" do
+    app = start_app(ImplicitDispatchSolve, %{test_pid: self()})
+
+    assert_receive :todo_list_init
+    assert_receive :create_todo_init
+
+    payload = %{id: 1, title: "Write tests"}
+
+    assert :ok = Solve.dispatch(app, :create_todo, :submit, payload)
+
+    assert_receive {:todo_created, ^payload}
+    assert_receive {:create_todo_submitted, ^payload}
+    assert Solve.subscribe(app, :todo_list) == %{items: [payload]}
+  end
+
+  test "collection params changes replace the running item" do
+    app =
+      start_app(CallbackCollectionSolve, %{
+        items: callback_items(),
+        callback_tag: :initial,
+        test_pid: self()
+      })
+
+    assert_receive {:callback_catalog_init, [%{id: 1, title: "Todo"}], :initial}
+    assert_receive {:callback_item_init, 1, "Todo"}
+
+    item_pid = await_controller_pid(app, {:callback_item, 1})
+
+    assert :ok =
+             Solve.dispatch(app, :callback_catalog, :rename_item, %{id: 1, title: "Backlog"})
+
+    assert_receive {:callback_item_init, 1, "Backlog"}
+    refute await_pid_change(app, {:callback_item, 1}, item_pid) == item_pid
+
+    assert Solve.subscribe(app, {:callback_item, 1}) == %{id: 1, title: "Backlog"}
+    assert :ok = Solve.dispatch(app, {:callback_item, 1}, :report, :after)
+    assert_receive {:callback_item_report, 1, :after, %{tag: :initial}}
+  end
+
+  defp initial_columns do
+    [
+      %{id: 1, title: "Todo", visible?: true},
+      %{id: 2, title: "Doing", visible?: false}
+    ]
+  end
+
+  defp callback_items do
+    [%{id: 1, title: "Todo"}]
+  end
+
   defp start_app(module, app_params) do
     name = unique_name(module)
     assert {:ok, pid} = module.start_link(name: name, params: app_params)
@@ -475,6 +919,23 @@ defmodule Solve.RuntimeTest do
       _pid ->
         Process.sleep(10)
         await_pid_change(app, controller_name, old_pid, attempts - 1)
+    end
+  end
+
+  defp await_target_callbacks(app, target, expected, attempts \\ 50)
+
+  defp await_target_callbacks(_app, target, expected, 0) do
+    flunk("target #{inspect(target)} callbacks did not change to #{inspect(expected)} in time")
+  end
+
+  defp await_target_callbacks(app, target, expected, attempts) do
+    callbacks = :sys.get_state(app).controller_callbacks_by_target |> Map.get(target)
+
+    if callbacks == expected do
+      callbacks
+    else
+      Process.sleep(10)
+      await_target_callbacks(app, target, expected, attempts - 1)
     end
   end
 

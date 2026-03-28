@@ -2,6 +2,7 @@ defmodule Solve.ControllerTest do
   use ExUnit.Case, async: false
 
   import ExUnit.CaptureLog
+  alias Solve.Collection
 
   defmodule CounterController do
     use Solve.Controller, events: [:increment]
@@ -46,7 +47,62 @@ defmodule Solve.ControllerTest do
     @impl true
     def expose(_state, _dependencies, _init_params), do: %{mode: :stable}
 
-    def flip(_payload, _state, _dependencies, _callbacks, _init_params), do: :second
+    def flip(_payload), do: :second
+  end
+
+  defmodule CollectionDependencyController do
+    use Solve.Controller, events: []
+
+    @impl true
+    def init(%{test_pid: test_pid}, dependencies) do
+      send(test_pid, {:collection_dependency_init, dependencies})
+      :ready
+    end
+
+    @impl true
+    def expose(state, dependencies, _init_params) do
+      %{state: state, columns: Map.fetch!(dependencies, :columns)}
+    end
+  end
+
+  defmodule FlexibleArityController do
+    use Solve.Controller, events: [:one, :two, :three, :four, :five]
+
+    @impl true
+    def init(%{test_pid: test_pid}, dependencies) do
+      send(test_pid, {:flexible_arity_init, dependencies})
+      %{test_pid: test_pid, last: nil}
+    end
+
+    def one(%{test_pid: test_pid, value: value} = payload) do
+      send(test_pid, {:one_args, payload})
+      %{test_pid: test_pid, last: {:one, value}}
+    end
+
+    def two(payload, state) do
+      send(state.test_pid, {:two_args, payload, state})
+      %{state | last: {:two, payload}}
+    end
+
+    def three(payload, state, dependencies) do
+      send(state.test_pid, {:three_args, payload, state, dependencies})
+      %{state | last: {:three, payload}}
+    end
+
+    def four(payload, state, dependencies, callbacks) do
+      send(state.test_pid, {:four_args, payload, state, dependencies, callbacks})
+      %{state | last: {:four, payload}}
+    end
+
+    def five(payload, state, dependencies, callbacks, init_params) do
+      send(state.test_pid, {:five_args, payload, state, dependencies, callbacks, init_params})
+      %{state | last: {:five, payload}}
+    end
+
+    @impl true
+    def expose(state, _dependencies, _init_params) do
+      %{last: state.last}
+    end
   end
 
   test "use Solve.Controller rejects invalid events lists" do
@@ -59,26 +115,98 @@ defmodule Solve.ControllerTest do
 
         def init(_params, _dependencies), do: %{}
 
-        def increment(payload, state, dependencies, callbacks, init_params) do
-          {payload, state, dependencies, callbacks, init_params}
-        end
+        def increment(payload), do: %{payload: payload}
       end
       """)
     end
   end
 
-  test "use Solve.Controller requires declared event callbacks to exist as /5" do
+  test "use Solve.Controller requires declared event callbacks to exist with arity 1 through 5" do
     module = unique_module_name("MissingEvent")
 
-    assert_raise CompileError, ~r/must define declared event callback\(s\): increment\/5/, fn ->
-      Code.compile_string("""
-      defmodule #{inspect(module)} do
-        use Solve.Controller, events: [:increment]
+    assert_raise CompileError,
+                 ~r/must define declared event callback\(s\) with exactly one arity between \/1 and \/5: increment/,
+                 fn ->
+                   Code.compile_string("""
+                   defmodule #{inspect(module)} do
+                     use Solve.Controller, events: [:increment]
 
-        def init(_params, _dependencies), do: %{}
-      end
-      """)
-    end
+                     def init(_params, _dependencies), do: %{}
+                   end
+                   """)
+                 end
+  end
+
+  test "use Solve.Controller rejects declared event callbacks defined at multiple arities" do
+    module = unique_module_name("DuplicateEventArity")
+
+    assert_raise CompileError,
+                 ~r/must not define declared event callback\(s\) at multiple arities: increment \(increment\/1, increment\/2\)/,
+                 fn ->
+                   Code.compile_string("""
+                   defmodule #{inspect(module)} do
+                     use Solve.Controller, events: [:increment]
+
+                     def init(_params, _dependencies), do: %{}
+
+                     def increment(payload), do: %{payload: payload}
+                     def increment(payload, state), do: {payload, state}
+                   end
+                   """)
+                 end
+  end
+
+  test "dispatch/3 supports declared handlers with arity 1 through 5" do
+    params = %{test_pid: self()}
+    callbacks = %{audit: :ok}
+
+    assert {:ok, pid} =
+             FlexibleArityController.start_link(
+               solve_app: :app,
+               controller_name: :flexible,
+               params: params,
+               dependencies: %{source: %{value: 10}},
+               callbacks: callbacks
+             )
+
+    assert_receive {:flexible_arity_init, %{source: %{value: 10}}}
+    assert Solve.Controller.subscribe(pid) == %{last: nil}
+
+    one_payload = %{test_pid: self(), value: 1}
+    assert :ok = Solve.Controller.dispatch(pid, :one, one_payload)
+    assert_receive {:one_args, ^one_payload}
+    assert Solve.Controller.subscribe(pid) == %{last: {:one, 1}}
+
+    assert :ok = Solve.Controller.dispatch(pid, :two, :two_payload)
+    assert_receive {:two_args, :two_payload, %{test_pid: test_pid, last: {:one, 1}}}
+    assert test_pid == self()
+    assert Solve.Controller.subscribe(pid) == %{last: {:two, :two_payload}}
+
+    assert :ok = Solve.Controller.dispatch(pid, :three, :three_payload)
+
+    assert_receive {:three_args, :three_payload,
+                    %{test_pid: test_pid, last: {:two, :two_payload}}, %{source: %{value: 10}}}
+
+    assert test_pid == self()
+    assert Solve.Controller.subscribe(pid) == %{last: {:three, :three_payload}}
+
+    assert :ok = Solve.Controller.dispatch(pid, :four, :four_payload)
+
+    assert_receive {:four_args, :four_payload,
+                    %{test_pid: test_pid, last: {:three, :three_payload}},
+                    %{source: %{value: 10}}, ^callbacks}
+
+    assert test_pid == self()
+    assert Solve.Controller.subscribe(pid) == %{last: {:four, :four_payload}}
+
+    assert :ok = Solve.Controller.dispatch(pid, :five, :five_payload)
+
+    assert_receive {:five_args, :five_payload,
+                    %{test_pid: test_pid, last: {:four, :four_payload}}, %{source: %{value: 10}},
+                    ^callbacks, ^params}
+
+    assert test_pid == self()
+    assert Solve.Controller.subscribe(pid) == %{last: {:five, :five_payload}}
   end
 
   test "subscribe/2 returns the current exposed state using default expose/3" do
@@ -96,6 +224,65 @@ defmodule Solve.ControllerTest do
 
     assert_receive {:counter_init, %{}, ^params}
     assert Solve.Controller.subscribe(pid) == %{count: 2}
+  end
+
+  test "subscribe_with/3 returns current exposed state and sends encoded updates" do
+    params = %{initial: 2, test_pid: self()}
+
+    assert {:ok, pid} =
+             CounterController.start_link(
+               solve_app: :app,
+               controller_name: :counter,
+               params: params,
+               dependencies: %{},
+               callbacks: %{}
+             )
+
+    assert_receive {:counter_init, %{}, ^params}
+
+    assert {:ok, %{count: 2}, subscription_ref} =
+             Solve.Controller.subscribe_with(pid, self(), fn exposed_state ->
+               {:encoded_counter_update, exposed_state}
+             end)
+
+    assert is_reference(subscription_ref)
+
+    assert :ok = Solve.Controller.dispatch(pid, :increment, 1)
+
+    assert_receive {:encoded_counter_update, %{count: 3}}
+  end
+
+  test "unsubscribe/2 removes only the targeted internal subscription" do
+    params = %{initial: 1, test_pid: self()}
+
+    assert {:ok, pid} =
+             CounterController.start_link(
+               solve_app: :app,
+               controller_name: :counter,
+               params: params,
+               dependencies: %{},
+               callbacks: %{}
+             )
+
+    assert_receive {:counter_init, %{}, ^params}
+
+    assert {:ok, %{count: 1}, first_ref} =
+             Solve.Controller.subscribe_with(pid, self(), fn exposed_state ->
+               {:first_counter_update, exposed_state}
+             end)
+
+    assert {:ok, %{count: 1}, second_ref} =
+             Solve.Controller.subscribe_with(pid, self(), fn exposed_state ->
+               {:second_counter_update, exposed_state}
+             end)
+
+    assert first_ref != second_ref
+    assert :ok = Solve.Controller.unsubscribe(pid, first_ref)
+
+    assert :ok = Solve.Controller.dispatch(pid, :increment, 1)
+
+    refute_receive {:first_counter_update, _}, 50
+    assert_receive {:second_counter_update, %{count: 2}}
   end
 
   test "dispatch/3 passes payload, state, dependencies, callbacks, and init params to events" do
@@ -117,6 +304,78 @@ defmodule Solve.ControllerTest do
     assert :ok = Solve.Controller.dispatch(pid, :increment, 4)
 
     assert_receive {:increment_args, 4, %{count: 3}, %{source: %{value: 10}}, ^callbacks, ^params}
+
+    assert_receive %Solve.Message{
+      type: :update,
+      payload: %Solve.Update{app: :app, controller_name: :counter, exposed_state: %{count: 7}}
+    }
+  end
+
+  test "direct solve_event messages invoke controller events" do
+    params = %{initial: 3, test_pid: self()}
+    callbacks = %{audit: fn _ -> :ok end}
+
+    assert {:ok, pid} =
+             CounterController.start_link(
+               solve_app: :app,
+               controller_name: :counter,
+               params: params,
+               dependencies: %{source: %{value: 10}},
+               callbacks: callbacks
+             )
+
+    assert_receive {:counter_init, %{source: %{value: 10}}, ^params}
+    assert Solve.Controller.subscribe(pid) == %{count: 3}
+
+    send(pid, {:solve_event, :increment, 4})
+
+    assert_receive {:increment_args, 4, %{count: 3}, %{source: %{value: 10}}, ^callbacks, ^params}
+
+    assert_receive %Solve.Message{
+      type: :update,
+      payload: %Solve.Update{app: :app, controller_name: :counter, exposed_state: %{count: 7}}
+    }
+  end
+
+  test "direct solve_event messages use empty map payload when omitted" do
+    assert {:ok, pid} =
+             StaticExposeController.start_link(
+               solve_app: :app,
+               controller_name: :static,
+               params: %{ok: true},
+               dependencies: %{},
+               callbacks: %{}
+             )
+
+    assert Solve.Controller.subscribe(pid) == %{mode: :stable}
+
+    send(pid, {:solve_event, :flip})
+
+    assert :sys.get_state(pid).state == :second
+  end
+
+  test "update_callbacks/2 changes callbacks for later events without restarting" do
+    params = %{initial: 3, test_pid: self()}
+
+    assert {:ok, pid} =
+             CounterController.start_link(
+               solve_app: :app,
+               controller_name: :counter,
+               params: params,
+               dependencies: %{source: %{value: 10}},
+               callbacks: %{audit: :initial}
+             )
+
+    assert_receive {:counter_init, %{source: %{value: 10}}, ^params}
+    assert Solve.Controller.subscribe(pid) == %{count: 3}
+
+    assert :ok = Solve.Controller.update_callbacks(pid, %{audit: :updated})
+    assert :ok = Solve.Controller.dispatch(pid, :increment, 4)
+
+    assert_receive {:increment_args, 4, %{count: 3}, %{source: %{value: 10}}, %{audit: :updated},
+                    ^params}
+
+    refute_receive {:counter_init, _, _}, 50
 
     assert_receive %Solve.Message{
       type: :update,
@@ -163,6 +422,167 @@ defmodule Solve.ControllerTest do
     }
 
     refute_receive {:derived_init, _}
+  end
+
+  test "dependency update :replace updates the local dependency key" do
+    params = %{tag: :demo, test_pid: self()}
+
+    assert {:ok, pid} =
+             DerivedController.start_link(
+               solve_app: :app,
+               controller_name: :derived,
+               params: params,
+               dependencies: %{source: nil},
+               callbacks: %{}
+             )
+
+    assert_receive {:derived_init, %{source: nil}}
+    assert Solve.Controller.subscribe(pid) == %{state: :ready, source: nil, tag: :demo}
+
+    send(pid, %Solve.DependencyUpdate{app: :app, key: :source, op: :replace, value: %{value: 42}})
+
+    assert_receive %Solve.Message{
+      type: :update,
+      payload: %Solve.Update{
+        app: :app,
+        controller_name: :derived,
+        exposed_state: %{state: :ready, source: %{value: 42}, tag: :demo}
+      }
+    }
+  end
+
+  test "dependency update :collection_put inserts or replaces one item" do
+    params = %{test_pid: self()}
+
+    assert {:ok, pid} =
+             CollectionDependencyController.start_link(
+               solve_app: :app,
+               controller_name: :collection_dep,
+               params: params,
+               dependencies: %{columns: Collection.empty()},
+               callbacks: %{}
+             )
+
+    assert_receive {:collection_dependency_init, %{columns: %Collection{ids: [], items: %{}}}}
+    assert Solve.Controller.subscribe(pid) == %{state: :ready, columns: Collection.empty()}
+
+    send(pid, %Solve.DependencyUpdate{
+      app: :app,
+      key: :columns,
+      op: :collection_put,
+      id: 2,
+      value: %{title: "Doing"}
+    })
+
+    assert_receive %Solve.Message{
+      type: :update,
+      payload: %Solve.Update{
+        app: :app,
+        controller_name: :collection_dep,
+        exposed_state: %{
+          state: :ready,
+          columns: %Collection{ids: [2], items: %{2 => %{title: "Doing"}}}
+        }
+      }
+    }
+
+    send(pid, %Solve.DependencyUpdate{
+      app: :app,
+      key: :columns,
+      op: :collection_put,
+      id: 2,
+      value: %{title: "In Progress"}
+    })
+
+    assert_receive %Solve.Message{
+      type: :update,
+      payload: %Solve.Update{
+        app: :app,
+        controller_name: :collection_dep,
+        exposed_state: %{
+          state: :ready,
+          columns: %Collection{ids: [2], items: %{2 => %{title: "In Progress"}}}
+        }
+      }
+    }
+  end
+
+  test "dependency update :collection_delete removes one item" do
+    params = %{test_pid: self()}
+
+    initial_columns = %Collection{
+      ids: [1, 2],
+      items: %{1 => %{title: "Todo"}, 2 => %{title: "Doing"}}
+    }
+
+    assert {:ok, pid} =
+             CollectionDependencyController.start_link(
+               solve_app: :app,
+               controller_name: :collection_dep,
+               params: params,
+               dependencies: %{columns: initial_columns},
+               callbacks: %{}
+             )
+
+    assert_receive {:collection_dependency_init, %{columns: ^initial_columns}}
+    assert Solve.Controller.subscribe(pid) == %{state: :ready, columns: initial_columns}
+
+    send(pid, %Solve.DependencyUpdate{app: :app, key: :columns, op: :collection_delete, id: 1})
+
+    assert_receive %Solve.Message{
+      type: :update,
+      payload: %Solve.Update{
+        app: :app,
+        controller_name: :collection_dep,
+        exposed_state: %{
+          state: :ready,
+          columns: %Collection{ids: [2], items: %{2 => %{title: "Doing"}}}
+        }
+      }
+    }
+  end
+
+  test "dependency update :collection_reorder updates ids and preserves items" do
+    params = %{test_pid: self()}
+
+    initial_columns = %Collection{
+      ids: [2, 1],
+      items: %{1 => %{title: "Todo"}, 2 => %{title: "Doing"}}
+    }
+
+    assert {:ok, pid} =
+             CollectionDependencyController.start_link(
+               solve_app: :app,
+               controller_name: :collection_dep,
+               params: params,
+               dependencies: %{columns: initial_columns},
+               callbacks: %{}
+             )
+
+    assert_receive {:collection_dependency_init, %{columns: ^initial_columns}}
+    assert Solve.Controller.subscribe(pid) == %{state: :ready, columns: initial_columns}
+
+    send(pid, %Solve.DependencyUpdate{
+      app: :app,
+      key: :columns,
+      op: :collection_reorder,
+      ids: [1, 2]
+    })
+
+    assert_receive %Solve.Message{
+      type: :update,
+      payload: %Solve.Update{
+        app: :app,
+        controller_name: :collection_dep,
+        exposed_state: %{
+          state: :ready,
+          columns: %Collection{
+            ids: [1, 2],
+            items: %{1 => %{title: "Todo"}, 2 => %{title: "Doing"}}
+          }
+        }
+      }
+    }
   end
 
   test "undeclared events are logged and discarded" do
@@ -233,6 +653,39 @@ defmodule Solve.ControllerTest do
     subscriber = spawn(fn -> Process.sleep(:infinity) end)
 
     assert Solve.Controller.subscribe(pid, subscriber) == %{count: 1}
+
+    Process.exit(subscriber, :shutdown)
+    Process.sleep(10)
+
+    state = :sys.get_state(pid)
+    assert state.subscribers == %{}
+  end
+
+  test "dead internal subscribers are removed from the controller state" do
+    params = %{initial: 1, test_pid: self()}
+
+    assert {:ok, pid} =
+             CounterController.start_link(
+               solve_app: :app,
+               controller_name: :counter,
+               params: params,
+               dependencies: %{},
+               callbacks: %{}
+             )
+
+    assert_receive {:counter_init, %{}, ^params}
+
+    subscriber = spawn(fn -> Process.sleep(:infinity) end)
+
+    assert {:ok, %{count: 1}, _first_ref} =
+             Solve.Controller.subscribe_with(pid, subscriber, fn exposed_state ->
+               {:first_internal_update, exposed_state}
+             end)
+
+    assert {:ok, %{count: 1}, _second_ref} =
+             Solve.Controller.subscribe_with(pid, subscriber, fn exposed_state ->
+               {:second_internal_update, exposed_state}
+             end)
 
     Process.exit(subscriber, :shutdown)
     Process.sleep(10)

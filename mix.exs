@@ -39,11 +39,17 @@ defmodule Solve.MixProject do
 
   defp docs do
     [
-      main: "Solve",
+      main: "readme",
       source_ref: "readme",
       extras: [
         "README.md",
-        "ARCHITECTURE.md"
+        "ARCHITECTURE.md",
+        "examples/emerge_lookup_example.md",
+        "examples/counter_lookup_example.md"
+      ],
+      groups_for_extras: [
+        Guides: ["examples/emerge_lookup_example.md", "examples/counter_lookup_example.md"],
+        Internals: ["ARCHITECTURE.md"]
       ],
       groups_for_modules: [
         {"Core", [Solve]},

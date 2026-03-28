@@ -1,152 +1,56 @@
 defmodule Solve.Lookup do
   @moduledoc """
   Process-local facade for interacting with a Solve app.
-
-  `solve/2` subscribes once per process and controller, caches the latest exposed map in the
-  process dictionary under `{:solve_lookup_ref, app, controller_name}`, and augments the
-  returned map with `:events_` dispatch refs.
-
-  `use Solve.Lookup` supports two modes:
-
-  - `handle_info: :auto` (default) consumes `%Solve.Message{}` and `nil` in injected
-    `handle_info/2` clauses and calls `handle_solve_updated/2` when updates are observed.
-  - `handle_info: :manual` injects no `handle_info/2` clauses; match `%Solve.Message{}`
-    yourself, handle `nil` explicitly, and call `handle_message/1`.
-
-  See `examples/counter_lookup_example.md` for a complete end-to-end example.
-
-  ## Basic usage
-
-      defmodule MyApp.CounterWorker do
-        use GenServer
-        use Solve.Lookup
-
-        def start_link(app) do
-          GenServer.start_link(__MODULE__, app, name: __MODULE__)
-        end
-
-        def init(app) do
-          {:ok, %{app: app}}
-        end
-
-        def render(state) do
-          counter = solve(state.app, :counter)
-          IO.inspect(counter, label: "counter")
-          state
-        end
-
-        @impl Solve.Lookup
-        def handle_solve_updated(_updated, state) do
-          {:ok, render(state)}
-        end
-      end
-
-  `solve/2` returns the exposed controller map augmented with `:events_`:
-
-      %{
-        count: 2,
-        events_: %{
-          increment: %Solve.Message{type: :dispatch, payload: %Solve.Dispatch{...}}
-        }
-      }
-
-  Use `events/1` to access event refs safely. If the controller is off, `solve/2` returns
-  `nil` and `events(nil)` also returns `nil`; auto mode ignores that `nil` for you, and
-  manual handlers can do the same with `handle_info(nil, state)`.
-
-  ## Manual handle_info forwarding
-
-      defmodule MyApp.ManualWorker do
-        use GenServer
-        use Solve.Lookup, handle_info: :manual
-
-        def init(app) do
-          {:ok, %{app: app}}
-        end
-
-        def render(state) do
-          counter = solve(state.app, :counter)
-          IO.inspect(counter, label: "counter")
-          state
-        end
-
-        def handle_info(nil, state) do
-          {:noreply, state}
-        end
-
-        def handle_info(%Solve.Message{} = message, %{app: app} = state) do
-          case handle_message(message) do
-            %{^app => controllers} ->
-              if :counter in controllers,
-                do: {:noreply, render(state)},
-                else: {:noreply, state}
-
-            %{} ->
-              {:noreply, state}
-          end
-        end
-
-        def handle_info(_message, state) do
-          {:noreply, state}
-        end
-      end
-
-  `handle_message/1` returns a map keyed by the actual Solve app ref/pid, so manual
-  handlers typically match the `app` stored in state.
-
-  ## Reserved keys
-
-  `:events_` is reserved for lookup augmentation. Running controllers must expose plain maps
-  that do not already contain that key.
   """
 
   defmodule Ref do
     @moduledoc false
 
-    @enforce_keys [:app, :controller_name, :events, :subscribed?]
-    defstruct [:app, :controller_name, :value, :events, :subscribed?]
+    @enforce_keys [:app, :controller_name, :kind, :events, :subscribed?]
+    defstruct [:app, :controller_name, :kind, :value, :events, :subscribed?]
+  end
+
+  defmodule Updated do
+    @moduledoc false
+
+    @enforce_keys [:refs, :collections]
+    defstruct refs: [], collections: []
   end
 
   @events_key :events_
 
-  @type updated_controllers :: %{optional(GenServer.server()) => [atom()]}
+  @type target :: Solve.controller_target()
+  @type updated_controllers :: %{optional(GenServer.server()) => Updated.t()}
 
   @callback handle_solve_updated(updated_controllers(), term()) :: {:ok, term()}
   @optional_callbacks handle_solve_updated: 2
 
   defmacro __using__(opts \\ []) do
-    %{handle_info_mode: handle_info_mode} = validate_options!(opts, __CALLER__)
+    %{imports: imports, mode: mode, handle_info_mode: handle_info_mode} =
+      validate_options!(opts, __CALLER__)
 
-    quote bind_quoted: [handle_info_mode: handle_info_mode] do
-      @behaviour Solve.Lookup
+    quote do
+      import Solve.Lookup, only: unquote(imports)
 
-      import Solve.Lookup,
-        only: [
-          solve: 1,
-          solve: 2,
-          dispatch: 2,
-          dispatch: 3,
-          dispatch: 4,
-          events: 1,
-          handle_message: 1
-        ]
+      if unquote(mode) != :helpers do
+        @behaviour Solve.Lookup
+        @before_compile Solve.Lookup
+        @solve_lookup_handle_info_mode unquote(handle_info_mode)
 
-      @before_compile Solve.Lookup
-      @solve_lookup_handle_info_mode handle_info_mode
-
-      if handle_info_mode == :auto do
-        def handle_info(nil, state) do
-          {:noreply, state}
-        end
-
-        def handle_info(%Solve.Message{} = message, state) do
-          updated = handle_message(message)
-
-          if map_size(updated) == 0 do
+        if unquote(handle_info_mode) == :auto do
+          def handle_info(nil, state) do
             {:noreply, state}
-          else
-            {:ok, state} = handle_solve_updated(updated, state)
-            {:noreply, state}
+          end
+
+          def handle_info(%Solve.Message{} = message, state) do
+            updated = handle_message(message)
+
+            if map_size(updated) == 0 do
+              {:noreply, state}
+            else
+              {:ok, state} = handle_solve_updated(updated, state)
+              {:noreply, state}
+            end
           end
         end
       end
@@ -168,58 +72,102 @@ defmodule Solve.Lookup do
     quote(do: :ok)
   end
 
-  @doc """
-  Returns the current exposed map for a controller augmented with `:events_` dispatch refs.
-  Returns `nil` when the controller is currently off/stopped.
-  """
-  @spec solve(atom()) :: map() | nil
+  @spec solve(target()) :: map() | nil
   def solve(controller_name) do
     solve(nil, controller_name)
   end
 
-  @spec solve(GenServer.server() | nil, atom()) :: map() | nil
-  def solve(app, controller_name) when is_atom(controller_name) do
-    app
-    |> resolve_app!()
-    |> ensure_lookup_ref(controller_name)
-    |> augment_lookup_value()
+  @spec solve(GenServer.server() | nil, target()) :: map() | nil
+  def solve(app, controller_name) do
+    app = resolve_app!(app)
+
+    case lookup_kind(app, controller_name) do
+      :item ->
+        app
+        |> ensure_lookup_ref(controller_name, :item)
+        |> augment_lookup_value()
+
+      :collection ->
+        raise ArgumentError,
+              "Solve.Lookup.solve/2 does not support collection source #{inspect(controller_name)}; use collection/2"
+
+      :unknown ->
+        nil
+    end
   end
 
-  @doc """
-  Dispatches an event through the Solve runtime using the current process app.
-  """
-  @spec dispatch(atom(), atom()) :: :ok
-  def dispatch(controller_name, event) when is_atom(controller_name) do
+  @spec collection(atom()) :: Solve.Collection.t(map())
+  def collection(controller_name) when is_atom(controller_name) do
+    collection(nil, controller_name)
+  end
+
+  @spec collection(GenServer.server() | nil, atom()) :: Solve.Collection.t(map())
+  def collection(app, controller_name) when is_atom(controller_name) do
+    app = resolve_app!(app)
+
+    case lookup_kind(app, controller_name) do
+      :collection ->
+        app
+        |> ensure_lookup_ref(controller_name, :collection)
+        |> augment_lookup_value()
+
+      :item ->
+        raise ArgumentError,
+              "Solve.Lookup.collection/2 requires a collection source, got singleton #{inspect(controller_name)}"
+
+      :unknown ->
+        raise ArgumentError,
+              "Solve.Lookup.collection/2 could not resolve collection source #{inspect(controller_name)}"
+    end
+  end
+
+  @spec dispatch(target(), atom()) :: :ok
+  def dispatch(controller_name, event) do
     dispatch(nil, controller_name, event, %{})
   end
 
-  @spec dispatch(atom(), atom(), term()) :: :ok
-  def dispatch(controller_name, event, payload) when is_atom(controller_name) do
+  @spec dispatch(target(), atom(), term()) :: :ok
+  def dispatch(controller_name, event, payload) do
     dispatch(nil, controller_name, event, payload)
   end
 
-  @spec dispatch(GenServer.server() | nil, atom(), atom(), term()) :: :ok
-  def dispatch(app, controller_name, event, payload) when is_atom(controller_name) do
+  @spec dispatch(GenServer.server() | nil, target(), atom(), term()) :: :ok
+  def dispatch(app, controller_name, event, payload) when is_atom(event) do
     app
     |> resolve_app!()
     |> Solve.dispatch(controller_name, event, payload)
   end
 
   @doc """
-  Returns the nested events map from a lookup result.
+  Reads one direct `{pid, message}` event tuple from a lookup item.
+
+  This is a convenience wrapper over `events(controller)[event_name]`.
   """
-  @spec events(map() | nil) :: map() | nil
+  @spec event(map() | nil | Solve.Collection.t(any()), atom()) :: {pid(), term()} | nil
+  def event(controller, event_name) when is_atom(event_name) do
+    case events(controller) do
+      nil -> nil
+      events -> Map.get(events, event_name)
+    end
+  end
+
+  @doc """
+  Builds a direct `{pid, message}` event tuple with a fixed payload for a lookup item.
+  """
+  @spec event(map() | nil | Solve.Collection.t(any()), atom(), term()) :: {pid(), term()} | nil
+  def event(controller, event_name, payload) when is_atom(event_name) do
+    case event(controller, event_name) do
+      {pid, {:solve_event, ^event_name}} -> {pid, {:solve_event, event_name, payload}}
+      _ -> nil
+    end
+  end
+
+  @spec events(map() | nil | Solve.Collection.t(any())) :: map() | nil
   def events(nil), do: nil
+  def events(%Solve.Collection{}), do: nil
   def events(%{@events_key => events}), do: events
   def events(_value), do: nil
 
-  @doc """
-  Consumes a `%Solve.Message{}` and returns a map of updated controllers grouped by the
-  actual Solve app ref/pid.
-
-  Returns `%{}` when the message is Solve-related but does not update any cached controller
-  value in this process (for example, a dispatch envelope).
-  """
   @spec handle_message(Solve.Message.t()) :: updated_controllers()
   def handle_message(%Solve.Message{type: :dispatch, payload: %Solve.Dispatch{} = dispatch}) do
     app = resolve_app!(dispatch.app)
@@ -234,19 +182,43 @@ defmodule Solve.Lookup do
           controller_name: controller_name,
           exposed_state: exposed_value
         }
-      })
-      when is_atom(controller_name) do
+      }) do
     app = resolve_app!(app)
 
-    ref = lookup_ref(app, controller_name) || build_lookup_ref(app, controller_name, nil)
+    kind =
+      cond do
+        match?(%Solve.Collection{}, exposed_value) -> :collection
+        true -> :item
+      end
 
-    put_lookup_ref(%{ref | value: validate_lookup_value!(exposed_value), subscribed?: true})
-    %{app => [controller_name]}
+    ref = lookup_ref(app, controller_name) || build_lookup_ref(app, controller_name, kind, nil)
+
+    put_lookup_ref(%{
+      ref
+      | kind: kind,
+        value: validate_lookup_value!(exposed_value),
+        events: build_events_for_kind(app, controller_name, kind),
+        subscribed?: true
+    })
+
+    updated =
+      case kind do
+        :collection -> %Updated{refs: [], collections: [controller_name]}
+        :item -> %Updated{refs: [controller_name], collections: []}
+      end
+
+    %{app => updated}
   end
 
-  defp ensure_lookup_ref(app, controller_name) do
+  defp ensure_lookup_ref(app, controller_name, kind) do
     case lookup_ref(app, controller_name) do
-      %Ref{} = ref ->
+      %Ref{kind: ^kind} = ref ->
+        ref
+
+      %Ref{} = ref when kind == :collection ->
+        ref
+
+      %Ref{} = ref when kind == :item ->
         ref
 
       nil ->
@@ -254,6 +226,7 @@ defmodule Solve.Lookup do
           build_lookup_ref(
             app,
             controller_name,
+            kind,
             Solve.subscribe(app, controller_name, self())
           )
 
@@ -262,45 +235,86 @@ defmodule Solve.Lookup do
     end
   end
 
-  defp augment_lookup_value(%Ref{value: nil}), do: nil
+  defp augment_lookup_value(%Ref{kind: :item, value: nil}), do: nil
 
-  defp augment_lookup_value(%Ref{value: value, events: events}) do
+  defp augment_lookup_value(%Ref{kind: :item, value: value, events: events}) do
     Map.put(value, @events_key, events)
   end
 
-  defp build_lookup_ref(app, controller_name, value) do
+  defp augment_lookup_value(%Ref{
+         kind: :collection,
+         app: app,
+         controller_name: controller_name,
+         value: value
+       }) do
+    augment_collection_value(app, controller_name, value)
+  end
+
+  defp build_lookup_ref(app, controller_name, kind, value) do
     %Ref{
       app: app,
       controller_name: controller_name,
+      kind: kind,
       value: validate_lookup_value!(value),
-      events: build_dispatches(app, controller_name),
+      events: build_events_for_kind(app, controller_name, kind),
       subscribed?: true
     }
   end
 
-  defp build_dispatches(app, controller_name) do
-    app
-    |> Solve.controller_events(controller_name)
-    |> Kernel.||([])
-    |> Map.new(fn event ->
-      {event, Solve.Message.dispatch(app, controller_name, event, %{})}
-    end)
+  defp build_events_for_kind(_app, _controller_name, :collection), do: nil
+
+  defp build_events_for_kind(app, controller_name, :item),
+    do: build_direct_events(app, controller_name)
+
+  defp build_direct_events(app, controller_name) do
+    case Solve.controller_pid(app, controller_name) do
+      pid when is_pid(pid) ->
+        app
+        |> Solve.controller_events(controller_name)
+        |> Kernel.||([])
+        |> Map.new(fn event -> {event, {pid, {:solve_event, event}}} end)
+
+      _ ->
+        %{}
+    end
+  end
+
+  defp augment_collection_value(_app, _controller_name, nil) do
+    Solve.Collection.empty()
+  end
+
+  defp augment_collection_value(app, controller_name, %Solve.Collection{} = collection) do
+    items =
+      Map.new(collection.items, fn {id, value} ->
+        {id, Map.put(value, @events_key, build_direct_events(app, {controller_name, id}))}
+      end)
+
+    %Solve.Collection{collection | items: items}
   end
 
   defp validate_lookup_value!(nil), do: nil
 
   defp validate_lookup_value!(value) when is_map(value) and not is_struct(value) do
+    validate_lookup_item!(value)
+  end
+
+  defp validate_lookup_value!(%Solve.Collection{} = collection) do
+    items = Map.new(collection.items, fn {id, item} -> {id, validate_lookup_item!(item)} end)
+    %Solve.Collection{collection | items: items}
+  end
+
+  defp validate_lookup_value!(value) do
+    raise ArgumentError,
+          "Solve.Lookup expects exposed controller values to be plain maps, Solve.Collection structs, or nil, got: #{inspect(value)}"
+  end
+
+  defp validate_lookup_item!(value) do
     if Map.has_key?(value, @events_key) do
       raise ArgumentError,
             "Solve.Lookup reserves #{inspect(@events_key)} in exposed controller maps"
     else
       value
     end
-  end
-
-  defp validate_lookup_value!(value) do
-    raise ArgumentError,
-          "Solve.Lookup expects exposed controller values to be plain maps or nil, got: #{inspect(value)}"
   end
 
   defp lookup_ref(app, controller_name) do
@@ -323,6 +337,23 @@ defmodule Solve.Lookup do
     |> Enum.uniq()
     |> Enum.map(&ref_key(&1, controller_name))
   end
+
+  defp lookup_kind(app, controller_name) when is_atom(controller_name) do
+    case Solve.controller_variant(app, controller_name) do
+      :collection -> :collection
+      :singleton -> :item
+      nil -> :unknown
+    end
+  end
+
+  defp lookup_kind(app, {source_name, _id}) when is_atom(source_name) do
+    case Solve.controller_variant(app, source_name) do
+      :collection -> :item
+      _ -> :unknown
+    end
+  end
+
+  defp lookup_kind(_app, _controller_name), do: :unknown
 
   defp app_aliases(app) do
     pid = app_pid(app)
@@ -361,18 +392,50 @@ defmodule Solve.Lookup do
 
   defp resolve_app!(app), do: app
 
+  defp validate_options!(:helpers, _caller) do
+    %{imports: helper_imports(), mode: :helpers, handle_info_mode: nil}
+  end
+
   defp validate_options!(opts, caller) when is_list(opts) do
     handle_info_mode =
       validate_handle_info_option!(Keyword.get(opts, :handle_info, :auto), caller)
 
-    %{handle_info_mode: handle_info_mode}
+    %{imports: default_imports(), mode: handle_info_mode, handle_info_mode: handle_info_mode}
   end
 
   defp validate_options!(opts, caller) do
     raise CompileError,
       file: caller.file,
       line: caller.line,
-      description: "use Solve.Lookup expects a keyword list, got: #{inspect(opts)}"
+      description: "use Solve.Lookup expects :helpers or a keyword list, got: #{inspect(opts)}"
+  end
+
+  defp default_imports do
+    [
+      solve: 1,
+      solve: 2,
+      collection: 1,
+      collection: 2,
+      event: 2,
+      event: 3,
+      dispatch: 2,
+      dispatch: 3,
+      dispatch: 4,
+      events: 1,
+      handle_message: 1
+    ]
+  end
+
+  defp helper_imports do
+    [
+      solve: 1,
+      solve: 2,
+      collection: 1,
+      collection: 2,
+      event: 2,
+      event: 3,
+      events: 1
+    ]
   end
 
   defp validate_handle_info_option!(:auto, _caller), do: :auto

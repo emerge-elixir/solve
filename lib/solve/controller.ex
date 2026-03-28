@@ -36,15 +36,15 @@ defmodule Solve.Controller do
           %{count: state.count}
         end
 
-        def increment(_payload, state, _dependencies, _callbacks, _init_params) do
+        def increment(_payload, state) do
           %{state | count: state.count + 1}
         end
 
-        def decrement(_payload, state, _dependencies, _callbacks, _init_params) do
+        def decrement(_payload, state) do
           %{state | count: state.count - 1}
         end
 
-        def reset(_payload, _state, _dependencies, _callbacks, _init_params) do
+        def reset(_payload) do
           %{count: 0, private_data: "secret"}
         end
       end
@@ -71,10 +71,17 @@ defmodule Solve.Controller do
   `init_params` can have any shape, but it must be truthy. If it is `nil` or `false`, the
   controller stops with `{:invalid_init_params, controller_name, value}`.
 
-  `callbacks` is a plain map passed only to declared event handlers. Event handlers receive
-  all runtime inputs as:
+  `callbacks` is a plain map passed only to declared event handlers. Event handlers can be
+  defined with arity `1` through `5`, and Solve passes the leading runtime inputs the handler
+  asks for:
 
+      event_name(event_payload)
+      event_name(event_payload, state)
+      event_name(event_payload, state, dependencies)
+      event_name(event_payload, state, dependencies, callbacks)
       event_name(event_payload, state, dependencies, callbacks, init_params)
+
+  Declaring the same event at multiple arities is a compile error.
 
   ## Subscription Helpers
 
@@ -99,14 +106,17 @@ defmodule Solve.Controller do
   """
 
   require Logger
+  alias Solve.Collection
+  alias Solve.DependencyUpdate
   alias Solve.Message
 
   @genserver_start_options [:name, :timeout, :debug, :spawn_opt, :hibernate_after]
 
   @type state :: any()
-  @type dependencies :: map()
+  @type dependencies :: %{optional(atom()) => map() | Collection.t(map()) | nil}
   @type callbacks :: map()
   @type init_params :: any()
+  @type dependency_encoder :: (map() -> term())
 
   @doc """
   Initializes the controller user state.
@@ -153,8 +163,33 @@ defmodule Solve.Controller do
       end
 
       @impl GenServer
+      def handle_call({:subscribe_with, subscriber, encoder}, _from, server_state) do
+        Solve.Controller.__handle_subscribe_with__(subscriber, encoder, server_state)
+      end
+
+      @impl GenServer
+      def handle_call({:unsubscribe, subscription_ref}, _from, server_state) do
+        Solve.Controller.__handle_unsubscribe__(subscription_ref, server_state)
+      end
+
+      @impl GenServer
+      def handle_cast({:update_callbacks, callbacks}, server_state) do
+        Solve.Controller.__handle_callbacks_update__(callbacks, server_state)
+      end
+
+      @impl GenServer
       def handle_cast({:event, event, payload}, server_state) do
         Solve.Controller.__handle_event__(event, payload, server_state)
+      end
+
+      @impl GenServer
+      def handle_info({:solve_event, event}, server_state) when is_atom(event) do
+        Solve.Controller.__handle_direct_event__(event, %{}, server_state)
+      end
+
+      @impl GenServer
+      def handle_info({:solve_event, event, payload}, server_state) when is_atom(event) do
+        Solve.Controller.__handle_direct_event__(event, payload, server_state)
       end
 
       @impl GenServer
@@ -178,6 +213,11 @@ defmodule Solve.Controller do
       end
 
       @impl GenServer
+      def handle_info(%Solve.DependencyUpdate{} = dependency_update, server_state) do
+        Solve.Controller.__handle_dependency_update_message__(dependency_update, server_state)
+      end
+
+      @impl GenServer
       def handle_info({:DOWN, _ref, :process, subscriber, _reason}, server_state) do
         Solve.Controller.__handle_subscriber_down__(subscriber, server_state)
       end
@@ -193,23 +233,59 @@ defmodule Solve.Controller do
 
   defmacro __before_compile__(env) do
     events = Module.get_attribute(env.module, :solve_controller_events) || []
-    definitions = MapSet.new(Module.definitions_in(env.module))
+    definitions = Module.definitions_in(env.module)
 
-    missing_callbacks =
-      Enum.reject(events, fn event ->
-        MapSet.member?(definitions, {event, 5})
+    event_arities =
+      Map.new(events, fn event ->
+        arities =
+          definitions
+          |> Enum.reduce([], fn
+            {^event, arity}, acc -> [arity | acc]
+            _, acc -> acc
+          end)
+          |> Enum.sort()
+
+        {event, arities}
       end)
 
-    if missing_callbacks != [] do
-      callbacks = Enum.map_join(missing_callbacks, ", ", &"#{&1}/5")
+    invalid_callbacks =
+      event_arities
+      |> Enum.filter(fn {_event, arities} -> not valid_event_arities?(arities) end)
+      |> Enum.filter(fn {_event, arities} -> length(arities) <= 1 end)
+
+    if invalid_callbacks != [] do
+      callbacks = Enum.map_join(invalid_callbacks, ", ", &format_invalid_event_callback/1)
 
       raise CompileError,
         file: env.file,
         line: 1,
-        description: "#{inspect(env.module)} must define declared event callback(s): #{callbacks}"
+        description:
+          "#{inspect(env.module)} must define declared event callback(s) with exactly one arity between /1 and /5: #{callbacks}"
     end
 
-    quote(do: :ok)
+    duplicate_callbacks =
+      event_arities
+      |> Enum.filter(fn {_event, arities} -> length(arities) > 1 end)
+
+    if duplicate_callbacks != [] do
+      callbacks = Enum.map_join(duplicate_callbacks, "; ", &format_duplicate_event_callback/1)
+
+      raise CompileError,
+        file: env.file,
+        line: 1,
+        description:
+          "#{inspect(env.module)} must not define declared event callback(s) at multiple arities: #{callbacks}"
+    end
+
+    resolved_event_arities = Enum.map(event_arities, fn {event, [arity]} -> {event, arity} end)
+
+    quote bind_quoted: [event_arities: resolved_event_arities] do
+      @solve_controller_event_arities Map.new(event_arities)
+
+      def __solve_event_arity__(event) when is_atom(event) do
+        Map.fetch!(@solve_controller_event_arities, event)
+      end
+    end
   end
 
   @doc """
@@ -234,12 +310,42 @@ defmodule Solve.Controller do
     raise ArgumentError, "subscribe/2 expects a pid subscriber, got: #{inspect(subscriber)}"
   end
 
+  @doc false
+  @spec subscribe_with(GenServer.server(), pid(), dependency_encoder()) ::
+          {:ok, map(), reference()}
+  def subscribe_with(controller, subscriber, encoder)
+      when is_pid(subscriber) and is_function(encoder, 1) do
+    GenServer.call(controller, {:subscribe_with, subscriber, encoder})
+  end
+
+  def subscribe_with(_controller, subscriber, _encoder) do
+    raise ArgumentError,
+          "subscribe_with/3 expects a pid subscriber and unary encoder, got: #{inspect(subscriber)}"
+  end
+
+  @doc false
+  @spec unsubscribe(GenServer.server(), reference()) :: :ok
+  def unsubscribe(controller, subscription_ref) when is_reference(subscription_ref) do
+    GenServer.call(controller, {:unsubscribe, subscription_ref})
+  end
+
+  def unsubscribe(_controller, subscription_ref) do
+    raise ArgumentError,
+          "unsubscribe/2 expects a subscription reference, got: #{inspect(subscription_ref)}"
+  end
+
   @doc """
   Dispatches an event to a controller.
   """
   @spec dispatch(GenServer.server(), term(), term()) :: :ok
   def dispatch(controller, event, payload \\ %{}) do
     GenServer.cast(controller, {:event, event, payload})
+  end
+
+  @doc false
+  @spec update_callbacks(GenServer.server(), callbacks() | nil) :: :ok
+  def update_callbacks(controller, callbacks) do
+    GenServer.cast(controller, {:update_callbacks, normalize_optional_map(callbacks)})
   end
 
   @doc false
@@ -272,7 +378,9 @@ defmodule Solve.Controller do
          dependencies: dependencies,
          callbacks: callbacks,
          exposed_state: exposed_state,
-         subscribers: %{}
+         subscribers: %{},
+         subscriber_monitor_refs_by_pid: %{},
+         external_subscription_refs_by_pid: %{}
        }}
     end
   end
@@ -280,28 +388,97 @@ defmodule Solve.Controller do
   @doc false
   def __handle_subscribe__(
         subscriber,
-        %{subscribers: subscribers, exposed_state: exposed_state} = server_state
+        %{exposed_state: exposed_state, external_subscription_refs_by_pid: external_refs} =
+          server_state
       )
       when is_pid(subscriber) do
-    subscribers = ensure_subscriber(subscribers, subscriber)
-    {:reply, exposed_state, %{server_state | subscribers: subscribers}}
+    server_state =
+      if Map.has_key?(external_refs, subscriber) do
+        server_state
+      else
+        subscription_ref = make_ref()
+
+        put_subscription(
+          server_state,
+          subscription_ref,
+          subscriber,
+          {:external, server_state.solve_app, server_state.controller_name}
+        )
+        |> put_in([:external_subscription_refs_by_pid, subscriber], subscription_ref)
+      end
+
+    {:reply, exposed_state, server_state}
+  end
+
+  @doc false
+  def __handle_subscribe_with__(
+        subscriber,
+        encoder,
+        %{exposed_state: exposed_state} = server_state
+      )
+      when is_pid(subscriber) and is_function(encoder, 1) do
+    subscription_ref = make_ref()
+
+    server_state =
+      put_subscription(server_state, subscription_ref, subscriber, {:internal, encoder})
+
+    {:reply, {:ok, exposed_state, subscription_ref}, server_state}
+  end
+
+  @doc false
+  def __handle_unsubscribe__(subscription_ref, %{subscribers: subscribers} = server_state)
+      when is_reference(subscription_ref) do
+    server_state =
+      case Map.get(subscribers, subscription_ref) do
+        nil ->
+          server_state
+
+        %{subscriber: subscriber, kind: {:external, _, _}} ->
+          server_state
+          |> delete_subscription(subscription_ref)
+          |> update_in([:external_subscription_refs_by_pid], &Map.delete(&1, subscriber))
+
+        _entry ->
+          delete_subscription(server_state, subscription_ref)
+      end
+
+    {:reply, :ok, server_state}
+  end
+
+  @doc false
+  def __handle_callbacks_update__(callbacks, server_state) when is_map(callbacks) do
+    {:noreply, %{server_state | callbacks: callbacks}}
+  end
+
+  @doc false
+  def __handle_direct_event__(event, payload, server_state) when is_atom(event) do
+    __handle_event__(event, payload, server_state)
   end
 
   @doc false
   def __handle_event__(
         event,
         payload,
-        %{module: module, controller_name: controller_name} = server_state
+        %{module: module, controller_name: controller_name, solve_app: solve_app} = server_state
       ) do
     if declared_event?(module, event) do
+      event_arity = module.__solve_event_arity__(event)
+
       new_state =
-        apply(module, event, [
-          payload,
-          server_state.state,
-          server_state.dependencies,
-          server_state.callbacks,
-          server_state.params
-        ])
+        with_solve_app(solve_app, fn ->
+          apply(
+            module,
+            event,
+            event_args(
+              event_arity,
+              payload,
+              server_state.state,
+              server_state.dependencies,
+              server_state.callbacks,
+              server_state.params
+            )
+          )
+        end)
 
       server_state = %{server_state | state: new_state}
       {:noreply, refresh_exposed_state(server_state)}
@@ -321,8 +498,12 @@ defmodule Solve.Controller do
         exposed_state,
         %{solve_app: solve_app} = server_state
       ) do
-    dependencies = Map.put(server_state.dependencies, dependency_name, exposed_state)
-    server_state = %{server_state | dependencies: dependencies}
+    server_state =
+      apply_dependency_update(
+        DependencyUpdate.replace(solve_app, dependency_name, exposed_state),
+        server_state
+      )
+
     {:noreply, refresh_exposed_state(server_state)}
   end
 
@@ -331,8 +512,31 @@ defmodule Solve.Controller do
   end
 
   @doc false
-  def __handle_subscriber_down__(subscriber, %{subscribers: subscribers} = server_state) do
-    {:noreply, %{server_state | subscribers: Map.delete(subscribers, subscriber)}}
+  def __handle_dependency_update_message__(
+        %DependencyUpdate{app: solve_app} = dependency_update,
+        %{solve_app: solve_app} = server_state
+      ) do
+    server_state = apply_dependency_update(dependency_update, server_state)
+    {:noreply, refresh_exposed_state(server_state)}
+  end
+
+  def __handle_dependency_update_message__(%DependencyUpdate{}, server_state) do
+    {:noreply, server_state}
+  end
+
+  @doc false
+  def __handle_subscriber_down__(
+        subscriber,
+        %{subscriber_monitor_refs_by_pid: monitor_refs} = server_state
+      ) do
+    server_state =
+      if Map.has_key?(monitor_refs, subscriber) do
+        remove_subscriber(server_state, subscriber)
+      else
+        server_state
+      end
+
+    {:noreply, server_state}
   end
 
   defp validate_events_option!(opts, caller) when is_list(opts) do
@@ -380,16 +584,145 @@ defmodule Solve.Controller do
   defp normalize_optional_map(nil), do: %{}
   defp normalize_optional_map(value), do: value
 
-  defp ensure_subscriber(subscribers, subscriber) do
-    if Map.has_key?(subscribers, subscriber) do
-      subscribers
-    else
-      Map.put(subscribers, subscriber, Process.monitor(subscriber))
+  defp valid_event_arities?([arity]) when arity in 1..5, do: true
+  defp valid_event_arities?(_arities), do: false
+
+  defp format_invalid_event_callback({event, []}), do: Atom.to_string(event)
+  defp format_invalid_event_callback({event, [arity]}), do: "#{event}/#{arity}"
+
+  defp format_duplicate_event_callback({event, arities}) do
+    arities
+    |> Enum.map_join(", ", fn arity -> "#{event}/#{arity}" end)
+    |> then(&"#{event} (#{&1})")
+  end
+
+  defp event_args(event_arity, payload, state, dependencies, callbacks, init_params) do
+    [payload, state, dependencies, callbacks, init_params]
+    |> Enum.take(event_arity)
+  end
+
+  defp with_solve_app(solve_app, fun) when is_function(fun, 0) do
+    missing_app = make_ref()
+    previous_app = Process.get(:solve_app, missing_app)
+    Process.put(:solve_app, solve_app)
+
+    try do
+      fun.()
+    after
+      restore_solve_app(previous_app, missing_app)
     end
+  end
+
+  defp restore_solve_app(previous_app, missing_app) when previous_app == missing_app do
+    Process.delete(:solve_app)
+  end
+
+  defp restore_solve_app(app, _missing_app) do
+    Process.put(:solve_app, app)
   end
 
   defp declared_event?(module, event) do
     event in module.__events__()
+  end
+
+  defp apply_dependency_update(
+         %DependencyUpdate{key: key, op: :replace, value: value},
+         %{dependencies: dependencies} = server_state
+       ) do
+    %{server_state | dependencies: Map.put(dependencies, key, value)}
+  end
+
+  defp apply_dependency_update(
+         %DependencyUpdate{key: key, op: :collection_put, id: id, value: value},
+         %{dependencies: dependencies} = server_state
+       ) do
+    collection = dependencies |> Map.get(key, Collection.empty()) |> ensure_collection!(key)
+
+    %{
+      server_state
+      | dependencies: Map.put(dependencies, key, Collection.put(collection, id, value))
+    }
+  end
+
+  defp apply_dependency_update(
+         %DependencyUpdate{key: key, op: :collection_delete, id: id},
+         %{dependencies: dependencies} = server_state
+       ) do
+    collection = dependencies |> Map.get(key, Collection.empty()) |> ensure_collection!(key)
+    %{server_state | dependencies: Map.put(dependencies, key, Collection.delete(collection, id))}
+  end
+
+  defp apply_dependency_update(
+         %DependencyUpdate{key: key, op: :collection_reorder, ids: ids},
+         %{dependencies: dependencies} = server_state
+       ) do
+    collection = dependencies |> Map.get(key, Collection.empty()) |> ensure_collection!(key)
+
+    %{
+      server_state
+      | dependencies: Map.put(dependencies, key, Collection.reorder(collection, ids))
+    }
+  end
+
+  defp put_subscription(server_state, subscription_ref, subscriber, kind) do
+    monitor_ref =
+      Map.get_lazy(server_state.subscriber_monitor_refs_by_pid, subscriber, fn ->
+        Process.monitor(subscriber)
+      end)
+
+    server_state
+    |> put_in([:subscribers, subscription_ref], %{subscriber: subscriber, kind: kind})
+    |> put_in([:subscriber_monitor_refs_by_pid, subscriber], monitor_ref)
+  end
+
+  defp delete_subscription(%{subscribers: subscribers} = server_state, subscription_ref) do
+    case Map.pop(subscribers, subscription_ref) do
+      {nil, _subscribers} ->
+        server_state
+
+      {%{subscriber: subscriber}, subscribers} ->
+        external_refs =
+          case Map.get(server_state.external_subscription_refs_by_pid, subscriber) do
+            ^subscription_ref ->
+              Map.delete(server_state.external_subscription_refs_by_pid, subscriber)
+
+            _ ->
+              server_state.external_subscription_refs_by_pid
+          end
+
+        has_other_subscriptions? =
+          Enum.any?(subscribers, fn {_ref, entry} -> entry.subscriber == subscriber end)
+
+        monitor_refs =
+          if has_other_subscriptions? do
+            server_state.subscriber_monitor_refs_by_pid
+          else
+            case Map.pop(server_state.subscriber_monitor_refs_by_pid, subscriber) do
+              {nil, monitor_refs} ->
+                monitor_refs
+
+              {monitor_ref, monitor_refs} ->
+                Process.demonitor(monitor_ref, [:flush])
+                monitor_refs
+            end
+          end
+
+        %{
+          server_state
+          | subscribers: subscribers,
+            subscriber_monitor_refs_by_pid: monitor_refs,
+            external_subscription_refs_by_pid: external_refs
+        }
+    end
+  end
+
+  defp remove_subscriber(%{subscribers: subscribers} = server_state, subscriber) do
+    subscription_refs =
+      subscribers
+      |> Enum.filter(fn {_ref, entry} -> entry.subscriber == subscriber end)
+      |> Enum.map(fn {subscription_ref, _entry} -> subscription_ref end)
+
+    Enum.reduce(subscription_refs, server_state, &delete_subscription(&2, &1))
   end
 
   defp refresh_exposed_state(server_state) do
@@ -414,10 +747,32 @@ defmodule Solve.Controller do
   end
 
   defp broadcast_update(server_state, new_exposed_state) do
-    message =
-      Message.update(server_state.solve_app, server_state.controller_name, new_exposed_state)
+    Enum.each(server_state.subscribers, fn {_subscription_ref, entry} ->
+      case build_subscriber_message(entry, server_state, new_exposed_state) do
+        nil -> :ok
+        message -> send(entry.subscriber, message)
+      end
+    end)
+  end
 
-    Enum.each(Map.keys(server_state.subscribers), &send(&1, message))
+  defp build_subscriber_message(
+         %{kind: {:external, solve_app, controller_name}},
+         _server_state,
+         new_exposed_state
+       ) do
+    Message.update(solve_app, controller_name, new_exposed_state)
+  end
+
+  defp build_subscriber_message(%{kind: {:internal, encoder}}, _server_state, new_exposed_state) do
+    encoder.(new_exposed_state)
+  end
+
+  defp ensure_collection!(%Collection{} = collection, _key), do: collection
+  defp ensure_collection!(nil, _key), do: Collection.empty()
+
+  defp ensure_collection!(value, key) do
+    raise ArgumentError,
+          "Solve dependency #{inspect(key)} expected a Solve.Collection, got: #{inspect(value)}"
   end
 
   defp validate_exposed_state!(exposed_state, _module, _controller_name)
