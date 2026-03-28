@@ -26,42 +26,31 @@ defmodule Solve.Lookup do
   @optional_callbacks handle_solve_updated: 2
 
   defmacro __using__(opts \\ []) do
-    %{handle_info_mode: handle_info_mode} = validate_options!(opts, __CALLER__)
+    %{imports: imports, mode: mode, handle_info_mode: handle_info_mode} =
+      validate_options!(opts, __CALLER__)
 
-    quote bind_quoted: [handle_info_mode: handle_info_mode] do
-      @behaviour Solve.Lookup
+    quote do
+      import Solve.Lookup, only: unquote(imports)
 
-      import Solve.Lookup,
-        only: [
-          solve: 1,
-          solve: 2,
-          collection: 1,
-          collection: 2,
-          event: 2,
-          event: 3,
-          dispatch: 2,
-          dispatch: 3,
-          dispatch: 4,
-          events: 1,
-          handle_message: 1
-        ]
+      if unquote(mode) != :helpers do
+        @behaviour Solve.Lookup
+        @before_compile Solve.Lookup
+        @solve_lookup_handle_info_mode unquote(handle_info_mode)
 
-      @before_compile Solve.Lookup
-      @solve_lookup_handle_info_mode handle_info_mode
-
-      if handle_info_mode == :auto do
-        def handle_info(nil, state) do
-          {:noreply, state}
-        end
-
-        def handle_info(%Solve.Message{} = message, state) do
-          updated = handle_message(message)
-
-          if map_size(updated) == 0 do
+        if unquote(handle_info_mode) == :auto do
+          def handle_info(nil, state) do
             {:noreply, state}
-          else
-            {:ok, state} = handle_solve_updated(updated, state)
-            {:noreply, state}
+          end
+
+          def handle_info(%Solve.Message{} = message, state) do
+            updated = handle_message(message)
+
+            if map_size(updated) == 0 do
+              {:noreply, state}
+            else
+              {:ok, state} = handle_solve_updated(updated, state)
+              {:noreply, state}
+            end
           end
         end
       end
@@ -403,18 +392,50 @@ defmodule Solve.Lookup do
 
   defp resolve_app!(app), do: app
 
+  defp validate_options!(:helpers, _caller) do
+    %{imports: helper_imports(), mode: :helpers, handle_info_mode: nil}
+  end
+
   defp validate_options!(opts, caller) when is_list(opts) do
     handle_info_mode =
       validate_handle_info_option!(Keyword.get(opts, :handle_info, :auto), caller)
 
-    %{handle_info_mode: handle_info_mode}
+    %{imports: default_imports(), mode: handle_info_mode, handle_info_mode: handle_info_mode}
   end
 
   defp validate_options!(opts, caller) do
     raise CompileError,
       file: caller.file,
       line: caller.line,
-      description: "use Solve.Lookup expects a keyword list, got: #{inspect(opts)}"
+      description: "use Solve.Lookup expects :helpers or a keyword list, got: #{inspect(opts)}"
+  end
+
+  defp default_imports do
+    [
+      solve: 1,
+      solve: 2,
+      collection: 1,
+      collection: 2,
+      event: 2,
+      event: 3,
+      dispatch: 2,
+      dispatch: 3,
+      dispatch: 4,
+      events: 1,
+      handle_message: 1
+    ]
+  end
+
+  defp helper_imports do
+    [
+      solve: 1,
+      solve: 2,
+      collection: 1,
+      collection: 2,
+      event: 2,
+      event: 3,
+      events: 1
+    ]
   end
 
   defp validate_handle_info_option!(:auto, _caller), do: :auto

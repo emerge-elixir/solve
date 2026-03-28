@@ -9,7 +9,7 @@ defmodule Solve.LookupTest do
     @impl true
     def init(%{initial: initial}, _dependencies), do: %{count: initial}
 
-    def increment(_payload, state, _dependencies, _callbacks, _init_params) do
+    def increment(_payload, state) do
       %{state | count: state.count + 1}
     end
   end
@@ -45,7 +45,7 @@ defmodule Solve.LookupTest do
     @impl true
     def init(%{initial: initial}, _dependencies), do: %{initial: initial}
 
-    def set_initial(initial, _state, _dependencies, _callbacks, _init_params) do
+    def set_initial(initial) do
       %{initial: initial}
     end
 
@@ -62,7 +62,7 @@ defmodule Solve.LookupTest do
       %{count: initial}
     end
 
-    def increment(_payload, state, _dependencies, _callbacks, _init_params) do
+    def increment(_payload, state) do
       %{state | count: state.count + 1}
     end
 
@@ -114,7 +114,7 @@ defmodule Solve.LookupTest do
     @impl true
     def init(%{columns: columns}, _dependencies), do: %{columns: columns}
 
-    def set_columns(columns, _state, _dependencies, _callbacks, _init_params) do
+    def set_columns(columns) do
       %{columns: columns}
     end
 
@@ -128,7 +128,7 @@ defmodule Solve.LookupTest do
     @impl true
     def init(%{id: id, title: title}, _dependencies), do: %{id: id, title: title}
 
-    def rename(title, state, _dependencies, _callbacks, _init_params) do
+    def rename(title, state) do
       %{state | title: title}
     end
 
@@ -448,6 +448,27 @@ defmodule Solve.LookupTest do
     end
     """)
 
+    module = unique_name("HelpersOnly")
+
+    Code.compile_string("""
+    defmodule #{inspect(module)} do
+      use Solve.Lookup, :helpers
+
+      def helper_refs do
+        {&solve/2, &collection/2, &events/1, &event/2, &event/3}
+      end
+    end
+    """)
+
+    {solve_ref, collection_ref, events_ref, event_ref, payload_event_ref} = module.helper_refs()
+
+    assert is_function(solve_ref, 2)
+    assert is_function(collection_ref, 2)
+    assert is_function(events_ref, 1)
+    assert is_function(event_ref, 2)
+    assert is_function(payload_event_ref, 3)
+    refute function_exported?(module, :handle_info, 2)
+
     module = unique_name("InvalidHandleInfo")
 
     assert_raise CompileError, ~r/must be :auto or :manual/, fn ->
@@ -457,6 +478,16 @@ defmodule Solve.LookupTest do
         use Solve.Lookup, handle_info: false
 
         def init(state), do: {:ok, state}
+      end
+      """)
+    end
+
+    module = unique_name("InvalidLookupMode")
+
+    assert_raise CompileError, ~r/expects :helpers or a keyword list/, fn ->
+      Code.compile_string("""
+      defmodule #{inspect(module)} do
+        use Solve.Lookup, :ui
       end
       """)
     end

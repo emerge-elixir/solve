@@ -47,7 +47,7 @@ defmodule Solve.ControllerTest do
     @impl true
     def expose(_state, _dependencies, _init_params), do: %{mode: :stable}
 
-    def flip(_payload, _state, _dependencies, _callbacks, _init_params), do: :second
+    def flip(_payload), do: :second
   end
 
   defmodule CollectionDependencyController do
@@ -65,6 +65,46 @@ defmodule Solve.ControllerTest do
     end
   end
 
+  defmodule FlexibleArityController do
+    use Solve.Controller, events: [:one, :two, :three, :four, :five]
+
+    @impl true
+    def init(%{test_pid: test_pid}, dependencies) do
+      send(test_pid, {:flexible_arity_init, dependencies})
+      %{test_pid: test_pid, last: nil}
+    end
+
+    def one(%{test_pid: test_pid, value: value} = payload) do
+      send(test_pid, {:one_args, payload})
+      %{test_pid: test_pid, last: {:one, value}}
+    end
+
+    def two(payload, state) do
+      send(state.test_pid, {:two_args, payload, state})
+      %{state | last: {:two, payload}}
+    end
+
+    def three(payload, state, dependencies) do
+      send(state.test_pid, {:three_args, payload, state, dependencies})
+      %{state | last: {:three, payload}}
+    end
+
+    def four(payload, state, dependencies, callbacks) do
+      send(state.test_pid, {:four_args, payload, state, dependencies, callbacks})
+      %{state | last: {:four, payload}}
+    end
+
+    def five(payload, state, dependencies, callbacks, init_params) do
+      send(state.test_pid, {:five_args, payload, state, dependencies, callbacks, init_params})
+      %{state | last: {:five, payload}}
+    end
+
+    @impl true
+    def expose(state, _dependencies, _init_params) do
+      %{last: state.last}
+    end
+  end
+
   test "use Solve.Controller rejects invalid events lists" do
     module = unique_module_name("InvalidEvents")
 
@@ -75,26 +115,98 @@ defmodule Solve.ControllerTest do
 
         def init(_params, _dependencies), do: %{}
 
-        def increment(payload, state, dependencies, callbacks, init_params) do
-          {payload, state, dependencies, callbacks, init_params}
-        end
+        def increment(payload), do: %{payload: payload}
       end
       """)
     end
   end
 
-  test "use Solve.Controller requires declared event callbacks to exist as /5" do
+  test "use Solve.Controller requires declared event callbacks to exist with arity 1 through 5" do
     module = unique_module_name("MissingEvent")
 
-    assert_raise CompileError, ~r/must define declared event callback\(s\): increment\/5/, fn ->
-      Code.compile_string("""
-      defmodule #{inspect(module)} do
-        use Solve.Controller, events: [:increment]
+    assert_raise CompileError,
+                 ~r/must define declared event callback\(s\) with exactly one arity between \/1 and \/5: increment/,
+                 fn ->
+                   Code.compile_string("""
+                   defmodule #{inspect(module)} do
+                     use Solve.Controller, events: [:increment]
 
-        def init(_params, _dependencies), do: %{}
-      end
-      """)
-    end
+                     def init(_params, _dependencies), do: %{}
+                   end
+                   """)
+                 end
+  end
+
+  test "use Solve.Controller rejects declared event callbacks defined at multiple arities" do
+    module = unique_module_name("DuplicateEventArity")
+
+    assert_raise CompileError,
+                 ~r/must not define declared event callback\(s\) at multiple arities: increment \(increment\/1, increment\/2\)/,
+                 fn ->
+                   Code.compile_string("""
+                   defmodule #{inspect(module)} do
+                     use Solve.Controller, events: [:increment]
+
+                     def init(_params, _dependencies), do: %{}
+
+                     def increment(payload), do: %{payload: payload}
+                     def increment(payload, state), do: {payload, state}
+                   end
+                   """)
+                 end
+  end
+
+  test "dispatch/3 supports declared handlers with arity 1 through 5" do
+    params = %{test_pid: self()}
+    callbacks = %{audit: :ok}
+
+    assert {:ok, pid} =
+             FlexibleArityController.start_link(
+               solve_app: :app,
+               controller_name: :flexible,
+               params: params,
+               dependencies: %{source: %{value: 10}},
+               callbacks: callbacks
+             )
+
+    assert_receive {:flexible_arity_init, %{source: %{value: 10}}}
+    assert Solve.Controller.subscribe(pid) == %{last: nil}
+
+    one_payload = %{test_pid: self(), value: 1}
+    assert :ok = Solve.Controller.dispatch(pid, :one, one_payload)
+    assert_receive {:one_args, ^one_payload}
+    assert Solve.Controller.subscribe(pid) == %{last: {:one, 1}}
+
+    assert :ok = Solve.Controller.dispatch(pid, :two, :two_payload)
+    assert_receive {:two_args, :two_payload, %{test_pid: test_pid, last: {:one, 1}}}
+    assert test_pid == self()
+    assert Solve.Controller.subscribe(pid) == %{last: {:two, :two_payload}}
+
+    assert :ok = Solve.Controller.dispatch(pid, :three, :three_payload)
+
+    assert_receive {:three_args, :three_payload,
+                    %{test_pid: test_pid, last: {:two, :two_payload}}, %{source: %{value: 10}}}
+
+    assert test_pid == self()
+    assert Solve.Controller.subscribe(pid) == %{last: {:three, :three_payload}}
+
+    assert :ok = Solve.Controller.dispatch(pid, :four, :four_payload)
+
+    assert_receive {:four_args, :four_payload,
+                    %{test_pid: test_pid, last: {:three, :three_payload}},
+                    %{source: %{value: 10}}, ^callbacks}
+
+    assert test_pid == self()
+    assert Solve.Controller.subscribe(pid) == %{last: {:four, :four_payload}}
+
+    assert :ok = Solve.Controller.dispatch(pid, :five, :five_payload)
+
+    assert_receive {:five_args, :five_payload,
+                    %{test_pid: test_pid, last: {:four, :four_payload}}, %{source: %{value: 10}},
+                    ^callbacks, ^params}
+
+    assert test_pid == self()
+    assert Solve.Controller.subscribe(pid) == %{last: {:five, :five_payload}}
   end
 
   test "subscribe/2 returns the current exposed state using default expose/3" do

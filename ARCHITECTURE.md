@@ -44,6 +44,9 @@ The app module defines `controllers/0` with `controller!/1` specs. Each spec dec
 - for collection sources, a `collect/1` callback returning ordered child ids and params
 - optional callbacks passed to event handlers
 
+Inside a `use Solve` module, callback functions can call bare `dispatch/2` or `dispatch/3`.
+That implicit app resolution is only guaranteed while a controller event handler is executing.
+
 Dependency bindings are normalized into source-level graph edges plus local dependency keys.
 
 Examples:

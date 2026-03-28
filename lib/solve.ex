@@ -31,6 +31,10 @@ defmodule Solve do
 
       defp collection(source), do: Solve.ControllerSpec.collection(source)
       defp collection(source, filter), do: Solve.ControllerSpec.collection(source, filter)
+      defp dispatch(controller_name, event), do: Solve.dispatch(controller_name, event)
+
+      defp dispatch(controller_name, event, payload),
+        do: Solve.dispatch(controller_name, event, payload)
 
       def start_link(opts \\ []) do
         name = Keyword.get(opts, :name, __MODULE__)
@@ -76,6 +80,17 @@ defmodule Solve do
           ControllerSpec.variant() | nil
   def controller_variant(app, controller_name) do
     GenServer.call(app, {:controller_variant, controller_name})
+  end
+
+  @spec dispatch(controller_target(), atom()) :: :ok
+  def dispatch(controller_name, event) when is_atom(event) do
+    dispatch(controller_name, event, %{})
+  end
+
+  @spec dispatch(controller_target(), atom(), term()) :: :ok
+  def dispatch(controller_name, event, payload) when is_atom(event) do
+    resolve_current_app!()
+    |> dispatch(controller_name, event, payload)
   end
 
   @spec dispatch(GenServer.server(), controller_target(), term(), term()) :: :ok
@@ -1492,6 +1507,17 @@ defmodule Solve do
     Controller.subscribe_with(controller_pid, subscriber, encoder)
   catch
     :exit, _reason -> :subscription_failed
+  end
+
+  defp resolve_current_app! do
+    case Process.get(:solve_app) do
+      nil ->
+        raise ArgumentError,
+              "Solve.dispatch/2 and dispatch/3 require a current solve app in process context"
+
+      app ->
+        app
+    end
   end
 
   defp unsubscribe_controller_safely(controller_pid, subscription_ref) do

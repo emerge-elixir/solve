@@ -33,17 +33,19 @@ defmodule MyApp.CounterController do
     %{count: 0}
   end
 
-  def increment(_payload, state, _dependencies, _callbacks, _params) do
+  def increment(_payload, state) do
     %{state | count: state.count + 1}
   end
 
-  def decrement(_payload, state, _dependencies, _callbacks, _params) do
+  def decrement(_payload, state) do
     %{state | count: state.count - 1}
   end
 end
 ```
 
 This controller uses the default `expose/3`, so its internal state is also the exposed map.
+Declared event handlers can be defined with arity `1` through `5`; Solve passes the leading
+runtime inputs in this order: `payload`, `state`, `dependencies`, `callbacks`, `init_params`.
 
 ### 2. Define a Solve app
 
@@ -68,6 +70,31 @@ Start the app like any other GenServer:
 ```elixir
 {:ok, app} = MyApp.State.start_link(name: MyApp.State)
 ```
+
+Controller spec callbacks can also dispatch through the current app. Inside a `use Solve`
+module, bare `dispatch/2` and `dispatch/3` calls are available inside callback functions:
+
+```elixir
+defmodule MyApp.State do
+  use Solve
+
+  @impl true
+  def controllers do
+    [
+      controller!(
+        name: :create_todo,
+        module: MyApp.CreateTodoController,
+        callbacks: %{
+          submit: fn payload -> dispatch(:todo_list, :create_todo, payload) end
+        }
+      )
+    ]
+  end
+end
+```
+
+That implicit app resolution is guaranteed when the callback runs during controller event
+handling.
 
 ### 3. Read state from render code with `Solve.Lookup`
 
@@ -96,6 +123,9 @@ end
 
 `use Solve.Lookup` defaults to `handle_info: :auto`, so `%Solve.Message{}` update envelopes
 refresh the local lookup cache and trigger `handle_solve_updated/2`.
+
+If a module only needs lookup helpers and should not get injected `handle_info/2` clauses or a
+`handle_solve_updated/2` requirement, use `use Solve.Lookup, :helpers`.
 
 `events/1` exposes direct `{pid, message}` event tuples from lookup items. Use
 `event(controller, event_name)` as a convenience wrapper for one event, and
@@ -156,7 +186,7 @@ defmodule MyApp.ColumnController do
     %{id: id, title: title}
   end
 
-  def rename(title, state, _dependencies, _callbacks, _params) do
+  def rename(title, state) do
     %{state | title: title}
   end
 

@@ -36,15 +36,15 @@ defmodule Solve.Controller do
           %{count: state.count}
         end
 
-        def increment(_payload, state, _dependencies, _callbacks, _init_params) do
+        def increment(_payload, state) do
           %{state | count: state.count + 1}
         end
 
-        def decrement(_payload, state, _dependencies, _callbacks, _init_params) do
+        def decrement(_payload, state) do
           %{state | count: state.count - 1}
         end
 
-        def reset(_payload, _state, _dependencies, _callbacks, _init_params) do
+        def reset(_payload) do
           %{count: 0, private_data: "secret"}
         end
       end
@@ -71,10 +71,17 @@ defmodule Solve.Controller do
   `init_params` can have any shape, but it must be truthy. If it is `nil` or `false`, the
   controller stops with `{:invalid_init_params, controller_name, value}`.
 
-  `callbacks` is a plain map passed only to declared event handlers. Event handlers receive
-  all runtime inputs as:
+  `callbacks` is a plain map passed only to declared event handlers. Event handlers can be
+  defined with arity `1` through `5`, and Solve passes the leading runtime inputs the handler
+  asks for:
 
+      event_name(event_payload)
+      event_name(event_payload, state)
+      event_name(event_payload, state, dependencies)
+      event_name(event_payload, state, dependencies, callbacks)
       event_name(event_payload, state, dependencies, callbacks, init_params)
+
+  Declaring the same event at multiple arities is a compile error.
 
   ## Subscription Helpers
 
@@ -226,23 +233,59 @@ defmodule Solve.Controller do
 
   defmacro __before_compile__(env) do
     events = Module.get_attribute(env.module, :solve_controller_events) || []
-    definitions = MapSet.new(Module.definitions_in(env.module))
+    definitions = Module.definitions_in(env.module)
 
-    missing_callbacks =
-      Enum.reject(events, fn event ->
-        MapSet.member?(definitions, {event, 5})
+    event_arities =
+      Map.new(events, fn event ->
+        arities =
+          definitions
+          |> Enum.reduce([], fn
+            {^event, arity}, acc -> [arity | acc]
+            _, acc -> acc
+          end)
+          |> Enum.sort()
+
+        {event, arities}
       end)
 
-    if missing_callbacks != [] do
-      callbacks = Enum.map_join(missing_callbacks, ", ", &"#{&1}/5")
+    invalid_callbacks =
+      event_arities
+      |> Enum.filter(fn {_event, arities} -> not valid_event_arities?(arities) end)
+      |> Enum.filter(fn {_event, arities} -> length(arities) <= 1 end)
+
+    if invalid_callbacks != [] do
+      callbacks = Enum.map_join(invalid_callbacks, ", ", &format_invalid_event_callback/1)
 
       raise CompileError,
         file: env.file,
         line: 1,
-        description: "#{inspect(env.module)} must define declared event callback(s): #{callbacks}"
+        description:
+          "#{inspect(env.module)} must define declared event callback(s) with exactly one arity between /1 and /5: #{callbacks}"
     end
 
-    quote(do: :ok)
+    duplicate_callbacks =
+      event_arities
+      |> Enum.filter(fn {_event, arities} -> length(arities) > 1 end)
+
+    if duplicate_callbacks != [] do
+      callbacks = Enum.map_join(duplicate_callbacks, "; ", &format_duplicate_event_callback/1)
+
+      raise CompileError,
+        file: env.file,
+        line: 1,
+        description:
+          "#{inspect(env.module)} must not define declared event callback(s) at multiple arities: #{callbacks}"
+    end
+
+    resolved_event_arities = Enum.map(event_arities, fn {event, [arity]} -> {event, arity} end)
+
+    quote bind_quoted: [event_arities: resolved_event_arities] do
+      @solve_controller_event_arities Map.new(event_arities)
+
+      def __solve_event_arity__(event) when is_atom(event) do
+        Map.fetch!(@solve_controller_event_arities, event)
+      end
+    end
   end
 
   @doc """
@@ -416,17 +459,26 @@ defmodule Solve.Controller do
   def __handle_event__(
         event,
         payload,
-        %{module: module, controller_name: controller_name} = server_state
+        %{module: module, controller_name: controller_name, solve_app: solve_app} = server_state
       ) do
     if declared_event?(module, event) do
+      event_arity = module.__solve_event_arity__(event)
+
       new_state =
-        apply(module, event, [
-          payload,
-          server_state.state,
-          server_state.dependencies,
-          server_state.callbacks,
-          server_state.params
-        ])
+        with_solve_app(solve_app, fn ->
+          apply(
+            module,
+            event,
+            event_args(
+              event_arity,
+              payload,
+              server_state.state,
+              server_state.dependencies,
+              server_state.callbacks,
+              server_state.params
+            )
+          )
+        end)
 
       server_state = %{server_state | state: new_state}
       {:noreply, refresh_exposed_state(server_state)}
@@ -531,6 +583,43 @@ defmodule Solve.Controller do
 
   defp normalize_optional_map(nil), do: %{}
   defp normalize_optional_map(value), do: value
+
+  defp valid_event_arities?([arity]) when arity in 1..5, do: true
+  defp valid_event_arities?(_arities), do: false
+
+  defp format_invalid_event_callback({event, []}), do: Atom.to_string(event)
+  defp format_invalid_event_callback({event, [arity]}), do: "#{event}/#{arity}"
+
+  defp format_duplicate_event_callback({event, arities}) do
+    arities
+    |> Enum.map_join(", ", fn arity -> "#{event}/#{arity}" end)
+    |> then(&"#{event} (#{&1})")
+  end
+
+  defp event_args(event_arity, payload, state, dependencies, callbacks, init_params) do
+    [payload, state, dependencies, callbacks, init_params]
+    |> Enum.take(event_arity)
+  end
+
+  defp with_solve_app(solve_app, fun) when is_function(fun, 0) do
+    missing_app = make_ref()
+    previous_app = Process.get(:solve_app, missing_app)
+    Process.put(:solve_app, solve_app)
+
+    try do
+      fun.()
+    after
+      restore_solve_app(previous_app, missing_app)
+    end
+  end
+
+  defp restore_solve_app(previous_app, missing_app) when previous_app == missing_app do
+    Process.delete(:solve_app)
+  end
+
+  defp restore_solve_app(app, _missing_app) do
+    Process.put(:solve_app, app)
+  end
 
   defp declared_event?(module, event) do
     event in module.__events__()

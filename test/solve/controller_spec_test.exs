@@ -103,4 +103,38 @@ defmodule Solve.ControllerSpecTest do
              %{key: :visible_columns, source: :column, kind: :collection, filter: ^filter}
            ] = bindings
   end
+
+  test "use Solve injects dispatch helpers for callback definitions" do
+    module = unique_module_name("DispatchHelpers")
+
+    Code.compile_string("""
+    defmodule #{inspect(module)} do
+      use Solve
+
+      @impl true
+      def controllers do
+        [
+          controller!(
+            name: :create_todo,
+            module: #{inspect(CounterController)},
+            callbacks: %{
+              submit: fn payload -> dispatch(:todo_list, :create_todo, payload) end
+            }
+          )
+        ]
+      end
+    end
+    """)
+
+    assert [%ControllerSpec{callbacks: %{submit: submit}} = spec] = module.controllers()
+    assert is_function(submit, 1)
+    assert {:ok, %ControllerSpec{callbacks: %{submit: ^submit}}} = ControllerSpec.validate(spec)
+  end
+
+  defp unique_module_name(prefix) do
+    Module.concat(
+      __MODULE__,
+      String.to_atom(prefix <> Integer.to_string(System.unique_integer([:positive])))
+    )
+  end
 end

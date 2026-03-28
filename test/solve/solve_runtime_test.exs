@@ -12,7 +12,7 @@ defmodule Solve.RuntimeTest do
       %{value: value}
     end
 
-    def set(value, _state, _dependencies, _callbacks, _init_params), do: %{value: value}
+    def set(value), do: %{value: value}
   end
 
   defmodule LifecycleDerivedController do
@@ -54,7 +54,7 @@ defmodule Solve.RuntimeTest do
       %{value: value}
     end
 
-    def crash(reason, _state, _dependencies, _callbacks, _init_params) do
+    def crash(reason) do
       raise "crash: #{inspect(reason)}"
     end
   end
@@ -179,7 +179,7 @@ defmodule Solve.RuntimeTest do
       %{columns: columns}
     end
 
-    def set_columns(columns, _state, _dependencies, _callbacks, _init_params) do
+    def set_columns(columns) do
       %{columns: columns}
     end
 
@@ -196,11 +196,11 @@ defmodule Solve.RuntimeTest do
       %{title: title, visible?: visible?}
     end
 
-    def rename(title, state, _dependencies, _callbacks, _init_params) do
+    def rename(title, state) do
       %{state | title: title}
     end
 
-    def set_visible(visible?, state, _dependencies, _callbacks, _init_params) do
+    def set_visible(visible?, state) do
       %{state | visible?: visible?}
     end
 
@@ -249,11 +249,11 @@ defmodule Solve.RuntimeTest do
       %{items: items, callback_tag: callback_tag}
     end
 
-    def set_callback_tag(callback_tag, state, _dependencies, _callbacks, _init_params) do
+    def set_callback_tag(callback_tag, state) do
       %{state | callback_tag: callback_tag}
     end
 
-    def rename_item(%{id: id, title: title}, state, _dependencies, _callbacks, _init_params) do
+    def rename_item(%{id: id, title: title}, state) do
       items =
         Enum.map(state.items, fn item ->
           if item.id == id do
@@ -281,7 +281,7 @@ defmodule Solve.RuntimeTest do
       %{id: id, title: title, test_pid: test_pid}
     end
 
-    def report(payload, state, _dependencies, callbacks, _init_params) do
+    def report(payload, state, _dependencies, callbacks) do
       send(state.test_pid, {:callback_item_report, state.id, payload, callbacks})
       state
     end
@@ -289,6 +289,70 @@ defmodule Solve.RuntimeTest do
     @impl true
     def expose(state, _dependencies, _init_params) do
       %{id: state.id, title: state.title}
+    end
+  end
+
+  defmodule TodoListController do
+    use Solve.Controller, events: [:create_todo]
+
+    @impl true
+    def init(%{test_pid: test_pid}, _dependencies) do
+      send(test_pid, :todo_list_init)
+      %{items: [], test_pid: test_pid}
+    end
+
+    def create_todo(payload, state) do
+      send(state.test_pid, {:todo_created, payload})
+      %{state | items: state.items ++ [payload]}
+    end
+
+    @impl true
+    def expose(state, _dependencies, _init_params) do
+      %{items: state.items}
+    end
+  end
+
+  defmodule CreateTodoController do
+    use Solve.Controller, events: [:submit]
+
+    @impl true
+    def init(%{test_pid: test_pid}, _dependencies) do
+      send(test_pid, :create_todo_init)
+      %{test_pid: test_pid}
+    end
+
+    def submit(payload, state, _dependencies, callbacks) do
+      callbacks.submit.(payload)
+      send(state.test_pid, {:create_todo_submitted, payload})
+      state
+    end
+
+    @impl true
+    def expose(state, _dependencies, _init_params) do
+      %{ready?: true, test_pid: state.test_pid}
+    end
+  end
+
+  defmodule ImplicitDispatchSolve do
+    use Solve
+
+    @impl true
+    def controllers do
+      [
+        controller!(
+          name: :todo_list,
+          module: Solve.RuntimeTest.TodoListController,
+          params: fn %{app_params: app_params} -> %{test_pid: app_params.test_pid} end
+        ),
+        controller!(
+          name: :create_todo,
+          module: Solve.RuntimeTest.CreateTodoController,
+          params: fn %{app_params: app_params} -> %{test_pid: app_params.test_pid} end,
+          callbacks: %{
+            submit: fn payload -> dispatch(:todo_list, :create_todo, payload) end
+          }
+        )
+      ]
     end
   end
 
@@ -742,6 +806,21 @@ defmodule Solve.RuntimeTest do
     assert_receive {:callback_item_report, 1, :after, %{tag: :updated}}
     assert Solve.controller_pid(app, {:callback_item, 1}) == item_pid
     refute_receive {:callback_item_init, 1, _title}, 50
+  end
+
+  test "controller spec callbacks can dispatch through the current app during event handling" do
+    app = start_app(ImplicitDispatchSolve, %{test_pid: self()})
+
+    assert_receive :todo_list_init
+    assert_receive :create_todo_init
+
+    payload = %{id: 1, title: "Write tests"}
+
+    assert :ok = Solve.dispatch(app, :create_todo, :submit, payload)
+
+    assert_receive {:todo_created, ^payload}
+    assert_receive {:create_todo_submitted, ^payload}
+    assert Solve.subscribe(app, :todo_list) == %{items: [payload]}
   end
 
   test "collection params changes replace the running item" do

@@ -17,11 +17,11 @@ defmodule MyApp.CounterController do
   @impl true
   def init(_params, _dependencies), do: %{count: 0}
 
-  def increment(_payload, state, _dependencies, _callbacks, _init_params) do
+  def increment(_payload, state) do
     %{state | count: state.count + 1}
   end
 
-  def decrement(_payload, state, _dependencies, _callbacks, _init_params) do
+  def decrement(_payload, state) do
     %{state | count: state.count - 1}
   end
 end

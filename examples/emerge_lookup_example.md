@@ -46,6 +46,9 @@ Use `event(controller, event_name)` when Emerge should provide the payload later
 `Event.on_change(event(form, :set_title))`. Use `event(controller, event_name, payload)` when the
 payload is fixed at render time.
 
+If another module only needs the helper imports and should not get auto lookup `handle_info/2`
+behavior, use `use Solve.Lookup, :helpers`.
+
 ## Collection Lookup Uses The Same Pattern
 
 If the state module exposes a collection source, read it directly in `render/1`.
