@@ -1,15 +1,15 @@
-# Solve Architecture
+# Solve architecture
 
 Solve is a controller-graph runtime built from one coordinating `Solve` process, a set of
 controller `GenServer`s, and optional collection sources that materialize ordered child sets.
 
 The `Solve` app process owns graph validation, controller lifecycle, dependency reconciliation,
-source and target exposed-state caching, and external subscriber tracking. Concrete controller
-instances own their internal state and expose plain-map public views derived from `expose/3`.
+source- and target-level exposed-state caching, and external subscriber tracking. Controller
+instances own their internal state and expose plain-map public views through `expose/3`.
 
-## Core Model
+## Core model
 
-### Sources And Targets
+### Sources and targets
 
 Solve distinguishes between static source names and concrete runtime targets.
 
@@ -19,9 +19,9 @@ Solve distinguishes between static source names and concrete runtime targets.
 - a collection source itself is virtual; it does not own a controller pid
 
 The dependency graph is static and source-level. Runtime lifecycle, subscriptions, and dispatch can
-address either source names or concrete targets.
+operate on either source names or concrete targets.
 
-### Solve App Runtime
+### Solve app runtime
 
 Each `use Solve` module starts a single app `GenServer` that:
 
@@ -32,7 +32,7 @@ Each `use Solve` module starts a single app `GenServer` that:
 - tracks external subscribers per source or target
 - reconciles dependents when upstream state, params, or collection membership change
 
-### Controller Graph
+### Controller graph
 
 The app module defines `controllers/0` with `controller!/1` specs. Each spec declares:
 
@@ -47,7 +47,7 @@ The app module defines `controllers/0` with `controller!/1` specs. Each spec dec
 Inside a `use Solve` module, callback functions can call bare `dispatch/2` or `dispatch/3`.
 That implicit app resolution is only guaranteed while a controller event handler is executing.
 
-Dependency bindings are normalized into source-level graph edges plus local dependency keys.
+Solve normalizes dependency bindings into source-level graph edges plus local dependency keys.
 
 Examples:
 
@@ -73,7 +73,7 @@ Collection sources are different: Solve materializes them as `%Solve.Collection{
 the exposed state of their child targets. The child controllers themselves are ordinary controllers
 and do not know they came from a collection source.
 
-### Exposed State
+### Exposed state
 
 Solve treats exposed state as the shared boundary between processes.
 
@@ -100,7 +100,7 @@ This lets the same controller broadcast turn into:
 - a `:replace` dependency patch for single bindings
 - `:collection_put`, `:collection_delete`, or `:collection_reorder` patches for collection bindings
 
-## Graph Compilation
+## Graph compilation
 
 Graph validation happens on app boot, before any controllers start.
 
@@ -123,11 +123,11 @@ The compiled graph produces:
 
 This gives Solve a stable source-level dependency order plus fast direct-dependent lookup.
 
-## Controller Lifecycle
+## Controller lifecycle
 
 On boot, Solve walks the source graph in topological order and reconciles each source.
 
-### Singleton Sources
+### Singleton sources
 
 For a singleton source, the runtime:
 
@@ -147,7 +147,7 @@ Params control existence:
 Replacement is start-new-then-stop-old. The new controller is registered before the old one is
 shut down, which avoids a gap in availability.
 
-### Collection Sources
+### Collection sources
 
 For a collection source, the runtime:
 
@@ -162,9 +162,9 @@ For a collection source, the runtime:
 Collected child replacement is params-based for a given `id`. If only collected callbacks change,
 Solve keeps the existing child pid and updates its callbacks in place.
 
-## Dependency Propagation
+## Dependency propagation
 
-### Direct Encoded Subscriptions
+### Direct encoded subscriptions
 
 Controllers subscribe directly to their upstream dependencies when they start.
 
@@ -176,8 +176,8 @@ Binding kinds matter:
 - a filtered collection binding stores a `%Solve.Collection{}` and subscribes only to child
   targets whose current `{id, item}` match the filter
 
-Controllers still broadcast directly. The difference is that subscribers now carry encoder
-functions, so a broadcast can be transformed before delivery.
+Controllers still broadcast directly. Subscribers now carry encoder functions, so a broadcast can
+be transformed before delivery.
 
 Examples:
 
@@ -185,7 +185,7 @@ Examples:
 - collection binding encoder -> `%Solve.DependencyUpdate{op: :collection_put, ...}`
 - filtered collection binding encoder -> either `:collection_put` or `:collection_delete`
 
-### Solve App Responsibilities
+### Solve app responsibilities
 
 The Solve app also subscribes to every running singleton and collected child. That lets it:
 
@@ -194,10 +194,9 @@ The Solve app also subscribes to every running singleton and collected child. Th
 - decide whether direct dependents should start, stop, stay running, or be replaced
 - add or remove dependency subscriptions when collection membership or filters change
 
-This split keeps state propagation direct while still letting the app process stay in control of
-lifecycle decisions.
+This keeps state propagation direct while leaving lifecycle decisions with the app process.
 
-## External Interaction APIs
+## External interaction APIs
 
 ### `Solve.subscribe/3`
 
@@ -222,7 +221,7 @@ current controller pid for that target.
 - if the target is running, the event is forwarded to it
 - if the target is stopped, unknown, or a collection source atom, dispatch is a silent no-op
 
-### Introspection Helpers
+### Introspection helpers
 
 Solve also exposes:
 
@@ -233,13 +232,13 @@ Solve also exposes:
 
 ## Solve.Lookup
 
-`Solve.Lookup` is a process-local facade over `Solve.subscribe/3` and `Solve.dispatch/4`.
+`Solve.Lookup` is a process-local wrapper and cache around `Solve.subscribe/3`
+and `Solve.dispatch/4`.
 
-In practice, the most common usage is render-driven UI code. See
-`examples/emerge_lookup_example.md` for that style and `examples/counter_lookup_example.md` for the
-smaller non-UI variant.
+The README covers the most common public usage patterns, including UI code and
+ordinary long-running processes.
 
-It caches three shapes:
+It stores three lookup shapes:
 
 - singleton item lookups via `solve(app, :counter)`
 - collected child item lookups via `solve(app, {:column, 1})`
@@ -249,10 +248,10 @@ Item lookups are augmented with `:events_` direct event tuples. Collection looku
 `%Solve.Collection{}` whose items are augmented item maps. The collection wrapper itself has no
 events.
 
-`handle_message/1` refreshes the process-local cache and returns updates grouped by app as
+`handle_message/1` refreshes the local cache and returns updates grouped by app as
 `%Solve.Lookup.Updated{refs, collections}`.
 
-### Auto Mode
+### Auto mode
 
 `use Solve.Lookup` defaults to `handle_info: :auto`.
 
@@ -263,13 +262,13 @@ Injected `handle_info/2` clauses:
 - refresh the local cache through `handle_message/1`
 - call `handle_solve_updated/2` with `%Solve.Lookup.Updated{refs, collections}`
 
-### Manual Mode
+### Manual mode
 
 With `handle_info: :manual`, no `handle_info/2` clauses are injected. The caller matches
 `%Solve.Message{}` itself, calls `handle_message/1`, and decides what to do with the returned map
 of updated refs and collections.
 
-## Message Shapes
+## Message shapes
 
 Singleton or child updates use `%Solve.Update{}`:
 
@@ -324,7 +323,7 @@ The runtime depends on a few fixed rules:
 - dispatch to unknown or stopped targets is a no-op
 - undeclared controller events are logged and discarded
 
-## Typical Flows
+## Typical flows
 
 ### Boot
 
@@ -333,7 +332,7 @@ The runtime depends on a few fixed rules:
 3. Running targets subscribe to their dependency targets.
 4. Solve subscribes to each running target and caches both target and source exposed state.
 
-### Event Dispatch
+### Event dispatch
 
 1. A process either calls `Solve.dispatch/4`, sends a deferred dispatch envelope, or sends a direct
    `{pid, {:solve_event, ...}}` tuple produced by `Solve.Lookup`.
@@ -341,14 +340,14 @@ The runtime depends on a few fixed rules:
 3. The controller updates internal state and recomputes `expose/3`.
 4. If the exposed map changed, the controller broadcasts an update envelope.
 
-### Upstream State Change
+### Upstream state change
 
 1. An upstream singleton or collected child broadcasts a new exposed map.
 2. Dependent controllers receive the encoded dependency update directly.
 3. The Solve app refreshes its target cache and, if needed, its source `%Solve.Collection{}`.
 4. Solve reconciles direct dependents to decide whether to keep, stop, start, replace, attach, or detach subscriptions.
 
-### Collection Reconcile
+### Collection reconcile
 
 1. A collection source re-runs `collect/1` because its upstream state changed.
 2. Solve diffs ordered ids against the existing materialized collection.
@@ -356,7 +355,7 @@ The runtime depends on a few fixed rules:
 4. Solve rebuilds the source `%Solve.Collection{}` and notifies external collection subscribers.
 5. Solve reevaluates collection bindings in dependents and adds or removes child subscriptions.
 
-### Crash And Restart
+### Crash and restart
 
 1. A controller target exits unexpectedly.
 2. Solve marks that target stopped and notifies external subscribers with an update carrying `nil`.
@@ -365,5 +364,4 @@ The runtime depends on a few fixed rules:
 5. Solve attempts restart within a bounded retry budget.
 6. If the restart budget is exhausted, the Solve app stops.
 
-For public usage examples, see `README.md`, `examples/emerge_lookup_example.md`, and
-`examples/counter_lookup_example.md`.
+For public usage examples, see `README.md`.
