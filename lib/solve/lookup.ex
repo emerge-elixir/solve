@@ -15,14 +15,15 @@ defmodule Solve.Lookup do
 
     @enforce_keys [:refs, :collections]
     defstruct refs: [], collections: []
+
+    @type t :: %__MODULE__{refs: [Solve.controller_target()], collections: [atom()]}
   end
 
   @events_key :events_
 
   @type target :: Solve.controller_target()
-  @type updated_controllers :: %{optional(GenServer.server()) => Updated.t()}
 
-  @callback handle_solve_updated(updated_controllers(), term()) :: {:ok, term()}
+  @callback handle_solve_updated(map(), term()) :: {:ok, term()}
   @optional_callbacks handle_solve_updated: 2
 
   defmacro __using__(opts \\ []) do
@@ -168,7 +169,7 @@ defmodule Solve.Lookup do
   def events(%{@events_key => events}), do: events
   def events(_value), do: nil
 
-  @spec handle_message(Solve.Message.t()) :: updated_controllers()
+  @spec handle_message(Solve.Message.t()) :: map()
   def handle_message(%Solve.Message{type: :dispatch, payload: %Solve.Dispatch{} = dispatch}) do
     app = resolve_app!(dispatch.app)
     Solve.dispatch(app, dispatch.controller_name, dispatch.event, dispatch.payload)
