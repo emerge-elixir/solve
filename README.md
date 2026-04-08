@@ -1,23 +1,17 @@
 # Solve
 
-Solve is a state management framework for UI-heavy Elixir applications.
+Solve is a controller-graph state runtime for Elixir applications.
 
-Solve organizes state around controller dependencies, not component hierarchy. The result is an acyclic state graph that can fan out, share upstream nodes, and terminate in multiple leaves. UI layout and state structure stay separate: the UI may be rendered as a tree, while state is modeled as an acyclic dependency graph of controllers.
+It models application state as a graph of focused controllers instead of a tree
+that mirrors UI structure. Each controller owns one slice of behavior and
+state, exposes a plain map, and declares its dependencies explicitly.
 
-Each controller owns one slice of behavior and state, exposes a plain map, and can depend on other controllers. Solve validates the graph on boot and rejects circular dependencies.
+This keeps state structure and UI structure separate. Your UI can still render
+as a tree, but your application state does not have to follow that shape.
 
-## What Solve Gives You
+## Install Solve
 
-- Small, focused state owners instead of one large application process
-- Explicit dependencies between state owners
-- Derived state without pushing that logic into the UI layer
-- Collection support for repeated item controllers
-- Explicit cross-controller writes through dispatch and callbacks
-- The ability to read state where a process needs it, which reduces the need to thread large state and handler bundles through nested UI helpers
-
-## Installation
-
-If available in Hex, add `solve` to your dependencies:
+Add `solve` to your dependencies:
 
 ```elixir
 def deps do
@@ -27,21 +21,65 @@ def deps do
 end
 ```
 
-## Core Ideas
+## Model state around interaction
 
-- **Solve app** - the coordinating `GenServer` that owns the controller graph
+Users do not interact with one widget in isolation. They interact with the
+application as a whole.
+
+A click, a filter change, a draft edit, or a menu selection is presented in one
+place, but it often affects several other parts of the system:
+
+- visible content
+- counters and summaries
+- enabled actions
+- local editing state
+- background processes
+
+That is why Solve models state around ownership and interaction, not around the
+nearest rendered component.
+
+A controller is not just a bucket of values. A controller models one coherent
+slice of application behavior.
+
+## Learn the core ideas
+
 - **controller** - a `GenServer` that owns one slice of state and behavior
-- **exposed state** - the plain map a controller shares with subscribers, dependents, and UI code
-- **dependency** - another controller's exposed state made available to a controller
-- **callback** - a function passed from the app into a controller for explicit cross-controller writes
-- **collection source** - a controller spec that manages many item controllers like `{:todo, 1}` or `{:todo, 2}`
-- **Solve.Lookup** - a process-local read API that keeps a local view of Solve state and builds direct event refs
+- **exposed state** - the plain map a controller shares with subscribers,
+  dependents, and view code
+- **dependency** - another controller's exposed state made available to a
+  controller
+- **callback** - a function passed from the app into a controller for explicit
+  cross-controller writes
+- **collection source** - a controller spec that manages many item controllers
+  such as `{:todo, 1}` or `{:todo, 2}`
+- **Solve app** - the coordinating `GenServer` that owns the controller graph
+- **Solve.Lookup** - a process-local API for cached reads and direct event refs
 
-Declared event handlers can take the leading subset of runtime inputs they need: `payload`, `state`, `dependencies`, `callbacks`, and `init_params`.
+Declared event handlers take the leading subset of runtime inputs they need:
 
-## Smallest Working Example
+- `payload`
+- `state`
+- `dependencies`
+- `callbacks`
+- `init_params`
 
-Start with one controller and one Solve app.
+For example, an event handler may be defined at any of these arities:
+
+```elixir
+event_name(payload)
+event_name(payload, state)
+event_name(payload, state, dependencies)
+event_name(payload, state, dependencies, callbacks)
+event_name(payload, state, dependencies, callbacks, init_params)
+```
+
+## Start with one controller
+
+Start with one controller.
+
+A controller is the smallest useful unit in Solve. It owns one slice of state,
+handles a small set of events, and exposes a plain map for the rest of the
+application to read.
 
 ```elixir
 defmodule MyApp.CounterController do
@@ -53,11 +91,26 @@ defmodule MyApp.CounterController do
   def increment(_payload, state), do: %{state | count: state.count + 1}
   def decrement(_payload, state), do: %{state | count: state.count - 1}
 end
+```
 
-defmodule MyApp.State do
+This controller models one small interaction boundary: incrementing and
+decrementing a counter.
+
+That is the right place to begin. Start with one interaction and give it one
+controller.
+
+## Run controllers in an app
+
+Controllers run inside a Solve app.
+
+The app starts the controller graph, keeps it alive, and routes events to the
+right controller instance.
+
+```elixir
+defmodule MyApp.App do
   use Solve
 
-  @impl true
+  @impl Solve
   def controllers do
     [
       controller!(name: :counter, module: MyApp.CounterController)
@@ -69,22 +122,302 @@ end
 Start the app like any other `GenServer`:
 
 ```elixir
-{:ok, app} = MyApp.State.start_link(name: MyApp.State)
+{:ok, app} = MyApp.App.start_link(name: MyApp.App)
 ```
 
-In this example:
+At this point:
 
-- `MyApp.State` defines the controller graph
-- `:counter` is a singleton controller source
-- the controller owns its internal state
-- the exposed state is the same map because it uses the default `expose/3`
+- `MyApp.CounterController` models one slice of behavior
+- `MyApp.App` runs that controller
+- the app becomes the stable runtime entrypoint for reads, dispatch, and
+  subscriptions
 
-## Using Solve Directly
+## Describe data flow in the app
 
-The lowest-level way to interact with Solve is through `dispatch` and `subscribe`.
+The app is not only a runtime container. It also defines how controllers
+interact.
+
+That is the main role of the controller graph.
+
+An app defines:
+
+- which controllers exist
+- which controllers read from others through dependencies
+- which writes cross ownership boundaries through callbacks
+- which repeated controller instances are materialized through collections
+
+For example:
 
 ```elixir
-iex> {:ok, app} = MyApp.State.start_link(name: MyApp.State)
+defmodule MyApp.App do
+  use Solve
+
+  @impl Solve
+  def controllers do
+    [
+      controller!(name: :task_list, module: MyApp.TaskList),
+      controller!(
+        name: :create_task,
+        module: MyApp.CreateTask,
+        callbacks: %{
+          submit: fn title -> dispatch(:task_list, :create_task, title) end
+        }
+      ),
+      controller!(
+        name: :filter,
+        module: MyApp.Filter,
+        dependencies: [:task_list]
+      ),
+      controller!(
+        name: :task_editor,
+        module: MyApp.TaskEditor,
+        variant: :collection,
+        dependencies: [:task_list],
+        collect: fn _context = %{dependencies: %{task_list: task_list}} ->
+          Enum.map(task_list.ids, fn id ->
+            {id, [params: %{id: id, title: task_list.tasks[id].title}]}
+          end)
+        end
+      )
+    ]
+  end
+end
+```
+
+This graph describes data flow directly:
+
+- `:filter` reads from `:task_list`
+- `:create_task` writes back to `:task_list` through a callback
+- `:task_editor` materializes one controller per task
+- `:task_list` remains the owner of the canonical data
+
+Controllers implement behavior. The app defines how controllers read from and
+write to each other.
+
+## Keep controllers focused
+
+Each controller owns one coherent interaction boundary.
+
+Good controller boundaries include things like:
+
+- current screen selection
+- draft input state
+- active filter state
+- canonical list data
+- one edit session per item
+
+A focused controller has:
+
+- one clear responsibility
+- one small event surface
+- one exposed state map
+- one reason to change
+
+For example:
+
+```elixir
+defmodule MyApp.Screen do
+  use Solve.Controller, events: [:set]
+
+  @screens [
+    %{id: :tasks, label: "Tasks"},
+    %{id: :reports, label: "Reports"}
+  ]
+
+  @impl true
+  def init(_params, _dependencies), do: %{current: :tasks}
+
+  def set(screen, state) when screen in [:tasks, :reports] do
+    %{state | current: screen}
+  end
+
+  def set(_screen, state), do: state
+
+  @impl true
+  def expose(state, _dependencies, _params) do
+    %{current: state.current, screens: @screens}
+  end
+end
+```
+
+## Use dependencies for derived state
+
+Use dependencies when one controller needs another controller's exposed state as
+input.
+
+Dependencies are for reads.
+
+They are the right place for:
+
+- filtered ids
+- grouped sections
+- status summaries
+- enabled actions
+- derived counts
+
+For example, a filter controller exposes `visible_ids` instead of making the UI
+recompute filtering logic during rendering:
+
+```elixir
+defmodule MyApp.Filter do
+  use Solve.Controller, events: [:set]
+
+  @filters [:all, :active, :completed]
+
+  @impl true
+  def init(_params, _dependencies), do: %{active: :all}
+
+  def set(filter, _state) when filter in @filters, do: %{active: filter}
+  def set(_filter, state), do: state
+
+  @impl true
+  def expose(state, _dependencies = %{task_list: task_list}, _params) do
+    %{
+      filters: @filters,
+      active: state.active,
+      visible_ids: visible_ids(state.active, task_list)
+    }
+  end
+
+  defp visible_ids(:all, %{ids: ids}), do: ids
+
+  defp visible_ids(:active, %{ids: ids, tasks: tasks}) do
+    Enum.reject(ids, fn id -> tasks[id].completed? end)
+  end
+
+  defp visible_ids(:completed, %{ids: ids, tasks: tasks}) do
+    Enum.filter(ids, fn id -> tasks[id].completed? end)
+  end
+end
+```
+
+This keeps derived state out of the UI layer.
+
+## Use callbacks for explicit writes
+
+Use callbacks when one controller needs to request a write from another
+controller.
+
+Dependencies describe reads. Callbacks describe writes.
+
+This keeps the dependency graph acyclic while preserving ownership.
+
+For example, an input controller owns the draft title while another controller
+owns the canonical list:
+
+```elixir
+defmodule MyApp.App do
+  use Solve
+
+  @impl Solve
+  def controllers do
+    [
+      controller!(name: :task_list, module: MyApp.TaskList),
+      controller!(
+        name: :create_task,
+        module: MyApp.CreateTask,
+        callbacks: %{
+          submit: fn title -> dispatch(:task_list, :create_task, title) end
+        }
+      )
+    ]
+  end
+end
+```
+
+The controller still owns its own local transition logic:
+
+```elixir
+defmodule MyApp.CreateTask do
+  use Solve.Controller, events: [:set_title, :submit]
+
+  @impl true
+  def init(_params, _dependencies), do: %{title: ""}
+
+  def set_title(title) when is_binary(title) do
+    %{title: title}
+  end
+
+  def submit(_payload, state, _dependencies, _callbacks = %{submit: submit}) do
+    case String.trim(state.title) do
+      "" ->
+        %{title: ""}
+
+      title ->
+        submit.(title)
+        %{title: ""}
+    end
+  end
+end
+```
+
+This keeps ownership explicit:
+
+- one controller owns the draft input
+- another controller owns the canonical data
+- the write boundary is visible in the app graph
+
+## Use collections for repeated item state
+
+Use a collection source when many items need the same local behavior.
+
+This fits cases like:
+
+- one edit session per row
+- one expanded state per item
+- one upload state per file
+- one inspector state per node
+
+A collection source reuses one controller design while keeping each item's local
+state separate.
+
+```elixir
+controller!(
+  name: :task_editor,
+  module: MyApp.TaskEditor,
+  variant: :collection,
+  dependencies: [:task_list],
+  collect: fn _context = %{dependencies: %{task_list: task_list}} ->
+    Enum.map(task_list.ids, fn id ->
+      {id, [params: %{id: id, title: task_list.tasks[id].title}]}
+    end)
+  end
+)
+```
+
+Each item controller then owns only its own local behavior:
+
+```elixir
+defmodule MyApp.TaskEditor do
+  use Solve.Controller, events: [:begin_edit, :cancel_edit, :set_title, :save_edit]
+
+  @impl true
+  def init(params, _dependencies), do: %{editing?: false, title: params.title}
+
+  def begin_edit(_payload, state), do: %{state | editing?: true}
+
+  def set_title(title, %{editing?: true} = state) when is_binary(title) do
+    %{state | title: title}
+  end
+
+  def cancel_edit(_payload, _state, _dependencies, _callbacks, params) do
+    %{editing?: false, title: params.title}
+  end
+
+  @impl true
+  def expose(state, _dependencies, params), do: Map.put(state, :id, params.id)
+end
+```
+
+This keeps per-item local state out of the canonical list while still making
+every item controller addressable as `{:task_editor, id}`.
+
+## Read and write state directly
+
+The base API is `Solve.subscribe/3` and `Solve.dispatch/4`.
+
+```elixir
+iex> {:ok, app} = MyApp.App.start_link(name: MyApp.App)
 iex> Solve.subscribe(app, :counter)
 %{count: 0}
 
@@ -93,34 +426,109 @@ iex> Solve.subscribe(app, :counter)
 %{count: 1}
 ```
 
-`Solve.dispatch/4` sends an event to a controller. `Solve.subscribe/2` returns the current exposed state and subscribes the caller to future updates.
+`Solve.subscribe/3`:
 
-This API is enough when you want to work with Solve directly from another process or from tests.
+- returns the current exposed state synchronously
+- registers the subscriber for future updates
+- works with singleton targets, collected child targets, and collection sources
 
-## Reading State From A Process With Solve.Lookup
+`Solve.dispatch/4`:
 
-When a process wants to keep a local, process-friendly view of Solve state, use `Solve.Lookup`.
+- routes an event through the Solve app
+- forwards the event to the current controller pid for that target
+- becomes a no-op if the target is off or missing
 
-`Solve.Lookup` is designed to fit Emerge's render/event loop especially well, but it is not limited to Emerge. It also supports ordinary `GenServer` processes and other long-running processes that want local cached reads and update handling.
+Solve also exposes a few inspection helpers:
+
+- `Solve.controller_pid/2`
+- `Solve.controller_events/2`
+- `Solve.controller_variant/2`
+
+Use these when a test, worker, or tool needs raw access to the runtime.
+
+## Use Solve.Lookup for process-local access
+
+Use `Solve.Lookup` when a long-running process needs:
+
+- cached reads
+- update handling
+- direct event refs
+
+`Solve.Lookup` is framework-agnostic. It works in ordinary `GenServer`
+processes, workers, and UI processes.
 
 The main helpers are:
 
-- `solve(app, target)` for singleton controllers and collection items
+- `solve(app, target)` for singleton controllers and collected child targets
 - `collection(app, source)` for collection sources
-- `events(item)` to read a controller's direct event refs
-- `event(item, name)` and `event(item, name, payload)` to build direct handler tuples
+- `events(item)` to read direct event refs
+- `event(item, name)` and `event(item, name, payload)` to build direct event
+  tuples
 
-If you already know the id of a collection item, read it directly:
+Item lookups return the exposed state map augmented with an `:events_` key.
+Collection lookups return `%Solve.Collection{ids, items}` whose items are
+augmented item maps.
+
+## Use Solve.Lookup in a GenServer
+
+`Solve.Lookup` works well in ordinary `GenServer` processes.
 
 ```elixir
-todo = solve(app, {:todo, 42})
+defmodule MyApp.CounterWorker do
+  use GenServer
+  use Solve.Lookup
+
+  def start_link(app) do
+    GenServer.start_link(__MODULE__, app, name: __MODULE__)
+  end
+
+  @impl true
+  def init(app), do: {:ok, %{app: app}}
+
+  @impl true
+  def handle_cast(:increment, state) do
+    counter = solve(state.app, :counter)
+
+    case event(counter, :increment) do
+      {pid, message} -> send(pid, message)
+      nil -> :ok
+    end
+
+    {:noreply, state}
+  end
+
+  def render(%{app: app} = state) do
+    IO.inspect(solve(app, :counter), label: "counter")
+    state
+  end
+
+  @impl Solve.Lookup
+  def handle_solve_updated(_updated, state) do
+    {:ok, render(state)}
+  end
+end
 ```
 
-Use `collection(app, :todo)` when you want the full ordered collection.
+Key properties:
 
-## Solve.Lookup With Emerge
+- the first `solve/2` call subscribes the process and populates its local cache
+- later `solve/2` calls read from that cache
+- `event(counter, :increment)` gives you a direct `{pid, message}` tuple
+- `handle_solve_updated/2` handles the process-specific reaction to Solve state
+  changes
 
-With Emerge, the standard `Solve.Lookup` pattern is: read state in `render/1`, bind events directly from lookup items, and rerender when Solve updates arrive.
+`use Solve.Lookup` defaults to `handle_info: :auto`. `%Solve.Message{}`
+envelopes refresh the local cache and call `handle_solve_updated/2` for you.
+
+Use `handle_info: :manual` when the process needs to inspect updates itself and
+decide which ones matter.
+
+## Use Solve.Lookup in Emerge
+
+`Solve.Lookup` also fits naturally into Emerge viewports.
+
+In Emerge, views read Solve state in `render/0` or `render/1`, bind events from
+lookup items, and rerender from `handle_solve_updated/2`.
 
 ```elixir
 defmodule MyApp.Viewport do
@@ -129,7 +537,7 @@ defmodule MyApp.Viewport do
 
   @impl Viewport
   def render(_state) do
-    counter = solve(MyApp.State, :counter)
+    counter = solve(MyApp.App, :counter)
 
     row([], [
       button("+", event(counter, :increment)),
@@ -145,372 +553,80 @@ defmodule MyApp.Viewport do
 end
 ```
 
-This keeps rendering code local to the view layer. View helpers can read the state they need where they render instead of relying on large parent-owned state bundles.
+This keeps state reads and event wiring close to the view code that uses them.
 
-For a fuller Emerge example, see `examples/emerge_lookup_example.md`.
+## Model larger applications
 
-## Solve.Lookup With Any GenServer
+As an application grows, one controller stops being enough. The common shape is:
 
-Solve.Lookup also works outside Emerge.
+- one controller for canonical data
+- one or more controllers for derived state
+- collection controllers for repeated local item behavior
 
-```elixir
-defmodule MyApp.CounterWorker do
-  use GenServer
-  use Solve.Lookup
-
-  def start_link(app) do
-    GenServer.start_link(__MODULE__, app, name: __MODULE__)
-  end
-
-  @impl true
-  def init(app), do: {:ok, %{app: app}}
-
-  def render(%{app: app} = state) do
-    IO.inspect(solve(app, :counter), label: "counter")
-    state
-  end
-
-  @impl Solve.Lookup
-  def handle_solve_updated(_updated, state) do
-    {:ok, render(state)}
-  end
-end
-```
-
-Use this style when a long-running process wants cached reads and automatic update handling without depending on Emerge.
-
-For the GenServer-focused example, see `examples/counter_lookup_example.md`.
-
-## Modeling A Real App
-
-The [Emerge TodoMVC example](https://github.com/emerge-elixir/emerge/tree/main/example) shows how Solve scales from a single controller into a small state graph.
-
-The controller graph is defined in one place:
-
-```elixir
-def controllers do
-  [
-    controller!(name: :todo_list, module: TodoApp.TodoList),
-    controller!(
-      name: :create_todo,
-      module: TodoApp.CreateTodo,
-      callbacks: %{
-        submit: fn title -> dispatch(:todo_list, :create_todo, title) end
-      }
-    ),
-    controller!(
-      name: :filter,
-      module: TodoApp.Filter,
-      dependencies: [:todo_list]
-    ),
-    controller!(
-      name: :todo_editor,
-      module: TodoApp.TodoEditor,
-      variant: :collection,
-      dependencies: [:todo_list],
-      callbacks: %{
-        save_edit: fn id, title -> dispatch(:todo_list, :update_todo, %{id: id, title: title}) end
-      },
-      collect: fn %{dependencies: %{todo_list: todo_list}} ->
-        Enum.map(todo_list.ids, fn id ->
-          {id, [params: %{id: id, title: todo_list.todos[id].title}]}
-        end)
-      end
-    )
-  ]
-end
-```
-
-That graph separates responsibilities cleanly:
+A task app can be split like this:
 
 | Controller | Owns | Depends on | Purpose |
 | --- | --- | --- | --- |
-| `:todo_list` | canonical todo data | none | create, update, delete, toggle todos |
-| `:create_todo` | the draft input value | none | manage input state and submit new todos |
-| `:filter` | active filter | `:todo_list` | expose visible ids derived from todo state |
-| `{:todo_editor, id}` | local edit state for one todo | `:todo_list` | manage editing UI for a single item |
+| `:task_list` | canonical task data | none | create, update, delete, toggle tasks |
+| `:create_task` | draft input value | none | manage input state and submit new tasks |
+| `:filter` | active filter | `:task_list` | expose visible ids derived from task state |
+| `{:task_editor, id}` | local edit state for one task | `:task_list` | manage editing UI for a single item |
 
-This is a core Solve pattern: keep canonical data, derived state, and local UI state in separate controllers with explicit relationships.
+This is a common Solve structure:
 
-## Dependencies, Callbacks, And Collections
+- canonical data in one controller
+- derived state in another
+- local per-item state in a collection source
 
-These three features carry most of the architectural weight in a larger Solve app.
+Split into separate apps only when parts of your system become genuinely
+independent domains. That means they:
 
-### Dependencies
+- have their own controller graph
+- evolve independently
+- do not share much internal state ownership
+- are composed together at a higher level rather than tightly coordinated
 
-Use dependencies when one controller needs another controller's exposed state as input.
+Separate apps also fit when you need different variants of the same graph. A
+user-facing app and an admin app can reuse the same core controllers while the
+admin app adds moderation, audit, or other admin-only controllers.
 
-The filter controller depends on `:todo_list` and computes visible ids in `expose/3`:
+Controllers stay reusable because they do not know which app they live in. The
+app defines how they are wired together. This works when reused controllers
+still receive the dependency keys, params, and callbacks they expect.
 
-```elixir
-defmodule TodoApp.Filter do
-  use Solve.Controller, events: [:set]
+One concrete example of this style is the Emerge TodoMVC demo:
+[https://github.com/emerge-elixir/emerge/tree/main/example](https://github.com/emerge-elixir/emerge/tree/main/example)
 
-  @filters [:all, :active, :completed]
+## Pick the right primitive
 
-  @impl true
-  def init(_params, _dependencies), do: %{active: :all}
-
-  def set(filter, _state) when filter in @filters, do: %{active: filter}
-  def set(_filter, state), do: state
-
-  @impl true
-  def expose(state, %{todo_list: todo_list}, _params) do
-    %{
-      filters: @filters,
-      active: state.active,
-      visible_ids: visible_ids(state.active, todo_list)
-    }
-  end
-
-  defp visible_ids(:all, %{ids: ids}), do: ids
-
-  defp visible_ids(:active, %{ids: ids, todos: todos}) do
-    Enum.reject(ids, fn id -> todos[id].completed? end)
-  end
-
-  defp visible_ids(:completed, %{ids: ids, todos: todos}) do
-    Enum.filter(ids, fn id -> todos[id].completed? end)
-  end
-end
-```
-
-This keeps filtering logic out of the UI. The UI asks for visible ids, and the controller decides how they are derived.
-
-### Callbacks
-
-Use callbacks when one controller should trigger another controller's write explicitly.
-
-Because a Solve app is an acyclic dependency graph, a controller should not reach back into upstream controllers directly. Dependencies make downstream data flow explicit by declaring what a controller reads from elsewhere in the graph. Callbacks do the same for upstream writes: they make it explicit when a controller needs to request a change from a controller that owns state elsewhere in the graph.
-
-In the TodoMVC demo, `:create_todo` owns the text input state, but `:todo_list` owns the actual todo collection. The app wires those two together with a callback:
-
-```elixir
-controller!(
-  name: :create_todo,
-  module: TodoApp.CreateTodo,
-  callbacks: %{
-    submit: fn title -> dispatch(:todo_list, :create_todo, title) end
-  }
-)
-```
-
-The controller remains responsible for its own state transition logic:
-
-```elixir
-def submit(_payload, state, _dependencies, callbacks) do
-  case String.trim(state.title) do
-    "" ->
-      %{title: ""}
-
-    title ->
-      callbacks.submit.(title)
-      %{title: ""}
-  end
-end
-```
-
-This makes upstream writes explicit in the same way dependencies make downstream reads explicit, while keeping state ownership clear.
-
-### Collections
-
-Use collection sources when you need many similar controllers, one per item.
-
-The TodoMVC demo models per-item editing with a collection source:
-
-```elixir
-controller!(
-  name: :todo_editor,
-  module: TodoApp.TodoEditor,
-  variant: :collection,
-  dependencies: [:todo_list],
-  collect: fn %{dependencies: %{todo_list: todo_list}} ->
-    Enum.map(todo_list.ids, fn id ->
-      {id, [params: %{id: id, title: todo_list.todos[id].title}]}
-    end)
-  end
-)
-```
-
-Each item controller then owns only its local edit behavior:
-
-```elixir
-defmodule TodoApp.TodoEditor do
-  use Solve.Controller, events: [:begin_edit, :cancel_edit, :set_title, :save_edit]
-
-  @impl true
-  def init(params, _dependencies), do: %{editing?: false, title: params.title}
-
-  def begin_edit(_payload, state), do: %{state | editing?: true}
-  def set_title(title, %{editing?: true} = state) when is_binary(title), do: %{state | title: title}
-  def cancel_edit(_payload, _state, _dependencies, _callbacks, params), do: %{editing?: false, title: params.title}
-
-  def expose(state, _dependencies, params), do: Map.put(state, :id, params.id)
-end
-```
-
-This keeps local item UI state out of the canonical todo list while still making every editor controller addressable as `{:todo_editor, id}`.
-
-## How UI Code Stays Clean
-
-Solve lets UI code stay close to rendering and interaction wiring.
-
-In the TodoMVC demo, view helpers read exactly the state they need with `solve(...)`:
-
-```elixir
-def todo_list() do
-  filter = solve(TodoApp, :filter)
-
-  column([], Enum.map(filter.visible_ids, &todo_row/1))
-end
-
-defp todo_row(todo_id) do
-  todo_editor = solve(TodoApp, {:todo_editor, todo_id})
-
-  if todo_editor.editing? do
-    editing_row(todo_editor)
-  else
-    regular_row(todo_id)
-  end
-end
-
-defp regular_row(todo_id) do
-  todo = solve(TodoApp, :todo_list).todos[todo_id]
-
-  row([], [toggle_button(todo), title_button(todo), destroy_button(todo_id)])
-end
-```
-
-That keeps state access close to the code that renders it. Shared state can still be shared, but it does not have to be threaded through unrelated helpers just because they sit higher in the UI tree.
-
-The same applies to event wiring:
-
-```elixir
-Event.on_change(event(create_todo, :set_title))
-Event.on_press(event(todo_list, :toggle_todo, todo.id))
-Event.on_press(event(filter, :set, filter_name))
-Event.on_blur(event(todo_editor, :save_edit))
-```
-
-UI helpers bind directly to the controller that owns the behavior.
-
-## End-To-End Flow: Create A Todo
-
-The create flow shows how several small controllers work together without collapsing into one state owner.
-
-1. The input field reads `:create_todo` and sends `:set_title` and `:submit` events.
-2. `:create_todo` owns the draft input value.
-3. On submit, `:create_todo` validates the title and calls its `submit` callback.
-4. That callback dispatches `:create_todo` to `:todo_list`.
-5. `:todo_list` creates the canonical todo.
-6. `:filter` recomputes visible ids from the updated todo list.
-7. The `:todo_editor` collection is reconciled so a per-item editor exists for the new todo.
-8. Any subscribed process rerenders through `Solve.Lookup`.
-
-This illustrates Solve's style: each controller does one job, dependencies stay explicit, and the state graph grows by adding specialized nodes instead of expanding one central process.
-
-## What `solve/2` Returns
-
-`solve(app, controller_name)` returns the controller's exposed map augmented with an `:events_` key.
-
-```elixir
-%{
-  count: 2,
-  events_: %{
-    increment: {#PID<...>, {:solve_event, :increment}},
-    decrement: {#PID<...>, {:solve_event, :decrement}}
-  }
-}
-```
-
-Use `events/1` to read that key safely:
-
-```elixir
-counter = solve(app, :counter)
-{pid, message} = events(counter)[:increment]
-send(pid, message)
-```
-
-If the controller is off, `solve/2` returns `nil` and `events(nil)` also returns `nil`.
-
-For Emerge-style event attrs, prefer `event/2` and `event/3`:
-
-```elixir
-counter = solve(app, :counter)
-
-button("+", event(counter, :increment))
-Input.text([Event.on_change(event(counter, :set_title))], counter.title)
-button("Reset", event(counter, :set_mode, :all))
-```
-
-`event/2` returns the same direct `{pid, message}` tuple as `events(counter)[:increment]`, and `event/3` adds a fixed payload to that tuple.
-
-## What `collection/2` Returns
-
-Use `collection(app, source_name)` for collection sources and `solve(app, {source_name, id})` for one collected child.
-
-```elixir
-columns = collection(app, :column)
-
-Enum.map(columns, fn {id, column} ->
-  {id, column.title, Event.on_change(event(column, :rename))}
-end)
-
-column = solve(app, {:column, 1})
-{pid, message} = event(column, :rename, "Backlog")
-send(pid, message)
-```
-
-`collection/2` returns a `%Solve.Collection{}` whose items are the normal lookup item maps:
-
-```elixir
-%Solve.Collection{
-  ids: [1, 2],
-  items: %{
-    1 => %{
-      id: 1,
-      title: "Todo",
-      events_: %{rename: {#PID<...>, {:solve_event, :rename}}}
-    },
-    2 => %{
-      id: 2,
-      title: "Doing",
-      events_: %{rename: {#PID<...>, {:solve_event, :rename}}}
-    }
-  }
-}
-```
-
-`events/1` returns `nil` for the collection wrapper itself; events live on each item.
-
-## When To Reach For Which Tool
+Use these rules when choosing between Solve primitives:
 
 - Use a singleton controller for one focused state owner.
 - Use a dependency when one controller derives state from another.
-- Use a callback when one controller should trigger another controller's write explicitly.
+- Use a callback when one controller requests a write from another.
 - Use a collection source when each item needs its own local behavior or state.
-- Use `Solve.Lookup` when a process wants local cached reads and update-aware event wiring.
+- Use `Solve.Lookup` when a process needs cached reads and update-aware event
+  wiring.
 
-## Key Rules
+## Respect the invariants
 
-- Running controller instances must expose plain maps.
-- Collection sources expose `%Solve.Collection{ids, items}` through `Solve.subscribe/3` and `Solve.Lookup.collection/2`.
+- Running controller instances expose plain maps.
+- Collection sources expose `%Solve.Collection{ids, items}` through
+  `Solve.subscribe/3` and `Solve.Lookup.collection/2`.
 - `nil` means a singleton or collected child is off or stopped.
 - `:events_` is reserved in exposed maps for lookup augmentation.
-- `Solve.subscribe/3` returns raw exposed state for both singleton targets and collection sources.
+- `Solve.subscribe/3` returns raw exposed state for singleton targets and
+  collection sources.
 - `Solve.Lookup.solve/2` returns augmented singleton or collected-child views.
 - `Solve.Lookup.collection/2` returns an augmented collection view.
 
-## Further Reading
+## Keep reading
 
-- `examples/counter_lookup_example.md` shows `Solve.Lookup` in an ordinary `GenServer`, including manual `handle_info`.
-- `examples/emerge_lookup_example.md` shows the render-driven `Solve.Lookup` flow with Emerge.
 - `ARCHITECTURE.md` covers the runtime model and lifecycle rules in more detail.
-- [Emerge TodoMVC example](https://github.com/emerge-elixir/emerge/tree/main/example) is the full Emerge + Solve application.
 
-## Attribution
+## Acknowledge the influences
 
 Solve draws significant conceptual inspiration from
-[Keechma Next](https://github.com/keechma/keechma-next/), especially in its emphasis on
-controller-oriented state management, explicit data flow, and keeping UI structure separate from
-state structure.
+[Keechma Next](https://github.com/keechma/keechma-next/), especially in its
+emphasis on controller-oriented state management, explicit data flow, and
+keeping UI structure separate from state structure.

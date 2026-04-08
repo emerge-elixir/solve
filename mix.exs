@@ -43,12 +43,9 @@ defmodule Solve.MixProject do
       source_ref: "readme",
       extras: [
         "README.md",
-        "ARCHITECTURE.md",
-        "examples/emerge_lookup_example.md",
-        "examples/counter_lookup_example.md"
+        "ARCHITECTURE.md"
       ],
       groups_for_extras: [
-        Guides: ["examples/emerge_lookup_example.md", "examples/counter_lookup_example.md"],
         Internals: ["ARCHITECTURE.md"]
       ],
       groups_for_modules: [
