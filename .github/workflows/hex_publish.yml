@@ -1,0 +1,69 @@
+name: Hex Publish
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  publish:
+    name: Publish Hex package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v5
+
+      - name: Set up Elixir and OTP
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19.5"
+          otp-version: "28.3"
+
+      - name: Cache Mix dependencies and build
+        uses: actions/cache@v5
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mix-
+
+      - name: Install Hex and Rebar
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Verify tag matches mix version
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          project_version="$(mix run -e 'IO.write(Mix.Project.config()[:version])')"
+
+          if [ "$tag_version" != "$project_version" ]; then
+            echo "Tag version $tag_version does not match mix version $project_version" >&2
+            exit 1
+          fi
+
+      - name: Run CI test script
+        run: ./ci-tests.sh
+
+      - name: Build docs
+        run: mix docs
+
+      - name: Verify Hex package contents
+        run: mix hex.build --unpack
+
+      - name: Publish package
+        run: mix hex.publish --yes
+
+      - name: Publish docs
+        run: mix hex.publish docs --yes

@@ -207,13 +207,7 @@ defmodule Solve.DependencyGraph do
     controller_specs_by_name
     |> Map.keys()
     |> Enum.find_value([], fn controller_name ->
-      case do_find_cycle(
-             controller_name,
-             controller_specs_by_name,
-             MapSet.new(),
-             [],
-             MapSet.new()
-           ) do
+      case do_find_cycle(controller_name, controller_specs_by_name, MapSet.new(), []) do
         {:cycle, cycle, _visited} -> cycle
         {:ok, _visited} -> nil
       end
@@ -341,9 +335,9 @@ defmodule Solve.DependencyGraph do
     process_queue(new_queue, dependents_map, updated_in_degrees, all_nodes, [node | result])
   end
 
-  defp do_find_cycle(node, controller_specs_by_name, visited, stack, stack_set) do
+  defp do_find_cycle(node, controller_specs_by_name, visited, stack) do
     cond do
-      MapSet.member?(stack_set, node) ->
+      node in stack ->
         {:cycle, cycle_from_stack(node, stack), visited}
 
       MapSet.member?(visited, node) ->
@@ -352,11 +346,10 @@ defmodule Solve.DependencyGraph do
       true ->
         visited = MapSet.put(visited, node)
         stack = [node | stack]
-        stack_set = MapSet.put(stack_set, node)
         dependencies = controller_specs_by_name |> Map.fetch!(node) |> Map.get(:dependencies, [])
 
         Enum.reduce_while(dependencies, {:ok, visited}, fn dependency, {:ok, acc_visited} ->
-          case do_find_cycle(dependency, controller_specs_by_name, acc_visited, stack, stack_set) do
+          case do_find_cycle(dependency, controller_specs_by_name, acc_visited, stack) do
             {:cycle, cycle, new_visited} -> {:halt, {:cycle, cycle, new_visited}}
             {:ok, new_visited} -> {:cont, {:ok, new_visited}}
           end
