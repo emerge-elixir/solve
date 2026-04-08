@@ -1,5 +1,10 @@
 # Solve
 
+[![Hex.pm](https://img.shields.io/hexpm/v/solve.svg)](https://hex.pm/packages/solve)
+[![HexDocs](https://img.shields.io/badge/hex-docs-lightgreen.svg)](https://hexdocs.pm/solve)
+[![CI](https://img.shields.io/badge/CI-GitHub_Actions-2088FF?logo=githubactions&logoColor=white)](https://github.com/emerge-elixir/solve/actions/workflows/ci.yml)
+[![License](https://img.shields.io/github/license/emerge-elixir/solve.svg)](https://github.com/emerge-elixir/solve/blob/main/LICENSE)
+
 Solve is a controller-graph state runtime for Elixir applications.
 
 It models application state as a graph of focused controllers instead of a tree
