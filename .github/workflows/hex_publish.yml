@@ -46,7 +46,7 @@ jobs:
         shell: bash
         run: |
           tag_version="${GITHUB_REF_NAME#v}"
-          project_version="$(mix run -e 'IO.write(Mix.Project.config()[:version])')"
+          project_version="$(mix run --no-compile --no-start -e 'IO.write(Mix.Project.config()[:version])')"
 
           if [ "$tag_version" != "$project_version" ]; then
             echo "Tag version $tag_version does not match mix version $project_version" >&2

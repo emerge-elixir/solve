@@ -73,6 +73,7 @@ defmodule Solve.MixProject do
   defp package do
     [
       licenses: ["MIT"],
+      maintainers: ["Damirados"],
       links: %{
         "GitHub" => @source_url,
         "Issues" => @source_url <> "/issues"
