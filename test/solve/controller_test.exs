@@ -105,6 +105,117 @@ defmodule Solve.ControllerTest do
     end
   end
 
+  defmodule ExternalPublisher do
+    use GenServer
+
+    def start_link(opts \\ []) do
+      GenServer.start_link(__MODULE__, MapSet.new(), opts)
+    end
+
+    def subscribe(server, subscriber \\ self()) when is_pid(subscriber) do
+      GenServer.call(server, {:subscribe, subscriber})
+    end
+
+    def publish(server, message) do
+      GenServer.cast(server, {:publish, message})
+    end
+
+    @impl true
+    def init(subscribers), do: {:ok, subscribers}
+
+    @impl true
+    def handle_call({:subscribe, subscriber}, _from, subscribers) do
+      {:reply, :ok, MapSet.put(subscribers, subscriber)}
+    end
+
+    @impl true
+    def handle_cast({:publish, message}, subscribers) do
+      Enum.each(subscribers, &send(&1, message))
+      {:noreply, subscribers}
+    end
+  end
+
+  defmodule HandleInfoController do
+    use Solve.Controller, events: [:increment]
+
+    @impl true
+    def init(%{test_pid: test_pid} = params, dependencies) do
+      if publisher = params[:publisher] do
+        :ok = ExternalPublisher.subscribe(publisher)
+      end
+
+      if monitor_pid = params[:monitor_pid] do
+        Process.monitor(monitor_pid)
+      end
+
+      send(test_pid, {:handle_info_init, dependencies, params})
+
+      %{
+        count: Map.get(params, :initial, 0),
+        messages: [],
+        test_pid: test_pid
+      }
+    end
+
+    def increment(payload, state) do
+      %{state | count: state.count + payload}
+    end
+
+    @impl true
+    def expose(state, dependencies, _init_params) do
+      %{
+        count: state.count,
+        messages: Enum.reverse(state.messages),
+        source: Map.get(dependencies, :source)
+      }
+    end
+
+    def handle_info(message, state, dependencies, callbacks, init_params) do
+      send(
+        state.test_pid,
+        {:handle_info_args, message, state, dependencies, callbacks, init_params}
+      )
+
+      new_state =
+        case message do
+          {:external_increment, value} -> %{state | count: state.count + value}
+          _ -> state
+        end
+
+      %{new_state | messages: [message | new_state.messages]}
+    end
+  end
+
+  defmodule HandleInfoArityTwoController do
+    use Solve.Controller, events: []
+
+    @impl true
+    def init(%{publisher: publisher, test_pid: test_pid} = params, dependencies) do
+      :ok = ExternalPublisher.subscribe(publisher)
+      send(test_pid, {:handle_info_two_init, dependencies, params})
+
+      %{
+        count: Map.get(params, :initial, 0),
+        test_pid: test_pid
+      }
+    end
+
+    @impl true
+    def expose(state, _dependencies, _init_params) do
+      %{count: state.count}
+    end
+
+    def handle_info({:external_increment, value}, state) do
+      send(state.test_pid, {:handle_info_two_args, {:external_increment, value}, state})
+      %{state | count: state.count + value}
+    end
+
+    def handle_info(message, state) do
+      send(state.test_pid, {:handle_info_two_args, message, state})
+      state
+    end
+  end
+
   test "use Solve.Controller rejects invalid events lists" do
     module = unique_module_name("InvalidEvents")
 
@@ -145,12 +256,49 @@ defmodule Solve.ControllerTest do
                  fn ->
                    Code.compile_string("""
                    defmodule #{inspect(module)} do
-                     use Solve.Controller, events: [:increment]
+                    use Solve.Controller, events: [:increment]
+
+                    def init(_params, _dependencies), do: %{}
+
+                    def increment(payload), do: %{payload: payload}
+                    def increment(payload, state), do: {payload, state}
+                   end
+                   """)
+                 end
+  end
+
+  test "use Solve.Controller requires handle_info callbacks to use arity 2 through 5" do
+    module = unique_module_name("InvalidHandleInfoArity")
+
+    assert_raise CompileError,
+                 ~r/must define handle_info callback\(s\) with exactly one arity between \/2 and \/5: handle_info\/1/,
+                 fn ->
+                   Code.compile_string("""
+                   defmodule #{inspect(module)} do
+                     use Solve.Controller, events: []
 
                      def init(_params, _dependencies), do: %{}
 
-                     def increment(payload), do: %{payload: payload}
-                     def increment(payload, state), do: {payload, state}
+                     def handle_info(message), do: message
+                   end
+                   """)
+                 end
+  end
+
+  test "use Solve.Controller rejects handle_info callbacks defined at multiple arities" do
+    module = unique_module_name("DuplicateHandleInfoArity")
+
+    assert_raise CompileError,
+                 ~r/must not define handle_info callback\(s\) at multiple arities: handle_info\/2, handle_info\/3/,
+                 fn ->
+                   Code.compile_string("""
+                   defmodule #{inspect(module)} do
+                     use Solve.Controller, events: []
+
+                     def init(_params, _dependencies), do: %{}
+
+                     def handle_info(_message, state), do: state
+                     def handle_info(_message, state, _dependencies), do: state
                    end
                    """)
                  end
@@ -207,6 +355,211 @@ defmodule Solve.ControllerTest do
 
     assert test_pid == self()
     assert Solve.Controller.subscribe(pid) == %{last: {:five, :five_payload}}
+  end
+
+  test "ordinary handle_info receives external messages with Solve context and rebroadcasts exposed state" do
+    assert {:ok, publisher} = ExternalPublisher.start_link()
+
+    callbacks = %{audit: :enabled}
+    params = %{initial: 1, label: :demo, publisher: publisher, test_pid: self()}
+
+    assert {:ok, pid} =
+             HandleInfoController.start_link(
+               solve_app: :app,
+               controller_name: :handle_info,
+               params: params,
+               dependencies: %{source: %{value: 10}},
+               callbacks: callbacks
+             )
+
+    assert_receive {:handle_info_init, %{source: %{value: 10}}, ^params}
+
+    assert Solve.Controller.subscribe(pid) == %{
+             count: 1,
+             messages: [],
+             source: %{value: 10}
+           }
+
+    assert :ok = ExternalPublisher.publish(publisher, {:external_increment, 2})
+
+    assert_receive {:handle_info_args, {:external_increment, 2}, %{count: 1, messages: []},
+                    %{source: %{value: 10}}, ^callbacks, ^params},
+                   100
+
+    assert_receive %Solve.Message{
+      type: :update,
+      payload: %Solve.Update{
+        app: :app,
+        controller_name: :handle_info,
+        exposed_state: %{
+          count: 3,
+          messages: [{:external_increment, 2}],
+          source: %{value: 10}
+        }
+      }
+    }
+
+    assert Solve.Controller.subscribe(pid) == %{
+             count: 3,
+             messages: [{:external_increment, 2}],
+             source: %{value: 10}
+           }
+  end
+
+  test "handle_info/2 returns Solve state directly for non-Solve messages" do
+    assert {:ok, publisher} = ExternalPublisher.start_link()
+
+    params = %{initial: 2, publisher: publisher, test_pid: self()}
+
+    assert {:ok, pid} =
+             HandleInfoArityTwoController.start_link(
+               solve_app: :app,
+               controller_name: :handle_info_two,
+               params: params,
+               dependencies: %{},
+               callbacks: %{}
+             )
+
+    assert_receive {:handle_info_two_init, %{}, ^params}
+    assert Solve.Controller.subscribe(pid) == %{count: 2}
+
+    assert :ok = ExternalPublisher.publish(publisher, {:external_increment, 3})
+
+    assert_receive {:handle_info_two_args, {:external_increment, 3}, %{count: 2}}, 100
+
+    assert_receive %Solve.Message{
+      type: :update,
+      payload: %Solve.Update{
+        app: :app,
+        controller_name: :handle_info_two,
+        exposed_state: %{count: 5}
+      }
+    }
+
+    assert Solve.Controller.subscribe(pid) == %{count: 5}
+  end
+
+  test "direct solve_event messages stay reserved when controller defines handle_info" do
+    callbacks = %{audit: :enabled}
+    params = %{initial: 2, test_pid: self()}
+
+    assert {:ok, pid} =
+             HandleInfoController.start_link(
+               solve_app: :app,
+               controller_name: :handle_info,
+               params: params,
+               dependencies: %{source: nil},
+               callbacks: callbacks
+             )
+
+    assert_receive {:handle_info_init, %{source: nil}, ^params}
+    assert Solve.Controller.subscribe(pid) == %{count: 2, messages: [], source: nil}
+
+    send(pid, {:solve_event, :increment, 3})
+
+    assert_receive %Solve.Message{
+      type: :update,
+      payload: %Solve.Update{
+        app: :app,
+        controller_name: :handle_info,
+        exposed_state: %{count: 5, messages: [], source: nil}
+      }
+    }
+
+    refute_receive {:handle_info_args, {:solve_event, :increment, 3}, _, _, _, _}, 50
+  end
+
+  test "dependency updates stay reserved when controller defines handle_info" do
+    callbacks = %{audit: :enabled}
+    params = %{test_pid: self()}
+
+    assert {:ok, pid} =
+             HandleInfoController.start_link(
+               solve_app: :app,
+               controller_name: :handle_info,
+               params: params,
+               dependencies: %{source: nil},
+               callbacks: callbacks
+             )
+
+    assert_receive {:handle_info_init, %{source: nil}, ^params}
+    assert Solve.Controller.subscribe(pid) == %{count: 0, messages: [], source: nil}
+
+    send(pid, Solve.Message.update(:app, :source, %{value: 42}))
+
+    assert_receive %Solve.Message{
+      type: :update,
+      payload: %Solve.Update{
+        app: :app,
+        controller_name: :handle_info,
+        exposed_state: %{count: 0, messages: [], source: %{value: 42}}
+      }
+    }
+
+    refute_receive {:handle_info_args, %Solve.Message{}, _, _, _, _}, 50
+  end
+
+  test "raw Solve messages remain reserved from controller handle_info" do
+    callbacks = %{audit: :enabled}
+    params = %{test_pid: self()}
+
+    assert {:ok, pid} =
+             HandleInfoController.start_link(
+               solve_app: :app,
+               controller_name: :handle_info,
+               params: params,
+               dependencies: %{source: nil},
+               callbacks: callbacks
+             )
+
+    assert_receive {:handle_info_init, %{source: nil}, ^params}
+    assert Solve.Controller.subscribe(pid) == %{count: 0, messages: [], source: nil}
+
+    send(pid, Solve.Message.dispatch(:app, :handle_info, :increment, 4))
+
+    send(pid, %Solve.DependencyUpdate{app: :other_app, key: :source, op: :replace, value: %{x: 1}})
+
+    refute_receive {:handle_info_args, %Solve.Message{}, _, _, _, _}, 50
+    refute_receive {:handle_info_args, %Solve.DependencyUpdate{}, _, _, _, _}, 50
+
+    assert Solve.Controller.subscribe(pid) == %{count: 0, messages: [], source: nil}
+  end
+
+  test "unrelated DOWN messages fall through to controller handle_info" do
+    monitored = spawn(fn -> Process.sleep(:infinity) end)
+    callbacks = %{audit: :enabled}
+    params = %{monitor_pid: monitored, test_pid: self()}
+
+    assert {:ok, pid} =
+             HandleInfoController.start_link(
+               solve_app: :app,
+               controller_name: :handle_info,
+               params: params,
+               dependencies: %{source: nil},
+               callbacks: callbacks
+             )
+
+    assert_receive {:handle_info_init, %{source: nil}, ^params}
+    assert Solve.Controller.subscribe(pid) == %{count: 0, messages: [], source: nil}
+
+    Process.exit(monitored, :shutdown)
+
+    assert_receive {:handle_info_args, {:DOWN, _ref, :process, ^monitored, :shutdown},
+                    %{count: 0}, %{source: nil}, ^callbacks, ^params},
+                   100
+
+    assert_receive %Solve.Message{
+      type: :update,
+      payload: %Solve.Update{
+        app: :app,
+        controller_name: :handle_info,
+        exposed_state: %{
+          count: 0,
+          messages: [{:DOWN, _, :process, ^monitored, :shutdown}],
+          source: nil
+        }
+      }
+    }
   end
 
   test "subscribe/2 returns the current exposed state using default expose/3" do

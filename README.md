@@ -104,6 +104,30 @@ decrementing a counter.
 That is the right place to begin. Start with one interaction and give it one
 controller.
 
+Controllers can also react to non-Solve messages through a Solve-style
+`handle_info` callback. Like event handlers, `handle_info` takes the leading
+subset of runtime inputs it needs and returns the next state directly.
+
+```elixir
+defmodule MyApp.CounterController do
+  use Solve.Controller, events: [:increment]
+
+  @impl true
+  def init(_params, _dependencies) do
+    Process.send_after(self(), :tick, 1_000)
+    %{count: 0}
+  end
+
+  def increment(_payload, state), do: %{state | count: state.count + 1}
+
+  def handle_info(:tick, state), do: %{state | count: state.count + 1}
+end
+```
+
+Solve still reserves `{:solve_event, ...}`, `%Solve.Message{}`,
+`%Solve.DependencyUpdate{}`, and its own subscriber `{:DOWN, ...}` messages for
+controller internals.
+
 ## Run controllers in an app
 
 Controllers run inside a Solve app.
