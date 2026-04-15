@@ -89,9 +89,30 @@ defmodule Solve.Controller do
     current exposed state synchronously.
   - `dispatch(controller, event, payload \\ %{})` sends an event to the controller.
 
+  Controllers can also define a Solve-style `handle_info` callback to react to non-Solve
+  messages such as PubSub notifications, timer messages, or process monitors set up in
+  `init/2`.
+
+  `handle_info` uses the same leading-subset convention as events and returns the next
+  user state directly:
+
+      handle_info(message, state)
+      handle_info(message, state, dependencies)
+      handle_info(message, state, dependencies, callbacks)
+      handle_info(message, state, dependencies, callbacks, init_params)
+
   In normal app code, prefer `Solve.dispatch/4` so dispatch goes through the `Solve`
   runtime and stays aligned with controller lifecycle changes. `Solve.Controller.dispatch/3`
   is the low-level primitive for callers that already have a controller pid.
+
+  Solve reserves these message shapes for controller internals and they will not be
+  forwarded to controller-defined `handle_info` clauses:
+
+  - `{:solve_event, event}`
+  - `{:solve_event, event, payload}`
+  - `%Solve.Message{}`
+  - `%Solve.DependencyUpdate{}`
+  - subscriber monitor `{:DOWN, ref, :process, pid, reason}` messages owned by Solve
 
   ## Exposed State
 
@@ -144,6 +165,9 @@ defmodule Solve.Controller do
       @behaviour Solve.Controller
       @before_compile Solve.Controller
       @solve_controller_events events
+      Module.register_attribute(__MODULE__, :solve_controller_user_handle_info_arities,
+        accumulate: true
+      )
 
       @impl Solve.Controller
       def expose(state, _dependencies, _init_params), do: state
@@ -182,58 +206,30 @@ defmodule Solve.Controller do
         Solve.Controller.__handle_event__(event, payload, server_state)
       end
 
-      @impl GenServer
-      def handle_info({:solve_event, event}, server_state) when is_atom(event) do
-        Solve.Controller.__handle_direct_event__(event, %{}, server_state)
-      end
+      def handle_info(_message, state), do: state
 
-      @impl GenServer
-      def handle_info({:solve_event, event, payload}, server_state) when is_atom(event) do
-        Solve.Controller.__handle_direct_event__(event, payload, server_state)
-      end
-
-      @impl GenServer
-      def handle_info(
-            %Solve.Message{
-              type: :update,
-              payload: %Solve.Update{
-                app: solve_app,
-                controller_name: dependency_name,
-                exposed_state: exposed_state
-              }
-            },
-            server_state
-          ) do
-        Solve.Controller.__handle_dependency_update__(
-          solve_app,
-          dependency_name,
-          exposed_state,
-          server_state
-        )
-      end
-
-      @impl GenServer
-      def handle_info(%Solve.DependencyUpdate{} = dependency_update, server_state) do
-        Solve.Controller.__handle_dependency_update_message__(dependency_update, server_state)
-      end
-
-      @impl GenServer
-      def handle_info({:DOWN, _ref, :process, subscriber, _reason}, server_state) do
-        Solve.Controller.__handle_subscriber_down__(subscriber, server_state)
-      end
-
-      @impl GenServer
-      def handle_info(_message, server_state) do
-        {:noreply, server_state}
-      end
-
-      defoverridable expose: 3
+      defoverridable expose: 3, handle_info: 2
+      @on_definition Solve.Controller
     end
   end
+
+  @doc false
+  def __on_definition__(env, _kind, :handle_info, args, _guards, _body) do
+    Module.put_attribute(env.module, :solve_controller_user_handle_info_arities, length(args))
+  end
+
+  def __on_definition__(_env, _kind, _name, _args, _guards, _body), do: :ok
 
   defmacro __before_compile__(env) do
     events = Module.get_attribute(env.module, :solve_controller_events) || []
     definitions = Module.definitions_in(env.module)
+
+    handle_info_arities =
+      env.module
+      |> Module.get_attribute(:solve_controller_user_handle_info_arities)
+      |> Kernel.||([])
+      |> Enum.uniq()
+      |> Enum.sort()
 
     event_arities =
       Map.new(events, fn event ->
@@ -277,13 +273,96 @@ defmodule Solve.Controller do
           "#{inspect(env.module)} must not define declared event callback(s) at multiple arities: #{callbacks}"
     end
 
-    resolved_event_arities = Enum.map(event_arities, fn {event, [arity]} -> {event, arity} end)
+    invalid_handle_info_arities = Enum.reject(handle_info_arities, &valid_handle_info_arity?/1)
 
-    quote bind_quoted: [event_arities: resolved_event_arities] do
-      @solve_controller_event_arities Map.new(event_arities)
+    if invalid_handle_info_arities != [] do
+      callbacks = Enum.map_join(invalid_handle_info_arities, ", ", &format_handle_info_callback/1)
+
+      raise CompileError,
+        file: env.file,
+        line: 1,
+        description:
+          "#{inspect(env.module)} must define handle_info callback(s) with exactly one arity between /2 and /5: #{callbacks}"
+    end
+
+    if length(handle_info_arities) > 1 do
+      callbacks = Enum.map_join(handle_info_arities, ", ", &format_handle_info_callback/1)
+
+      raise CompileError,
+        file: env.file,
+        line: 1,
+        description:
+          "#{inspect(env.module)} must not define handle_info callback(s) at multiple arities: #{callbacks}"
+    end
+
+    resolved_event_arities = Enum.map(event_arities, fn {event, [arity]} -> {event, arity} end)
+    handle_info_arity = List.first(handle_info_arities)
+
+    quote do
+      @solve_controller_event_arities Map.new(unquote(Macro.escape(resolved_event_arities)))
+      @solve_controller_handle_info_arity unquote(handle_info_arity)
 
       def __solve_event_arity__(event) when is_atom(event) do
         Map.fetch!(@solve_controller_event_arities, event)
+      end
+
+      def __solve_handle_info_arity__, do: @solve_controller_handle_info_arity
+
+      defoverridable handle_info: 2
+
+      @impl GenServer
+      def handle_info(message, server_state) do
+        case message do
+          {:solve_event, event} when is_atom(event) ->
+            Solve.Controller.__handle_direct_event__(event, %{}, server_state)
+
+          {:solve_event, event, payload} when is_atom(event) ->
+            Solve.Controller.__handle_direct_event__(event, payload, server_state)
+
+          %Solve.Message{
+            type: :update,
+            payload: %Solve.Update{
+              app: solve_app,
+              controller_name: dependency_name,
+              exposed_state: exposed_state
+            }
+          } ->
+            Solve.Controller.__handle_dependency_update__(
+              solve_app,
+              dependency_name,
+              exposed_state,
+              server_state
+            )
+
+          %Solve.Message{} ->
+            {:noreply, server_state}
+
+          %Solve.DependencyUpdate{} = dependency_update ->
+            Solve.Controller.__handle_dependency_update_message__(dependency_update, server_state)
+
+          {:DOWN, ref, :process, subscriber, _reason}
+          when is_reference(ref) and is_pid(subscriber) ->
+            if Solve.Controller.__subscriber_monitor_match__?(ref, subscriber, server_state) do
+              Solve.Controller.__handle_subscriber_down__(subscriber, server_state)
+            else
+              Solve.Controller.__handle_fallback_info__(
+                message,
+                __MODULE__,
+                @solve_controller_handle_info_arity,
+                server_state,
+                fn -> super(message, server_state.state) end
+              )
+            end
+
+          _message ->
+            Solve.Controller.__handle_fallback_info__(
+              message,
+              __MODULE__,
+              @solve_controller_handle_info_arity,
+              server_state,
+              fn -> super(message, server_state.state) end
+            )
+        end
       end
     end
   end
@@ -539,6 +618,58 @@ defmodule Solve.Controller do
     {:noreply, server_state}
   end
 
+  @doc false
+  def __subscriber_monitor_match__?(ref, subscriber, %{
+        subscriber_monitor_refs_by_pid: monitor_refs
+      })
+      when is_reference(ref) and is_pid(subscriber) do
+    Map.get(monitor_refs, subscriber) == ref
+  end
+
+  @doc false
+  def __handle_fallback_info__(_message, _module, nil, server_state, _super_handle_info) do
+    {:noreply, server_state}
+  end
+
+  def __handle_fallback_info__(
+        _message,
+        _module,
+        2,
+        %{solve_app: solve_app} = server_state,
+        super_handle_info
+      )
+      when is_function(super_handle_info, 0) do
+    new_state = with_solve_app(solve_app, super_handle_info)
+    {:noreply, refresh_exposed_state(%{server_state | state: new_state})}
+  end
+
+  def __handle_fallback_info__(
+        message,
+        module,
+        handle_info_arity,
+        %{solve_app: solve_app} = server_state,
+        _super_handle_info
+      )
+      when handle_info_arity in 3..5 do
+    new_state =
+      with_solve_app(solve_app, fn ->
+        apply(
+          module,
+          :handle_info,
+          handle_info_args(
+            handle_info_arity,
+            message,
+            server_state.state,
+            server_state.dependencies,
+            server_state.callbacks,
+            server_state.params
+          )
+        )
+      end)
+
+    {:noreply, refresh_exposed_state(%{server_state | state: new_state})}
+  end
+
   defp validate_events_option!(opts, caller) when is_list(opts) do
     opts
     |> Keyword.get(:events, [])
@@ -587,6 +718,9 @@ defmodule Solve.Controller do
   defp valid_event_arities?([arity]) when arity in 1..5, do: true
   defp valid_event_arities?(_arities), do: false
 
+  defp valid_handle_info_arity?(arity) when arity in 2..5, do: true
+  defp valid_handle_info_arity?(_arity), do: false
+
   defp format_invalid_event_callback({event, []}), do: Atom.to_string(event)
   defp format_invalid_event_callback({event, [arity]}), do: "#{event}/#{arity}"
 
@@ -596,9 +730,16 @@ defmodule Solve.Controller do
     |> then(&"#{event} (#{&1})")
   end
 
+  defp format_handle_info_callback(arity), do: "handle_info/#{arity}"
+
   defp event_args(event_arity, payload, state, dependencies, callbacks, init_params) do
     [payload, state, dependencies, callbacks, init_params]
     |> Enum.take(event_arity)
+  end
+
+  defp handle_info_args(handle_info_arity, message, state, dependencies, callbacks, init_params) do
+    [message, state, dependencies, callbacks, init_params]
+    |> Enum.take(handle_info_arity)
   end
 
   defp with_solve_app(solve_app, fun) when is_function(fun, 0) do
