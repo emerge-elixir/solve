@@ -2,7 +2,7 @@ defmodule Solve.MixProject do
   use Mix.Project
 
   @description "Declarative UI agnostic state management architecture"
-  @version "0.1.0"
+  @version "0.2.0"
   @source_url "https://github.com/emerge-elixir/solve"
 
   def project do
@@ -80,6 +80,7 @@ defmodule Solve.MixProject do
       },
       files: [
         "lib",
+        "CHANGELOG.md",
         "README.md",
         "ARCHITECTURE.md",
         "LICENSE",
@@ -94,10 +95,12 @@ defmodule Solve.MixProject do
       main: "readme",
       source_ref: "v#{@version}",
       extras: [
+        "CHANGELOG.md",
         "README.md",
         "ARCHITECTURE.md"
       ],
       groups_for_extras: [
+        Release: ["CHANGELOG.md"],
         Internals: ["ARCHITECTURE.md"]
       ],
       groups_for_modules: [
