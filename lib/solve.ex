@@ -983,7 +983,7 @@ defmodule Solve do
                 put_collection_binding_subscription(
                   acc,
                   target,
-                  binding.key,
+                  binding,
                   id,
                   %{target: child_target, subscription_ref: subscription_ref}
                 )
@@ -1072,11 +1072,11 @@ defmodule Solve do
     end
   end
 
-  defp put_collection_binding_subscription(state, target, key, id, entry) do
+  defp put_collection_binding_subscription(state, target, binding, id, entry) do
     binding_state =
-      get_binding_state(state, target, key) || %{subscription_refs_by_id: %{}, ids: []}
+      get_binding_state(state, target, binding.key) || default_collection_binding_state(binding)
 
-    put_binding_state(state, target, key, %{
+    put_binding_state(state, target, binding.key, %{
       binding_state
       | subscription_refs_by_id: Map.put(binding_state.subscription_refs_by_id, id, entry)
     })
@@ -1146,8 +1146,6 @@ defmodule Solve do
       unsubscribe_collection_binding_entry(acc, entry)
     end)
   end
-
-  defp cleanup_binding_state(state, _binding_state), do: state
 
   defp unsubscribe_dependency_subscription(source_target, subscription_ref, state) do
     case Map.get(state.controller_pids_by_target, source_target) do
