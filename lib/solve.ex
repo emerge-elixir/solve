@@ -1114,17 +1114,19 @@ defmodule Solve do
   defp cleanup_binding_subscription(state, %{
          kind: :single,
          child_target: source_target,
+         source_pid: source_pid,
          subscription_ref: subscription_ref
        }) do
-    unsubscribe_dependency_subscription(source_target, subscription_ref, state)
+    unsubscribe_dependency_subscription(source_target, source_pid, subscription_ref, state)
     state
   end
 
   defp unsubscribe_collection_binding_entry(state, %{
          target: source_target,
+         source_pid: source_pid,
          subscription_ref: subscription_ref
        }) do
-    unsubscribe_dependency_subscription(source_target, subscription_ref, state)
+    unsubscribe_dependency_subscription(source_target, source_pid, subscription_ref, state)
     state
   end
 
@@ -1146,9 +1148,10 @@ defmodule Solve do
   defp cleanup_binding_state(state, %{
          kind: :single,
          child_target: source_target,
+         source_pid: source_pid,
          subscription_ref: subscription_ref
        }) do
-    unsubscribe_dependency_subscription(source_target, subscription_ref, state)
+    unsubscribe_dependency_subscription(source_target, source_pid, subscription_ref, state)
     state
   end
 
@@ -1161,10 +1164,15 @@ defmodule Solve do
     end)
   end
 
-  defp unsubscribe_dependency_subscription(source_target, subscription_ref, state) do
+  defp unsubscribe_dependency_subscription(source_target, source_pid, subscription_ref, state) do
     case Map.get(state.controller_pids_by_target, source_target) do
-      pid when is_pid(pid) -> unsubscribe_controller_safely(pid, subscription_ref)
-      _ -> :ok
+      # Unsubscribe only from the process this subscription was made in; when
+      # the source was replaced or stopped, the subscription died with it.
+      ^source_pid when is_pid(source_pid) ->
+        unsubscribe_controller_safely(source_pid, subscription_ref)
+
+      _ ->
+        :ok
     end
   end
 
