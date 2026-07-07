@@ -1098,14 +1098,6 @@ defmodule Solve do
   defp cleanup_binding_subscription(state, nil), do: state
 
   defp cleanup_binding_subscription(state, %{
-         target: source_target,
-         subscription_ref: subscription_ref
-       }) do
-    unsubscribe_dependency_subscription(source_target, subscription_ref, state)
-    state
-  end
-
-  defp cleanup_binding_subscription(state, %{
          kind: :single,
          child_target: source_target,
          subscription_ref: subscription_ref
