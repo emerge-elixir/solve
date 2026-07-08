@@ -213,10 +213,6 @@ defmodule Solve.ControllerSpec do
     {:error, {:invalid_dependencies, name, dependencies}}
   end
 
-  defp validate_existing_dependency_bindings(_name, []) do
-    :ok
-  end
-
   defp validate_existing_dependency_bindings(name, bindings) when is_list(bindings) do
     Enum.reduce_while(bindings, {:ok, MapSet.new()}, fn binding, {:ok, seen_keys} ->
       with {:ok, key} <- validate_existing_binding(name, binding),

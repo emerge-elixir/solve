@@ -45,6 +45,38 @@ defmodule Solve.RuntimeTest do
     end
   end
 
+  defmodule ReplaceableMiddleController do
+    use Solve.Controller, events: [:bump]
+
+    @impl true
+    def init(%{label: label, test_pid: test_pid}, _dependencies) do
+      send(test_pid, {:middle_init, label})
+      %{label: label, count: 0}
+    end
+
+    def bump(_payload, state), do: %{state | count: state.count + 1}
+
+    @impl true
+    def expose(state, _dependencies, _init_params) do
+      %{label: state.label, count: state.count}
+    end
+  end
+
+  defmodule MiddleDependentController do
+    use Solve.Controller, events: []
+
+    @impl true
+    def init(%{test_pid: test_pid}, dependencies) do
+      send(test_pid, {:middle_dependent_init, dependencies})
+      :leaf
+    end
+
+    @impl true
+    def expose(_state, dependencies, _init_params) do
+      %{middle: Map.get(dependencies, :middle)}
+    end
+  end
+
   defmodule CrashyController do
     use Solve.Controller, events: [:crash]
 
@@ -133,6 +165,40 @@ defmodule Solve.RuntimeTest do
               _value -> %{mode: :positive, test_pid: app_params.test_pid}
             end
           end
+        )
+      ]
+    end
+  end
+
+  defmodule ReplacementPropagationSolve do
+    use Solve
+
+    @impl true
+    def controllers do
+      [
+        controller!(
+          name: :source,
+          module: Solve.RuntimeTest.LifecycleSourceController,
+          params: fn %{app_params: app_params} ->
+            %{value: app_params.source_initial, test_pid: app_params.test_pid}
+          end
+        ),
+        controller!(
+          name: :middle,
+          module: Solve.RuntimeTest.ReplaceableMiddleController,
+          dependencies: [:source],
+          params: fn %{dependencies: dependencies, app_params: app_params} ->
+            case dependencies[:source] do
+              %{value: value} -> %{label: value, test_pid: app_params.test_pid}
+              _ -> false
+            end
+          end
+        ),
+        controller!(
+          name: :leaf,
+          module: Solve.RuntimeTest.MiddleDependentController,
+          dependencies: [:middle],
+          params: fn %{app_params: app_params} -> %{test_pid: app_params.test_pid} end
         )
       ]
     end
@@ -598,6 +664,94 @@ defmodule Solve.RuntimeTest do
 
     refute_receive {:stable_init, _, _, _}, 50
     assert Solve.controller_pid(app, :stable) == stable_pid
+  end
+
+  test "dependents keep receiving updates after a singleton dependency is replaced" do
+    app = start_app(ReplacementPropagationSolve, %{source_initial: 1, test_pid: self()})
+
+    assert_receive {:middle_init, 1}
+    assert_receive {:middle_dependent_init, %{middle: %{label: 1, count: 0}}}
+
+    assert Solve.subscribe(app, :leaf) == %{middle: %{label: 1, count: 0}}
+
+    leaf_pid = Solve.controller_pid(app, :leaf)
+    middle_pid = Solve.controller_pid(app, :middle)
+
+    assert :ok = Solve.dispatch(app, :source, :set, 2)
+
+    assert_receive {:middle_init, 2}
+    refute await_pid_change(app, :middle, middle_pid) == middle_pid
+
+    assert_receive %Solve.Message{
+      type: :update,
+      payload: %Solve.Update{
+        app: ^app,
+        controller_name: :leaf,
+        exposed_state: %{middle: %{label: 2, count: 0}}
+      }
+    }
+
+    assert Solve.controller_pid(app, :leaf) == leaf_pid
+    refute_receive {:middle_dependent_init, _}, 50
+
+    assert :ok = Solve.dispatch(app, :middle, :bump, %{})
+
+    assert_receive %Solve.Message{
+      type: :update,
+      payload: %Solve.Update{
+        app: ^app,
+        controller_name: :leaf,
+        exposed_state: %{middle: %{label: 2, count: 1}}
+      }
+    }
+  end
+
+  test "collection dependents keep receiving item updates after an item is replaced" do
+    app = start_app(CollectionSolve, %{columns: initial_columns(), test_pid: self()})
+
+    assert_receive {:catalog_init, _}
+    assert_receive {:column_init, 1, _}
+    assert_receive {:column_init, 2, _}
+    assert_receive {:collection_projection_init, :all, _}
+    assert_receive {:visible_projection_init, _}
+
+    assert Solve.subscribe(app, :projection) == %{label: :all, titles: ["Todo", "Doing"]}
+
+    item_pid = Solve.controller_pid(app, {:column, 1})
+    projection_pid = Solve.controller_pid(app, :projection)
+
+    updated_columns = [
+      %{id: 1, title: "Backlog", visible?: true},
+      %{id: 2, title: "Doing", visible?: false}
+    ]
+
+    assert :ok = Solve.dispatch(app, :catalog, :set_columns, updated_columns)
+
+    assert_receive {:column_init, 1, _}
+    refute await_pid_change(app, {:column, 1}, item_pid) == item_pid
+
+    assert_receive %Solve.Message{
+      type: :update,
+      payload: %Solve.Update{
+        app: ^app,
+        controller_name: :projection,
+        exposed_state: %{label: :all, titles: ["Backlog", "Doing"]}
+      }
+    }
+
+    assert :ok = Solve.dispatch(app, {:column, 1}, :rename, "Icebox")
+
+    assert_receive %Solve.Message{
+      type: :update,
+      payload: %Solve.Update{
+        app: ^app,
+        controller_name: :projection,
+        exposed_state: %{label: :all, titles: ["Icebox", "Doing"]}
+      }
+    }
+
+    assert Solve.controller_pid(app, :projection) == projection_pid
+    refute_receive {:collection_projection_init, _, _}, 50
   end
 
   test "runtime crashes restart the controller within budget" do

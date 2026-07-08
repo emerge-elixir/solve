@@ -298,12 +298,20 @@ defmodule Solve.Controller do
     resolved_event_arities = Enum.map(event_arities, fn {event, [arity]} -> {event, arity} end)
     handle_info_arity = List.first(handle_info_arities)
 
+    event_arity_defs =
+      for {event, arity} <- resolved_event_arities do
+        quote do
+          def __solve_event_arity__(unquote(event)), do: unquote(arity)
+        end
+      end
+
     quote do
-      @solve_controller_event_arities Map.new(unquote(Macro.escape(resolved_event_arities)))
       @solve_controller_handle_info_arity unquote(handle_info_arity)
 
+      unquote(event_arity_defs)
+
       def __solve_event_arity__(event) when is_atom(event) do
-        Map.fetch!(@solve_controller_event_arities, event)
+        raise KeyError, key: event, term: unquote(Macro.escape(Map.new(resolved_event_arities)))
       end
 
       def __solve_handle_info_arity__, do: @solve_controller_handle_info_arity

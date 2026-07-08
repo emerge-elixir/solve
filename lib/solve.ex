@@ -891,7 +891,7 @@ defmodule Solve do
     snapshot_value = binding_value(binding, state)
 
     cond do
-      is_pid(source_pid) and same_single_binding?(current_binding_state, source_target) ->
+      is_pid(source_pid) and live_single_binding?(current_binding_state, source_pid) ->
         {:ok, state}
 
       is_pid(source_pid) ->
@@ -912,6 +912,7 @@ defmodule Solve do
               kind: :single,
               source: binding.source,
               child_target: source_target,
+              source_pid: source_pid,
               subscription_ref: subscription_ref
             }
 
@@ -957,39 +958,50 @@ defmodule Solve do
         end
       end)
 
-    current_binding_state =
-      get_binding_state(state, target, binding.key) || default_collection_binding_state(binding)
-
     state =
-      Enum.reduce(desired_ids -- current_binding_state.ids, state, fn id, acc ->
+      Enum.reduce(desired_ids, state, fn id, acc ->
         child_target = {binding.source, id}
+        entry = Map.get(current_refs, id)
 
         case Map.get(acc.controller_pids_by_target, child_target) do
           pid when is_pid(pid) ->
-            encoder = build_collection_encoder(binding, id)
-
-            case subscribe_controller_with_safely(pid, dependent_pid, encoder) do
-              {:ok, current_exposed_state, subscription_ref} ->
-                if not initial? do
-                  send(dependent_pid, encoder.(current_exposed_state))
+            if live_collection_binding_entry?(entry, pid) do
+              acc
+            else
+              # A stale entry points at a replaced process, so its subscription
+              # died with it; dropping the entry is enough.
+              acc =
+                if entry do
+                  delete_collection_binding_subscription(acc, target, binding.key, id)
                 else
-                  snapshot_item = Collection.get(desired_collection, id)
-
-                  if snapshot_item != current_exposed_state do
-                    send(dependent_pid, encoder.(current_exposed_state))
-                  end
+                  acc
                 end
 
-                put_collection_binding_subscription(
-                  acc,
-                  target,
-                  binding.key,
-                  id,
-                  %{target: child_target, subscription_ref: subscription_ref}
-                )
+              encoder = build_collection_encoder(binding, id)
 
-              :subscription_failed ->
-                acc
+              case subscribe_controller_with_safely(pid, dependent_pid, encoder) do
+                {:ok, current_exposed_state, subscription_ref} ->
+                  if not initial? do
+                    send(dependent_pid, encoder.(current_exposed_state))
+                  else
+                    snapshot_item = Collection.get(desired_collection, id)
+
+                    if snapshot_item != current_exposed_state do
+                      send(dependent_pid, encoder.(current_exposed_state))
+                    end
+                  end
+
+                  put_collection_binding_subscription(
+                    acc,
+                    target,
+                    binding,
+                    id,
+                    %{target: child_target, source_pid: pid, subscription_ref: subscription_ref}
+                  )
+
+                :subscription_failed ->
+                  acc
+              end
             end
 
           _ ->
@@ -1034,15 +1046,11 @@ defmodule Solve do
     end
   end
 
-  defp same_single_binding?(
-         %{kind: :single, child_target: child_target, subscription_ref: subscription_ref},
-         source_target
-       )
-       when not is_nil(subscription_ref) do
-    child_target == source_target
+  defp live_single_binding?(%{kind: :single, source_pid: source_pid}, current_pid) do
+    source_pid == current_pid
   end
 
-  defp same_single_binding?(_binding_state, _source_target), do: false
+  defp live_single_binding?(_binding_state, _current_pid), do: false
 
   defp get_binding_state(state, target, key) do
     state.dependency_subscription_state_by_target
@@ -1072,11 +1080,11 @@ defmodule Solve do
     end
   end
 
-  defp put_collection_binding_subscription(state, target, key, id, entry) do
+  defp put_collection_binding_subscription(state, target, binding, id, entry) do
     binding_state =
-      get_binding_state(state, target, key) || %{subscription_refs_by_id: %{}, ids: []}
+      get_binding_state(state, target, binding.key) || default_collection_binding_state(binding)
 
-    put_binding_state(state, target, key, %{
+    put_binding_state(state, target, binding.key, %{
       binding_state
       | subscription_refs_by_id: Map.put(binding_state.subscription_refs_by_id, id, entry)
     })
@@ -1095,30 +1103,30 @@ defmodule Solve do
     end
   end
 
-  defp cleanup_binding_subscription(state, nil), do: state
-
-  defp cleanup_binding_subscription(state, %{
-         target: source_target,
-         subscription_ref: subscription_ref
-       }) do
-    unsubscribe_dependency_subscription(source_target, subscription_ref, state)
-    state
+  defp live_collection_binding_entry?(%{source_pid: source_pid}, current_pid) do
+    source_pid == current_pid
   end
+
+  defp live_collection_binding_entry?(_entry, _current_pid), do: false
+
+  defp cleanup_binding_subscription(state, nil), do: state
 
   defp cleanup_binding_subscription(state, %{
          kind: :single,
          child_target: source_target,
+         source_pid: source_pid,
          subscription_ref: subscription_ref
        }) do
-    unsubscribe_dependency_subscription(source_target, subscription_ref, state)
+    unsubscribe_dependency_subscription(source_target, source_pid, subscription_ref, state)
     state
   end
 
   defp unsubscribe_collection_binding_entry(state, %{
          target: source_target,
+         source_pid: source_pid,
          subscription_ref: subscription_ref
        }) do
-    unsubscribe_dependency_subscription(source_target, subscription_ref, state)
+    unsubscribe_dependency_subscription(source_target, source_pid, subscription_ref, state)
     state
   end
 
@@ -1140,9 +1148,10 @@ defmodule Solve do
   defp cleanup_binding_state(state, %{
          kind: :single,
          child_target: source_target,
+         source_pid: source_pid,
          subscription_ref: subscription_ref
        }) do
-    unsubscribe_dependency_subscription(source_target, subscription_ref, state)
+    unsubscribe_dependency_subscription(source_target, source_pid, subscription_ref, state)
     state
   end
 
@@ -1155,12 +1164,15 @@ defmodule Solve do
     end)
   end
 
-  defp cleanup_binding_state(state, _binding_state), do: state
-
-  defp unsubscribe_dependency_subscription(source_target, subscription_ref, state) do
+  defp unsubscribe_dependency_subscription(source_target, source_pid, subscription_ref, state) do
     case Map.get(state.controller_pids_by_target, source_target) do
-      pid when is_pid(pid) -> unsubscribe_controller_safely(pid, subscription_ref)
-      _ -> :ok
+      # Unsubscribe only from the process this subscription was made in; when
+      # the source was replaced or stopped, the subscription died with it.
+      ^source_pid when is_pid(source_pid) ->
+        unsubscribe_controller_safely(source_pid, subscription_ref)
+
+      _ ->
+        :ok
     end
   end
 
