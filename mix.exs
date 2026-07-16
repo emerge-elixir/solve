@@ -2,7 +2,7 @@ defmodule Solve.MixProject do
   use Mix.Project
 
   @description "Declarative UI agnostic state management architecture"
-  @version "0.2.0"
+  @version "0.2.1"
   @source_url "https://github.com/emerge-elixir/solve"
 
   def project do
