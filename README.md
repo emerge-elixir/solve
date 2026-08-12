@@ -5,23 +5,37 @@
 [![CI](https://img.shields.io/badge/CI-GitHub_Actions-2088FF?logo=githubactions&logoColor=white)](https://github.com/emerge-elixir/solve/actions/workflows/ci.yml)
 [![License](https://img.shields.io/github/license/emerge-elixir/solve.svg)](https://github.com/emerge-elixir/solve/blob/main/LICENSE)
 
-Solve is a controller-graph state runtime for Elixir applications.
+Solve is a UI application framework.
 
-It models application state as a graph of focused controllers instead of a tree
-that mirrors UI structure. Each controller owns one slice of behavior and
-state, exposes a plain map, and declares its dependencies explicitly.
+It provides tools to model an application as a hierarchy of reusable components,
+without concerns about how the application is presented to the user or
+how user inputs are routed to the application.
 
-This keeps state structure and UI structure separate. Your UI can still render
-as a tree, but your application state does not have to follow that shape.
+To create a usable application, you will have to pair it with a presentation layer
+such as Emerge, LiveView, or something else.
 
-## Install Solve
+If you are coming from LiveView, you can think of it as the assigns + handle_event
+part of your LiveView. If you are coming from React, imagine if everything used hooks
+and all of your state was managed outside the component hierarchy. From the Elm perspective,
+it would be your model + update function without the render function.
+
+This kind of separation unlocks interesting use cases, such as interacting with the same
+application from different sources. For example, multiple Nerves devices alongside a web interface.
+
+It also allows an application to scale to a much higher degree of complexity while
+retaining a clear overview of how data flows between components, since lifecycles of components
+are not lumped together with rendering code. Testing situation also improves allowing
+for testing parts of application in isolation.
+
+
+## Installation
 
 Add `solve` to your dependencies:
 
 ```elixir
 def deps do
   [
-    {:solve, "~> 0.1.0"}
+    {:solve, "~> 0.2.2"}
   ]
 end
 ```
