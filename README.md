@@ -189,10 +189,10 @@ Events for a Controller are declared in use statement.
 use Solve.Controller, events: [:increment, :decrement]
 ```
 
-This now requiers implementation of at leas onet function named `increment`
+This module now needs to implement at least one function named `increment`
 and one function named `decrement`.
 
-Solve will accept definition with arities `1-5` so
+Solve will accept function definitions with arity `1-5` so
 for `events: [:example event]` one of these needs to be implemented.
 
 ```elixir
@@ -204,7 +204,6 @@ def example_event(event_payload, state, dependencies, callbacks, init_params)
 ```
 
 Declaring the same event at multiple arities is a compile error.
-We will talk about dependencies and callbacks soon but let's ignore them for now.  
 
 Each event handler implementation needs to return new internal state of controller.
 In case of our counter we increment or decrement count by 1 or by provided value.
@@ -286,13 +285,199 @@ iex(12)> flush
 }
 ```
 
-
-
-
-
-
+Observe state messages and notice how there was update with state nil when controller crashed
+and then another one when controller was restarted. That nil state will become important
+in a second.
 
 ## There might be others and we may depend on each other
+
+Controllers can depend on other controllers and have other controllers depend on them.
+Dependency connections are defined in the application rather then in individual controllers.
+This allows for reuse of controllers. Let's demonstrate with a multicontroller app.
+
+We are going to reuse Counter controller from the previous example but this time we will name it :credits
+and we are going to add a new controller named :hello that will greet our user and show a number of available credits.
+
+```elixir
+defmodule MyApp.App do
+  use Solve
+
+  @impl Solve
+  def controllers do
+  [
+    controller!(name: :credits, module: MyApp.Counter),
+    controller!(
+      name: :hello,
+      module: MyApp.Hello,
+      dependencies: [:credits],
+      params: fn %{app_params: app_params} -> Map.get(app_params || %{}, :name, "Anon") end
+    )
+  ]
+  end
+end
+```
+
+I have also sneaked in `:app_params` here. If when starting app you provide params map
+`MyApp.App.start_link(params: %{name: "The greeted one"})` that map will be available
+to params function of every controller.
+
+Controllers cannot be completely detached from their dependencies if they are going to use them,
+they need to be aware of the shape of data that is important to them (although you can take advantage of params
+to introduce some polymorphic getters in form of anonymous functions).
+
+```elixir
+defmodule MyApp.Hello do
+  use Solve.Controller
+
+  @impl Solve.Controller
+  def init(_params, _dependencies), do: nil
+
+  def expose(_state, %{credits: %{count: count}}, params) do
+    greeting = "Hello #{params}, you have #{count} credits"
+    %{greeting: greeting}
+  end
+end
+```
+
+In this expose function we are not using state, we are pattern matching directly on
+credits count and since params for our controller is just a string with the name
+we are using it directly.
+
+
+If we start the app and subscribe to hello we will be greeted with 0 credits.
+```elixir
+iex(4)> {:ok, app_pid} = MyApp.App.start_link(params: %{name: "The greeted one"})
+{:ok, #PID<0.199.0>}
+iex(5)> Solve.subscribe(app_pid, :hello)
+%{greeting: "Hello The greeted one, you have 0 credits"}
+```
+
+Now if credits are incremented, counter controller exposes new state and
+that triggers expose function of all of the controllers that depend on it
+to be rerun.
+
+```
+iex(6)> Solve.dispatch(app_pid, :credits, :increment, 100)
+:ok
+iex(7)> flush
+%Solve.Message{
+  type: :update,
+  payload: %Solve.Update{
+    app: #PID<0.199.0>,
+    controller_name: :hello,
+    exposed_state: %{greeting: "Hello The greeted one, you have 100 credits"}
+  }
+}
+:ok
+```
+
+Since we didn't subscribe to :credits we only got update message from the `:hello`
+controller.
+
+Params functions in the application can also rely on the dependencies of the controller.
+Let's add another controller to our app that is only on when credits are negative.
+
+```elixir
+defmodule MyApp.NegativeAlert do
+  use Solve.Controller
+
+  @impl Solve.Controller
+  def init(_params, _dependencies), do: nil
+
+  def expose(_state, _deps, _params) do
+    %{alert: "Negative credits"}
+  end
+end
+```
+
+```elixir
+defmodule MyApp.App do
+  use Solve
+
+  @impl Solve
+  def controllers do
+  [
+    controller!(name: :credits, module: MyApp.Counter),
+    controller!(
+      name: :hello,
+      module: MyApp.Hello,
+      dependencies: [:credits],
+      params: fn %{app_params: app_params} -> Map.get(app_params || %{}, :name, "Anon") end
+    ),
+    controller!(
+      name: :negative,
+      module: MyApp.NegativeAlert,
+      dependencies: [:credits],
+      params: fn %{dependencies: %{credits: credits}} -> credits && credits.count < 0 end
+    )
+  ]
+  end
+end
+```
+
+```
+iex(19)> {:ok, app_pid} = MyApp.App.start_link()
+{:ok, #PID<0.235.0>}
+iex(20)> Solve.subscribe(app_pid, :negative)
+nil
+iex(21)> Solve.subscribe(app_pid, :hello)
+%{greeting: "Hello Anon, you have 0 credits"}
+iex(22)> Solve.dispatch(app_pid, :credits, :decrement, 100)
+:ok
+iex(23)> flush
+%Solve.Message{
+  type: :update,
+  payload: %Solve.Update{
+    app: #PID<0.235.0>,
+    controller_name: :hello,
+    exposed_state: %{greeting: "Hello Anon, you have -100 credits"}
+  }
+}
+%Solve.Message{
+  type: :update,
+  payload: %Solve.Update{
+    app: #PID<0.235.0>,
+    controller_name: :negative,
+    exposed_state: %{alert: "Negative credits"}
+  }
+}
+:ok
+iex(24)> Solve.dispatch(app_pid, :credits, :increment, 200)
+:ok
+iex(25)> flush
+%Solve.Message{
+  type: :update,
+  payload: %Solve.Update{
+    app: #PID<0.235.0>,
+    controller_name: :hello,
+    exposed_state: %{greeting: "Hello Anon, you have 100 credits"}
+  }
+}
+%Solve.Message{
+  type: :update,
+  payload: %Solve.Update{
+    app: #PID<0.235.0>,
+    controller_name: :negative,
+    exposed_state: nil
+  }
+}
+:ok
+```
+
+When controller is not turned on it's exposed state is nil. If you go
+back an look at params transition table and combine that fact that when
+controller crashes it also exposes nil for an instant. That combination
+of dependencies and params functions allow you to define not how data flows
+between controllers but also how state of dependencies influences the lifecycle
+of other controllers in a declarative way in a single place.
+
+There are few restriction on dependencies. Circular dependencies
+are not allowed. `def controllers` deliberately has arity of 0 and
+dependency graph is checked for circular dependencies. This is to
+make whole graph eventually consistent but also for clarity. One of the
+main advantages of Solve is high level overview of application visible in singular file.
+Opposed to component systems that force you to read implementation
+of every component and it's view function in order to figure that out.
 
 ## By calling back I can reach anyone 
 
