@@ -5,9 +5,9 @@
 [![CI](https://img.shields.io/badge/CI-GitHub_Actions-2088FF?logo=githubactions&logoColor=white)](https://github.com/emerge-elixir/solve/actions/workflows/ci.yml)
 [![License](https://img.shields.io/github/license/emerge-elixir/solve.svg)](https://github.com/emerge-elixir/solve/blob/main/LICENSE)
 
-Solve is a UI application framework.
+Solve is an application framework.
 
-It provides tools to model an application as a hierarchy of reusable components,
+It provides tools to model an application as a graph of reusable state machines,
 without concerns about how the application is presented to the user or
 how user inputs are routed to the application.
 
@@ -22,11 +22,9 @@ it would be your model + update function without the render function.
 This kind of separation unlocks interesting use cases, such as interacting with the same
 application from different sources. For example, multiple Nerves devices alongside a web interface at the same time.
 
-It also allows an application to scale to a much higher degree of complexity while
+It's architecture allows an application to scale to a much higher degree of complexity while
 retaining a clear overview of how data flows between components, since lifecycles of components
-are not lumped together with rendering code. Testing situation also improves allowing
-for testing parts of application in isolation.
-
+are not lumped together with rendering code.
 
 ## Installation
 
@@ -467,7 +465,7 @@ iex(25)> flush
 When controller is not turned on it's exposed state is nil. If you go
 back an look at params transition table and combine that fact that when
 controller crashes it also exposes nil for an instant. That combination
-of dependencies and params functions allow you to define not how data flows
+of dependencies and params functions allow you to define not only how data flows
 between controllers but also how state of dependencies influences the lifecycle
 of other controllers in a declarative way in a single place.
 
@@ -481,7 +479,213 @@ of every component and it's view function in order to figure that out.
 
 ## By calling back I can reach anyone 
 
+Callbacks are another way of exchange of data between controllers.
+Although you could send find out pid of some other controller and communicate
+directly between controllers that is heavily discouraged.
+
+Let's add a simple notification system to our app. We will
+create controller that holds notifications.
+
+```elixir
+defmodule MyApp.Notifications do
+  use Solve.Controller, events: [:notify, :dismiss]
+
+  @impl Solve.Controller
+  def init(_params, _dependencies), do: []
+
+  def notify(message, state), do: [message | state]
+
+  def dismiss(_, []), do: []
+  def dismiss(index, state) when is_integer(index), do: Enum.delete_at(state, index)
+  def dismiss(_, [_ | rest]), do: rest
+
+  # Expose has to return plain map, so we can't use state directly
+  def expose(state, _deps, _params), do: %{notifications: state}
+end
+```
+
+Now if we want to show add notification every time when credits balance changes
+we can do that by adding callback to the counter controller.
+
+We will refactor it a little bit:
+
+```elixir
+defmodule MyApp.Counter do
+  use Solve.Controller, events: [:increment, :decrement]
+
+  @impl Solve.Controller
+  def init(_params, _dependencies), do: %{count: 0}
+
+  def increment(nil, state, _deps, callbacks), do: update_count(state, 1, callbacks)
+  def increment(val, state, _deps, callbacks), do: update_count(state, val, callbacks)
+
+  def decrement(nil, state, _deps, callbacks), do: update_count(state, -1, callbacks)
+  def decrement(val, state, _deps, callbacks), do: update_count(state, -val, callbacks)
+
+  defp update_count(state = %{count: count}, val, %{count_updated_by: count_updated_by}) do
+    count_updated_by.(val)
+    %{state | count: count + val}
+  end
+end
+```
+
+What we did here is specified that in events we expect callbacks map
+to contain anonymous function with arity 1 under a `:count_updated_by`
+
+Now we can leverage callback to dispatch notification on every counter change.
+Having overview of that connection directly in the app.
+
+```elixir
+defmodule MyApp.App do
+  use Solve
+
+  @impl Solve
+  def controllers do
+  [
+    controller!(name: :notifications, module: MyApp.Notifications),
+    controller!(
+      name: :credits,
+      module: MyApp.Counter,
+      callbacks: %{
+        count_updated_by: fn value ->
+          Solve.dispatch(:notifications, :notify, "Credits change: #{value}")
+        end
+      }
+    )
+  ]
+  end
+end
+```
+
+```
+iex(4)> {:ok, app_pid} = MyApp.App.start_link()
+{:ok, #PID<0.200.0>}
+iex(5)> Solve.dispatch(app_pid, :credits, :increment, 300)
+:ok
+iex(6)> Solve.subscribe(app_pid, :notifications)
+%{notifications: ["Credits change: 300"]}
+iex(7)> Solve.dispatch(app_pid, :credits, :decrement, 200)
+:ok
+iex(8)> flush
+%Solve.Message{
+  type: :update,
+  payload: %Solve.Update{
+    app: #PID<0.200.0>,
+    controller_name: :notifications,
+    exposed_state: %{
+      notifications: ["Credits change: -200", "Credits change: 300"]
+    }
+  }
+}
+:ok
+```
+
+Callback allow for a direct dispatch to any other controller breaking out of dependencies graph.
+Specifying them on application level allows for all of cross controller
+connections to be visible in a single place.
+
+Be careful not to create loops when using them.
+
 ## In a nutshell I am a GenServer
+
+Controllers are built on top of GenServer and they retain `handle_info` from
+a GenServer expanding on it to have full array of solve controller arguments
+so any of the following are valid implementation:
+
+```elixir
+def handle_info(message, state)
+def handle_info(message, state, dependencies)
+def handle_info(message, state, dependencies, callbacks)
+def handle_info(message, state, dependencies, callbacks, init_params)
+```
+
+This allows you to easily subscribe to pub/sub and exchange messages
+with other processes in your BEAM cluster.
+
+We can easily leverage it to make our notifications automatically disappear
+after 5 seconds.
+
+```elixir
+defmodule MyApp.Notifications do
+  use Solve.Controller, events: [:notify, :dismiss]
+
+  @impl Solve.Controller
+  def init(_params, _dependencies), do: []
+
+  def notify(message, state) do
+    Process.send_after(self(), :dismiss_last, :timer.seconds(5))
+    [message | state]
+  end
+
+  def dismiss(_, []), do: []
+  def dismiss(index, state) when is_integer(index), do: List.delete_at(state, index)
+  def dismiss(_, [_ | rest]), do: rest
+
+  def handle_info(:dismiss_last, state), do: Enum.drop(state, -1)
+
+  # Expose has to return plain map, so we can't use state directly
+  def expose(state, _deps, _params), do: %{notifications: state}
+end
+```
+
+Keeping counter and application same as before.
+
+```
+iex(26)> {:ok, app_pid} = MyApp.App.start_link()
+{:ok, #PID<0.236.0>}
+iex(27)> Solve.subscribe(app_pid, :notifications)
+%{notifications: []}
+iex(28)> Solve.dispatch(app_pid, :credits, :increment, 300)
+:ok
+iex(29)> Solve.dispatch(app_pid, :credits, :decrement, 200)
+:ok
+iex(30)> flush
+%Solve.Message{
+  type: :update,
+  payload: %Solve.Update{
+    app: #PID<0.233.0>,
+    controller_name: :notifications,
+    exposed_state: %{notifications: []}
+  }
+}
+%Solve.Message{
+  type: :update,
+  payload: %Solve.Update{
+    app: #PID<0.236.0>,
+    controller_name: :notifications,
+    exposed_state: %{notifications: ["Credits change: 300"]}
+  }
+}
+%Solve.Message{
+  type: :update,
+  payload: %Solve.Update{
+    app: #PID<0.236.0>,
+    controller_name: :notifications,
+    exposed_state: %{
+      notifications: ["Credits change: -200", "Credits change: 300"]
+    }
+  }
+}
+%Solve.Message{
+  type: :update,
+  payload: %Solve.Update{
+    app: #PID<0.236.0>,
+    controller_name: :notifications,
+    exposed_state: %{notifications: ["Credits change: -200"]}
+  }
+}
+:ok
+iex(31)> flush
+%Solve.Message{
+  type: :update,
+  payload: %Solve.Update{
+    app: #PID<0.236.0>,
+    controller_name: :notifications,
+    exposed_state: %{notifications: []}
+  }
+}
+:ok
+```
 
 ## In a collection I am still individual
 
@@ -493,8 +697,8 @@ of every component and it's view function in order to figure that out.
 
 ## Acknowledgements and similar projects
 
-Solve is based on [Keechma Next](https://github.com/keechma/keechma-next/) for clojurescript.
+Solve is based on [Keechma Next](https://github.com/keechma/keechma-next/), a clojurescript web framework.
 It inherits general concept and is a spiritual successor to it, adapted to elixir with 
-tweaks to fit into the ecosystem. 
+tweaks to fit into the OTP ecosystem.
 
-Closest project with conceptually simialr architecture is [Bonsai](https://github.com/janestreet/bonsai) used by Jane Street
+Closest project with conceptually similar architecture is [Bonsai](https://github.com/janestreet/bonsai) an OCaml web framework by Jane Street
