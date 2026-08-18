@@ -522,18 +522,19 @@ defmodule MyApp.Counter do
   def decrement(nil, state, _deps, callbacks), do: update_count(state, -1, callbacks)
   def decrement(val, state, _deps, callbacks), do: update_count(state, -val, callbacks)
 
-  defp update_count(state = %{count: count}, val, %{count_updated_by: count_updated_by}) do
-    count_updated_by.(val)
+  defp update_count(state = %{count: count}, val, callbacks) do
+    Map.get(callbacks, :count_updated_by) && callbacks.count_updated_by.(val)
     %{state | count: count + val}
   end
 end
 ```
 
-What we did here is specified that in events we expect callbacks map
-to contain anonymous function with arity 1 under a `:count_updated_by`
+We execute callback named `:count_updated_by` with arity 1
+every time value gets updated.
 
-Now we can leverage callback to dispatch notification on every counter change.
-Having overview of that connection directly in the app.
+We can leverage callback to dispatch notification on every counter change.
+Since callbacks are defined directly in application we get clear overview
+of communication between controllers.
 
 ```elixir
 defmodule MyApp.App do
@@ -687,13 +688,106 @@ iex(31)> flush
 :ok
 ```
 
-## In a collection I am still individual
+## In a collective I still have my identity
 
+Controllers we have been using so far are were all singleton variant,
+meaning atom used for their name is also their id.
 
+There is also collection variant of controller where same controller is
+used to dynamically create collection of controllers each having it's own id.
 
+Collections are created by providing collect function instead of params function
+it needs to return list of `{id, [params: params]}` pairs. For each provided pair a new
+controller is spawned.
 
+You can provide additional callbacks to each controller in collection returning
+`{id, [params: <params>, callbacks: <callbacks>]}` pattern from the collect instead.
 
+We can demonstrate collections with counter controller implementation we already have.
+
+```elixir
+defmodule MyApp.App do
+  use Solve
+
+  @impl Solve
+  def controllers do
+  [
+    controller!(name: :n_counters, module: MyApp.Counter),
+    controller!(
+      name: :counter,
+      module: MyApp.Counter,
+      variant: :collection,
+      dependencies: [:n_counters],
+      collect: fn %{dependencies: %{n_counters: %{count: count}}} ->
+        if count > 0,
+          do: Enum.map(1..count, fn id -> {id, true} end),
+          else: []
+      end
+    )
+  ]
+  end
+end
+```
+
+```
+iex(45)> {:ok, app_pid} = MyApp.App.start_link()
+{:ok, #PID<0.365.0>}
+iex(46)> Solve.dispatch(app_pid, :n_counters, :increment, 3)
+:ok
+```
+At this point controller under id 3 is initialized
+```
+iex(48)> Solve.subscribe(app_pid, {:counter, 3})
+%{count: 0}
+iex(49)> Solve.dispatch(app_pid, {:counter, 3}, :increment, 100)
+:ok
+iex(50)> flush
+%Solve.Message{
+  type: :update,
+  payload: %Solve.Update{
+    app: #PID<0.365.0>,
+    controller_name: {:counter, 3},
+    exposed_state: %{count: 100}
+  }
+}
+:ok
+```
+If we decrease number of counters controller under id 3 will disappear
+```
+iex(51)> Solve.dispatch(app_pid, :n_counters, :decrement, 1)
+:ok
+iex(52)> flush
+%Solve.Message{
+  type: :update,
+  payload: %Solve.Update{
+    app: #PID<0.365.0>,
+    controller_name: {:counter, 3},
+    exposed_state: nil
+  }
+}
+:ok
+```
+Once reinitialized it will start from 0 again
+```
+iex(53)> Solve.dispatch(app_pid, :n_counters, :increment, 1)
+:ok
+iex(54)> flush
+%Solve.Message{
+  type: :update,
+  payload: %Solve.Update{
+    app: #PID<0.365.0>,
+    controller_name: {:counter, 3},
+    exposed_state: %{count: 0}
+  }
+}
+:ok
+```
+
+Bit of caution here, collections are easily misused and in a lot of
+use cases similar solution can be achieved by using single controller
+with more functionality folded into it.
 ...
+
 
 ## Acknowledgements and similar projects
 
