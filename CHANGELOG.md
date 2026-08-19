@@ -1,4 +1,9 @@
 # Changelog
+## [0.2.2] - 2026-08-19
+
+- Full readme rewrite
+- Allow more collect collection patterns
+- Add direct event dispatch to Solve.Lookup
 
 ## [0.2.1] - 2026-07-16
 

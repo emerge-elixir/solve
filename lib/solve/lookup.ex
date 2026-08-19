@@ -122,15 +122,22 @@ defmodule Solve.Lookup do
     end
   end
 
-  @spec dispatch(target(), atom()) :: :ok
-  def dispatch(controller_name, event) do
-    dispatch(nil, controller_name, event, %{})
-  end
+  @type dispatch_event() ::
+          {pid(), {:solve_event, atom()}} | {pid(), {:solve_event, atom(), term()}}
+
+  @spec dispatch(dispatch_event()) :: :ok
+  def dispatch({pid, message = {:solve_event, _}}) when is_pid(pid), do: send(pid, message)
+  def dispatch({pid, message = {:solve_event, _, _}}) when is_pid(pid), do: send(pid, message)
+
+  @spec dispatch(target() | dispatch_event(), atom() | term()) :: :ok
+  def dispatch({pid, {:solve_event, event}}, payload) when is_pid(pid),
+    do: send(pid, {:solve_event, event, payload})
+
+  def dispatch(controller_name, event), do: dispatch(nil, controller_name, event, %{})
 
   @spec dispatch(target(), atom(), term()) :: :ok
-  def dispatch(controller_name, event, payload) do
-    dispatch(nil, controller_name, event, payload)
-  end
+  def dispatch(controller_name, event, payload),
+    do: dispatch(nil, controller_name, event, payload)
 
   @spec dispatch(GenServer.server() | nil, target(), atom(), term()) :: :ok
   def dispatch(app, controller_name, event, payload) when is_atom(event) do
@@ -419,6 +426,7 @@ defmodule Solve.Lookup do
       collection: 2,
       event: 2,
       event: 3,
+      dispatch: 1,
       dispatch: 2,
       dispatch: 3,
       dispatch: 4,

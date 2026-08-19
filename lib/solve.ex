@@ -558,8 +558,16 @@ defmodule Solve do
   end
 
   defp validate_collected_entry(_controller_name, {id, opts}) when is_list(opts) do
-    callbacks = normalize_callbacks(Keyword.get(opts, :callbacks))
-    {:ok, id, %{params: Keyword.get(opts, :params, true), callbacks: callbacks}}
+    if Keyword.keyword?(opts) do
+      callbacks = normalize_callbacks(Keyword.get(opts, :callbacks))
+      {:ok, id, %{params: Keyword.get(opts, :params, true), callbacks: callbacks}}
+    else
+      {:ok, id, %{params: opts, callbacks: %{}}}
+    end
+  end
+
+  defp validate_collected_entry(_controller_name, {id, params}) do
+    {:ok, id, %{params: params, callbacks: %{}}}
   end
 
   defp validate_collected_entry(controller_name, entry) do
