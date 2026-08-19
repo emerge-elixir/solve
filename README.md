@@ -22,9 +22,22 @@ it would be your model + update function without the render function.
 This kind of separation unlocks interesting use cases, such as interacting with the same
 application from different sources. For example, multiple Nerves devices alongside a web interface at the same time.
 
-It's architecture allows an application to scale to a much higher degree of complexity while
+Its architecture allows an application to scale to a much higher degree of complexity while
 retaining a clear overview of how data flows between components, since lifecycles of components
 are not lumped together with rendering code.
+
+## Project status
+
+This project is still in early stages. Core API parts mentioned in this README are stable
+and are not expected to change significantly.
+
+Implementation is very sloppy and will eventually be completely replaced.
+
+Module documentation is coming soon.
+
+Currently only properly tested with [Emerge](https://emerge.hexdocs.pm/readme.html)
+
+[LiveView](https://phoenix-live-view.hexdocs.pm/Phoenix.LiveView.html) adapter is also in the works.
 
 ## Installation
 
@@ -688,7 +701,7 @@ iex(31)> flush
 :ok
 ```
 
-## In a collective I still have my identity
+## In a collective I retain my identity
 
 Controllers we have been using so far are were all singleton variant,
 meaning atom used for their name is also their id.
@@ -786,8 +799,106 @@ iex(54)> flush
 Bit of caution here, collections are easily misused and in a lot of
 use cases similar solution can be achieved by using single controller
 with more functionality folded into it.
-...
 
+## Looking up data inside of Solve application
+
+We have covered all of the features that solve provides
+for creating applications now we are going to explore how
+to connect it to the presentation layer.
+
+We will use the same app from the previous example
+and create GenServer that uses `Solve.Lookup` to
+render textual representation of application.
+
+```elixir
+defmodule MyApp.Presenter do
+  use GenServer
+  use Solve.Lookup
+
+  # Client
+
+  def add_counter(), do: GenServer.cast(__MODULE__, :add_counter)
+  def increment(id), do: GenServer.cast(__MODULE__, {:increment, id})
+  def show(), do: GenServer.call(__MODULE__, :show) |> IO.puts()
+
+  def start_link(app), do: GenServer.start_link(__MODULE__, app, name: __MODULE__)
+
+  @impl GenServer
+  def init(app), do: {:ok, %{app: app, scene: render(%{app: app})}}
+
+  @impl GenServer
+  def handle_cast(:add_counter, state) do
+    solve(state.app, :n_counters)
+    |> event(:increment)
+    |> dispatch(nil)
+    {:noreply, state}
+  end
+
+  def handle_cast({:increment, id}, state) do
+    solve(state.app, {:counter, id})
+    |> event(:increment)
+    |> dispatch(nil)
+    {:noreply, state}
+  end
+
+  @impl GenServer
+  def handle_call(:show, _from, state), do: {:reply, state.scene, state}
+
+  def render(%{app: app}) do
+    n_counters = solve(app, :n_counters)
+    counters = collection(app, :counter)
+
+    title = "Showing #{n_counters.count} counters"
+    counter_line = fn {id, %{count: count}} -> "Counter(#{id}): #{count}" end
+    [title | Enum.map(counters, counter_line)] |> Enum.intersperse("\n")
+  end
+
+  @impl Solve.Lookup
+  def handle_solve_updated(_updated, state), do: {:ok, %{state | scene: render(state)}}
+end
+```
+
+We are using few convenience helpers from Solve.Lookup here `solve`, `event`, `dispatch` and `collection`
+`solve` and `collection` are cached fetchers. `solve(app, :n_counters)` will fetch state n_counters
+controllers, subscribe to it and cache it to the process dictionary. Next time it is called it will
+used value cached in process dictionary.
+
+`use Solve.Lookup` will add a couple of handle_info clauses that match on Solve.Message, update
+process cache and call `handle_solve_updated` callback.
+
+In example new scene is rendered into GenServer state on each solve update.
+
+`MyApp.Presenter.show()` IO.puts scene from the state that is now always representing
+state of our solve application.
+
+```
+iex(4)> {:ok, app_pid} = MyApp.App.start_link()
+{:ok, #PID<0.199.0>}
+iex(5)> {:ok, presenter_pid} = MyApp.Presenter.start_link(app_pid)
+{:ok, #PID<0.201.0>}
+iex(6)> MyApp.Presenter.show()
+Showing 0 counters
+:ok
+iex(7)> MyApp.Presenter.add_counter()
+:ok
+iex(8)> MyApp.Presenter.show()
+Showing 1 counters
+Counter(1): 0
+:ok
+iex(9)> Solve.dispatch(app_pid, :n_counters, :increment, 3)
+:ok
+iex(10)> Solve.dispatch(app_pid, {:counter, 4}, :increment, 20)
+:ok
+iex(11)> MyApp.Presenter.increment(3)
+:ok
+iex(12)> MyApp.Presenter.show()
+Showing 4 counters
+Counter(1): 0
+Counter(2): 0
+Counter(3): 1
+Counter(4): 20
+:ok
+```
 
 ## Acknowledgements and similar projects
 
