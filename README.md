@@ -7,7 +7,7 @@
 
 Solve is an application framework.
 
-It provides tools to model an application as a graph of reusable state machines,
+It provides tools to model a UI application as a graph of reusable state machines,
 without concerns about how the application is presented to the user or
 how user inputs are routed to the application.
 
@@ -51,17 +51,17 @@ def deps do
 end
 ```
 
-## Writing an application 
+## Writing an application
 
 Building block of Solve application is a **controller**, for a controller to
-do anything it has to live inside of an **application**. Here is a simplest
+do materialize it has to live inside of an **application**. Here is the simplest
 solve application you can make.
 
 ```elixir
 defmodule MyApp.Hello do
   use Solve.Controller
 
-  @impl Solve.Controller 
+  @impl Solve.Controller
   def init(_params, _dependencies), do: %{hello: "Hello"}
 end
 
@@ -73,30 +73,30 @@ defmodule MyApp.App do
 end
 ```
 
-First module defines controller module that initializes with
+The first module defines controller module that initializes with
 internal state of `%{hello: "Hello"}`
 
-Second module defines an app that starts that controller under a name
+The second module defines an app that starts that controller under a name
 `:hello`
 
 
-You can start an app like any GenServer
+You can start an app like any GenServer:
 ```
 iex(4)> {:ok, app_pid} = MyApp.App.start_link()
 {:ok, #PID<0.194.0>}
 ```
-and subscribe to a controller data
+and subscribe to a controller's data
 ```
 iex(5)> Solve.subscribe(app_pid, :hello)
 %{hello: "Hello"}
 ```
-Subscribing to a controller returns it currently exposed data and
+Subscribing to a controller returns its currently exposed data and
 you also receive a message with new information whenever it changes.
 
 ## Exposing data
 
-By default controller exposes it's internal state, that can be modified
-by implementing `expose` function. Result of expose needs to be elixir
+By default controller exposes it's internal state, which can be modified
+by implementing `expose` function. The result of expose needs to be elixir
 map.
 
 
@@ -104,7 +104,7 @@ map.
 defmodule MyApp.Hello do
   use Solve.Controller
 
-  @impl Solve.Controller 
+  @impl Solve.Controller
   def init(_params, _dependencies), do: %{hello: "Hello"}
 
   @impl Solve.Controller
@@ -123,12 +123,12 @@ iex(11)> Solve.subscribe(app_pid, :hello)
 %{exposed: "Hello World"}
 ```
 
-## I have params therfore I am
+## I have params therefore I am
 
 Each controller in an application is defined by a name
 but its lifecycle is determined by params.
 
-In our earlier example we didn't provide `params` for controller in our app
+In our earlier example we didn't provide `params` for the controller in our app
 ```elixir
  controller!(name: :hello, module: MyApp.Hello)
 ```
@@ -136,7 +136,7 @@ in that case solve defaults to
 ```elixir
  controller!(name: :hello, module: MyApp.Hello, params: fn _ -> true end)
 ```
-which means basically means "this controller always running". If we change that to
+which basically means "this controller always running". If we change that to
 ```elixir
  controller!(name: :hello, module: MyApp.Hello, params: fn _ -> false end)
 ```
@@ -151,7 +151,7 @@ nil
 ## If my params change am I still me?
 
 Params with any truthy value will signal an application to turn on a controller,
-however if result of params function change it will affect controller in following way:
+however, if the result of params function change it will affect the controller in the following way:
 
 | Prev   | Current | Prev == Current | Actions |
 | -----  | ------  | ----------------| --------- |
@@ -161,8 +161,8 @@ however if result of params function change it will affect controller in followi
 | truthy | truthy  | false           | Stop the current controller process and start a new one |
 | truthy | truthy  | true            | Do nothing (controller is running)|
 
-Important state change to notice is from one truthy value to different
-truthy value, in that case app will stop current process and start a new one.
+An important state change to notice is from one truthy value to a different
+truthy value, in that case, the app will stop current process and start a new one.
 
 We will get to how params can change but let's introduce some concepts first.
 
@@ -175,7 +175,7 @@ Here is an example of counter that implements `increment` and `decrement` events
 defmodule MyApp.Counter do
   use Solve.Controller, events: [:increment, :decrement]
 
-  @impl Solve.Controller 
+  @impl Solve.Controller
   def init(_params, _dependencies), do: %{count: 0}
 
   def increment(_payload = nil, state = %{count: count}), do: %{state | count: count + 1}
@@ -195,7 +195,7 @@ end
 
 Let's unpack it line by line.
 
-Events for a Controller are declared in use statement.
+Events for a Controller are declared in the use statement.
 ```elixir
 use Solve.Controller, events: [:increment, :decrement]
 ```
@@ -216,7 +216,7 @@ def example_event(event_payload, state, dependencies, callbacks, init_params)
 
 Declaring the same event at multiple arities is a compile error.
 
-Each event handler implementation needs to return new internal state of controller.
+Each event handler implementation needs to return a new internal state of the controller.
 In case of our counter we increment or decrement count by 1 or by provided value.
 ```elixir
 def increment(_payload = nil, state = %{count: count}), do: %{state | count: count + 1}
@@ -236,7 +236,7 @@ iex(7)> Solve.subscribe(app_pid, :counter)
 %{count: 1}
 ```
 
-Since we are subscribed to we will also receive a message for each exposed state change.
+Since we are subscribed, we will also receive a message for each exposed state change.
 ```
 iex(8)> flush
 %Solve.Message{
@@ -250,7 +250,7 @@ iex(8)> flush
 ```
 
 If there is an error in our code and controller crashes, app will start it from a fresh state.
-We can simulate that here by sending payload that doesn't work with `+`.
+We can simulate that here by sending a payload that doesn't work with `+`.
 
 ```
 iex(10)> Solve.dispatch(app_pid, :counter, :increment, 25)
@@ -328,13 +328,13 @@ defmodule MyApp.App do
 end
 ```
 
-I have also sneaked in `:app_params` here. If when starting app you provide params map
+I have also sneaked in `:app_params` here. If, when starting the app you provide a params map
 `MyApp.App.start_link(params: %{name: "The greeted one"})` that map will be available
-to params function of every controller.
+to the params function of every controller.
 
 Controllers cannot be completely detached from their dependencies if they are going to use them,
 they need to be aware of the shape of data that is important to them (although you can take advantage of params
-to introduce some polymorphic getters in form of anonymous functions).
+to introduce some polymorphic getters in the form of anonymous functions).
 
 ```elixir
 defmodule MyApp.Hello do
@@ -351,7 +351,7 @@ end
 ```
 
 In this expose function we are not using state, we are pattern matching directly on
-credits count and since params for our controller is just a string with the name
+credits count and since params for our controller is just a string with the name,
 we are using it directly.
 
 
@@ -363,7 +363,7 @@ iex(5)> Solve.subscribe(app_pid, :hello)
 %{greeting: "Hello The greeted one, you have 0 credits"}
 ```
 
-Now if credits are incremented, counter controller exposes new state and
+Now if credits are incremented, the counter controller exposes new state and
 that triggers expose function of all of the controllers that depend on it
 to be rerun.
 
@@ -382,11 +382,11 @@ iex(7)> flush
 :ok
 ```
 
-Since we didn't subscribe to :credits we only got update message from the `:hello`
+Since we didn't subscribe to :credits, we only got an update message from the `:hello`
 controller.
 
 Params functions in the application can also rely on the dependencies of the controller.
-Let's add another controller to our app that is only on when credits are negative.
+Let's add another controller to our app that is only on when the credits are negative.
 
 ```elixir
 defmodule MyApp.NegativeAlert do
@@ -475,29 +475,29 @@ iex(25)> flush
 :ok
 ```
 
-When controller is not turned on it's exposed state is nil. If you go
-back an look at params transition table and combine that fact that when
-controller crashes it also exposes nil for an instant. That combination
+When controller is not turned on, it's exposed state is nil. If you go
+back an look at the params transition table and combine that with the fact that when
+a controller crashes it also exposes nil for an instant. That combination
 of dependencies and params functions allow you to define not only how data flows
-between controllers but also how state of dependencies influences the lifecycle
+between controllers but also how the state of dependencies influences the lifecycle
 of other controllers in a declarative way in a single place.
 
-There are few restriction on dependencies. Circular dependencies
-are not allowed. `def controllers` deliberately has arity of 0 and
-dependency graph is checked for circular dependencies. This is to
-make whole graph eventually consistent but also for clarity. One of the
+There are few a restriction on dependencies to be aware of. Circular dependencies
+are not allowed. `def controllers` deliberately has arity of 0, should be static
+ and the dependency graph is checked for circular dependencies. This is to
+make the whole graph eventually consistent but also for clarity. One of the
 main advantages of Solve is high level overview of application visible in singular file.
 Opposed to component systems that force you to read implementation
-of every component and it's view function in order to figure that out.
+of every component and its view function in order to figure out the topology.
 
-## By calling back I can reach anyone 
+## By calling back I can reach anyone
 
-Callbacks are another way of exchange of data between controllers.
-Although you could send find out pid of some other controller and communicate
-directly between controllers that is heavily discouraged.
+Callbacks are another way of exchanging of data between controllers.
+Although you could send find out the pid of some other controller and communicate
+directly between controllers, that is heavily discouraged.
 
 Let's add a simple notification system to our app. We will
-create controller that holds notifications.
+create a controller that holds notifications.
 
 ```elixir
 defmodule MyApp.Notifications do
@@ -517,8 +517,8 @@ defmodule MyApp.Notifications do
 end
 ```
 
-Now if we want to show add notification every time when credits balance changes
-we can do that by adding callback to the counter controller.
+Now if we want to add a notification every time the credits balance changes
+we can do that by adding a callback to the counter controller.
 
 We will refactor it a little bit:
 
@@ -542,11 +542,11 @@ defmodule MyApp.Counter do
 end
 ```
 
-We execute callback named `:count_updated_by` with arity 1
-every time value gets updated.
+We execute a callback named `:count_updated_by` with arity 1
+every time the value gets updated.
 
-We can leverage callback to dispatch notification on every counter change.
-Since callbacks are defined directly in application we get clear overview
+We can leverage the callback to dispatch a notification on every counter change.
+Since callbacks are defined directly in the application, we get clear overview
 of communication between controllers.
 
 ```elixir
@@ -594,18 +594,18 @@ iex(8)> flush
 :ok
 ```
 
-Callback allow for a direct dispatch to any other controller breaking out of dependencies graph.
-Specifying them on application level allows for all of cross controller
-connections to be visible in a single place.
+Callback allow for a direct dispatch to any other controller, breaking
+the data flow out of the dependencies graph.
+Specifying them at the application level allows for all of cross controller
+communication to be visible in a single place.
 
-Be careful not to create loops when using them.
+Be careful not to create loops when using callbacks.
 
 ## In a nutshell I am a GenServer
 
 Controllers are built on top of GenServer and they retain `handle_info` from
-a GenServer expanding on it to have full array of solve controller arguments
-so any of the following are valid implementation:
-
+a GenServer, expanding on it to have the full array of Solve controller arguments,
+that means you can implement any of the following:
 ```elixir
 def handle_info(message, state)
 def handle_info(message, state, dependencies)
@@ -613,10 +613,10 @@ def handle_info(message, state, dependencies, callbacks)
 def handle_info(message, state, dependencies, callbacks, init_params)
 ```
 
-This allows you to easily subscribe to pub/sub and exchange messages
-with other processes in your BEAM cluster.
+This allows you to interop with other processes in your BEAM cluster
+while keeping solve event semantics.
 
-We can easily leverage it to make our notifications automatically disappear
+We can use this to make our notifications automatically disappear
 after 5 seconds.
 
 ```elixir
@@ -680,6 +680,9 @@ iex(30)> flush
     }
   }
 }
+```
+After few seconds
+```
 %Solve.Message{
   type: :update,
   payload: %Solve.Update{
@@ -689,6 +692,9 @@ iex(30)> flush
   }
 }
 :ok
+```
+After another 5 seconds
+```
 iex(31)> flush
 %Solve.Message{
   type: :update,
@@ -703,20 +709,20 @@ iex(31)> flush
 
 ## In a collective I retain my identity
 
-Controllers we have been using so far are were all singleton variant,
-meaning atom used for their name is also their id.
+Controllers we have been using so far were all the singleton variant,
+meaning the atom used for their name is also their id.
 
-There is also collection variant of controller where same controller is
-used to dynamically create collection of controllers each having it's own id.
+There is also a collection variant of a controller where the same controller module is
+used to dynamically create collection of controllers, each with it's own id.
 
-Collections are created by providing collect function instead of params function
-it needs to return list of `{id, [params: params]}` pairs. For each provided pair a new
+Collections are created by providing a `collect` function instead of a `params` function.
+It needs to return a list of `{id, params}` pairs. For each provided pair a new
 controller is spawned.
 
-You can provide additional callbacks to each controller in collection returning
-`{id, [params: <params>, callbacks: <callbacks>]}` pattern from the collect instead.
+You can provide additional callbacks to each controller in the collection by returning
+`{id, [params: <params>, callbacks: <callbacks>]}` pattern from the collect function instead.
 
-We can demonstrate collections with counter controller implementation we already have.
+We can demonstrate collections reusing the counter controller implementation we already have.
 
 ```elixir
 defmodule MyApp.App do
@@ -748,7 +754,7 @@ iex(45)> {:ok, app_pid} = MyApp.App.start_link()
 iex(46)> Solve.dispatch(app_pid, :n_counters, :increment, 3)
 :ok
 ```
-At this point controller under id 3 is initialized
+At this point, the controller under id 3 is initialized
 ```
 iex(48)> Solve.subscribe(app_pid, {:counter, 3})
 %{count: 0}
@@ -765,7 +771,7 @@ iex(50)> flush
 }
 :ok
 ```
-If we decrease number of counters controller under id 3 will disappear
+If we decrease the number of counters controller under id 3 will disappear
 ```
 iex(51)> Solve.dispatch(app_pid, :n_counters, :decrement, 1)
 :ok
@@ -780,7 +786,7 @@ iex(52)> flush
 }
 :ok
 ```
-Once reinitialized it will start from 0 again
+Once reinitialized, it will start from 0 again
 ```
 iex(53)> Solve.dispatch(app_pid, :n_counters, :increment, 1)
 :ok
@@ -796,18 +802,18 @@ iex(54)> flush
 :ok
 ```
 
-Bit of caution here, collections are easily misused and in a lot of
-use cases similar solution can be achieved by using single controller
+Bit of caution here: collections are easily misused and in a lot of
+use cases a similar solution can be achieved by using single controller
 with more functionality folded into it.
 
 ## Looking up data inside of Solve application
 
-We have covered all of the features that solve provides
-for creating applications now we are going to explore how
+We have covered all of the features that Solve provides
+for creating applications at the moment. Now we are going to explore how
 to connect it to the presentation layer.
 
 We will use the same app from the previous example
-and create GenServer that uses `Solve.Lookup` to
+and create a GenServer that uses `Solve.Lookup` to
 render textual representation of application.
 
 ```elixir
@@ -858,18 +864,19 @@ defmodule MyApp.Presenter do
 end
 ```
 
-We are using few convenience helpers from Solve.Lookup here `solve`, `event`, `dispatch` and `collection`
-`solve` and `collection` are cached fetchers. `solve(app, :n_counters)` will fetch state n_counters
-controllers, subscribe to it and cache it to the process dictionary. Next time it is called it will
-used value cached in process dictionary.
+We are using a few convenience helpers from Solve.Lookup here `solve`, `event`, `dispatch` and `collection`
+`solve` and `collection` are cached fetchers. `solve(app, :n_counters)` will fetch the state of the n_counters
+controller, subscribe to it and cache it to the process dictionary. Next time it is called it will
+use the value cached in process dictionary.
 
-`use Solve.Lookup` will add a couple of handle_info clauses that match on Solve.Message, update
-process cache and call `handle_solve_updated` callback.
+`use Solve.Lookup` will add a couple of handle_info clauses that match on Solve.Message.
+When message is received they will update
+the process cache and call the `handle_solve_updated` callback.
 
-In example new scene is rendered into GenServer state on each solve update.
+In the example, a new scene is rendered into GenServer state on each solve update.
 
-`MyApp.Presenter.show()` IO.puts scene from the state that is now always representing
-state of our solve application.
+`MyApp.Presenter.show()` IO.puts the scene from the state, it now always
+reflects the state of our Solve application.
 
 ```
 iex(4)> {:ok, app_pid} = MyApp.App.start_link()
@@ -903,7 +910,7 @@ Counter(4): 20
 ## Acknowledgements and similar projects
 
 Solve is based on [Keechma Next](https://github.com/keechma/keechma-next/), a clojurescript web framework.
-It inherits general concept and is a spiritual successor to it, adapted to elixir with 
+It inherits the general concept and is a spiritual successor to it, adapted to elixir with
 tweaks to fit into the OTP ecosystem.
 
-Closest project with conceptually similar architecture is [Bonsai](https://github.com/janestreet/bonsai) an OCaml web framework by Jane Street
+The Closest project with similar architecture is [Bonsai](https://github.com/janestreet/bonsai) an OCaml web framework by Jane Street
