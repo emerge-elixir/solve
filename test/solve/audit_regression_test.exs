@@ -189,6 +189,18 @@ defmodule Solve.AuditRegressionTest do
     end
   end
 
+  test "lookup resolves named app restarts rather than reusing a dead instance" do
+    name = __MODULE__.Named
+    first = start_app(Chain, name: name)
+    assert Solve.Lookup.solve(name, :driver).value == 1
+    GenServer.stop(first, :shutdown)
+    second = start_app(Chain, name: name)
+    set_and_wait(Solve.controller_pid(second, :driver), 7)
+    assert Solve.Lookup.solve(name, :driver).value == 7
+    {pid, _} = Solve.Lookup.event(Solve.Lookup.solve(name, :driver), :set)
+    assert pid == Solve.controller_pid(second, :driver)
+  end
+
   test "collection identity and membership use exact comparisons" do
     collection = Collection.empty() |> Collection.put(1, :integer) |> Collection.put(1.0, :float)
     assert Collection.delete(collection, 1.0) == %Collection{ids: [1], items: %{1 => :integer}}
@@ -238,6 +250,53 @@ defmodule Solve.AuditRegressionTest do
 
       assert Solve.DependencyGraph.compile([spec]) == {:error, reason}
     end
+  end
+
+  test "warm singleton and collection lookups make no coordinator calls" do
+    app = start_app(Items)
+    Solve.Lookup.solve(app, :catalog)
+    Solve.Lookup.collection(app, :items)
+    :sys.statistics(app, true)
+
+    for _ <- 1..20 do
+      assert Solve.Lookup.solve(app, :catalog).value != nil
+      assert Solve.Lookup.collection(app, :items).ids == [1]
+    end
+
+    {:ok, statistics} = :sys.statistics(app, :get)
+    assert statistics[:messages_in] == 0
+    assert statistics[:messages_out] == 0
+  end
+
+  test "collection-only lookup refreshes routing on same-value child replacement" do
+    app = start_app(Items)
+    initial = Solve.Lookup.collection(app, :items)
+    {old, _} = Solve.Lookup.event(initial.items[1], :set)
+    set_and_wait(Solve.controller_pid(app, :catalog), [{1, %{value: false, token: :new}}])
+
+    assert_receive %Solve.Message{payload: %Solve.Update{controller_name: :items}} = update
+    assert Solve.Lookup.handle_message(update) != %{}
+    next = Solve.Lookup.collection(app, :items)
+    assert Map.drop(next.items[1], [:events_]) == Map.drop(initial.items[1], [:events_])
+    {new, _} = Solve.Lookup.event(next.items[1], :set)
+    assert new != old
+    assert new == Solve.controller_pid(app, {:items, 1})
+  end
+
+  test "lookup rejects old versions and versionless overwrites of runtime refs" do
+    app = start_app(Chain)
+    assert Solve.Lookup.solve(app, :driver).value == 1
+    old = Solve.subscribe_snapshot(app, :driver)
+    set_and_wait(old.pid, 2)
+
+    assert_receive %Solve.Message{
+                     payload: %Solve.Update{controller_name: :driver, exposed_state: %{value: 2}}
+                   } = update
+
+    assert Solve.Lookup.handle_message(update) != %{}
+    assert Solve.Lookup.handle_message(Solve.Update.message(old)) == %{}
+    assert Solve.Lookup.handle_message(Solve.Message.update(app, :driver, %{value: 999})) == %{}
+    assert Solve.Lookup.solve(app, :driver).value == 2
   end
 
   test "managed dependencies ignore older revisions, generations and unversioned messages" do
@@ -473,6 +532,102 @@ defmodule Solve.AuditRegressionTest do
     assert_receive {:DOWN, ^ref, :process, ^supervisor, _}, 2_000
     refute Process.alive?(first)
     refute Process.alive?(second)
+  end
+
+  test "lookup monitor forwarding and cleanup discard retired refs only" do
+    app = start_app(Chain)
+    unrelated = Process.monitor(self())
+    Solve.Lookup.solve(app, :driver)
+    GenServer.stop(app)
+    assert_receive {:solve_lookup_down, _, :process, ^app, _} = down
+    assert Solve.Lookup.handle_message(down) == %{}
+    assert Solve.Lookup.handle_message(down) == %{}
+    assert Solve.Lookup.cleanup() == :ok
+    assert catch_exit(Solve.Lookup.solve(app, :driver))
+    assert Process.demonitor(unrelated)
+    assert Solve.Lookup.handle_message(Solve.Message.update(app, :driver, %{value: 999})) == %{}
+  end
+
+  test "global and via names resolve to canonical app instances" do
+    registry = __MODULE__.Registry
+    start_supervised!({Registry, keys: :unique, name: registry})
+
+    for name <- [{:global, {__MODULE__, make_ref()}}, {:via, Registry, {registry, :app}}] do
+      app = start_app(Chain, name: name)
+      assert Solve.Lookup.solve(name, :driver).value == 1
+      assert Solve.dispatch(name, :driver, :set, 4) == :ok
+      eventually(fn -> Solve.subscribe(app, :driver).value == 4 end)
+
+      assert_receive %Solve.Message{
+                       payload: %Solve.Update{
+                         app: ^app,
+                         controller_name: :driver,
+                         exposed_state: %{value: 4}
+                       }
+                     } = update
+
+      Solve.Lookup.handle_message(update)
+      assert Solve.Lookup.solve(name, :driver) == Solve.Lookup.solve(app, :driver)
+    end
+  end
+
+  test "mixed replacement, filtering, subscriptions and named restart converge without leaks" do
+    name = __MODULE__.Stress
+    app = start_app(Items, name: name)
+    catalog = Solve.controller_pid(app, :catalog)
+    identity = Solve.subscribe(app, :projection).identity
+    Solve.Lookup.collection(name, :items)
+    Solve.Lookup.solve(name, {:items, 1})
+
+    for step <- 1..20 do
+      old_child = Solve.controller_pid(app, {:items, 1})
+      value = rem(step, 2) == 0
+      entries = [{1, %{value: value, token: step}}, {step + 1, %{value: false}}]
+
+      suspended(app, fn ->
+        set_and_wait(catalog, entries)
+        set_and_wait(old_child, :obsolete)
+      end)
+
+      eventually(fn -> Solve.controller_pid(app, {:items, 1}) != old_child end)
+      eventually(fn -> Solve.subscribe(app, :items).items[1].value === value end)
+
+      eventually(fn ->
+        Solve.subscribe(app, :projection).values == if(value, do: [true], else: [])
+      end)
+
+      consume_lookup_updates()
+      assert Solve.Lookup.collection(name, :items).ids == [1, step + 1]
+      assert Solve.Lookup.solve(name, {:items, 1}).value === value
+      assert Solve.subscribe(app, :projection).identity == identity
+      assert map_size(:sys.get_state(app).targets) == 4
+    end
+
+    old_update = Solve.subscribe_snapshot(app, {:items, 1})
+    children = Enum.map(:sys.get_state(app).targets, fn {_, record} -> record.pid end)
+    GenServer.stop(app)
+    assert Enum.all?(children, &(not Process.alive?(&1)))
+    replacement = start_app(Items, name: name)
+    assert Solve.Lookup.collection(name, :items).ids == [1]
+    assert Solve.Lookup.handle_message(Solve.Update.message(old_update)) == %{}
+    assert Solve.Lookup.solve(name, {:items, 1}).value == false
+
+    assert Solve.Lookup.event(Solve.Lookup.solve(name, {:items, 1}), :set) ==
+             {Solve.controller_pid(replacement, {:items, 1}), {:solve_event, :set}}
+  end
+
+  defp consume_lookup_updates do
+    receive do
+      %Solve.Message{} = message ->
+        Solve.Lookup.handle_message(message)
+        consume_lookup_updates()
+
+      {:solve_lookup_down, _, :process, _, _} = message ->
+        Solve.Lookup.handle_message(message)
+        consume_lookup_updates()
+    after
+      0 -> :ok
+    end
   end
 
   defp start_app(module, opts \\ []) do

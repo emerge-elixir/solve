@@ -247,6 +247,11 @@ defmodule Solve.LookupTest do
       end
     end
 
+    def handle_info({:solve_lookup_down, _, :process, _, _} = message, state) do
+      handle_message(message)
+      {:noreply, state}
+    end
+
     def handle_info(message, state) do
       {:noreply, %{state | unhandled: [message | state.unhandled]}}
     end
