@@ -31,8 +31,7 @@ are not lumped together with rendering code.
 This project is still in early stages. Core API parts mentioned in this README are stable
 and are not expected to change significantly.
 
-The runtime is actively evolving. Private runtime state and internal subscription protocols are not
-a stable API. See [the architecture guide](ARCHITECTURE.md) for lifecycle and consistency guarantees.
+Implementation is very sloppy and will eventually be completely replaced.
 
 Currently only properly tested with [Emerge](https://emerge.hexdocs.pm/readme.html)
 
@@ -49,37 +48,6 @@ def deps do
   ]
 end
 ```
-
-## Runtime and compatibility notes
-
-- Use `Solve.dispatch(app, target, event, payload)` for explicit app dispatch. Pass `%{}`
-  when there is no payload. Implicit `/2` and `/3` are for controller callback context;
-  there is no explicit-app three-argument overload.
-- Each app owns a controller supervisor. Normal shutdown, failed startup, and owner death
-  clean up its controllers. Initialization defaults to 5 seconds; override it with a positive
-  `controller_start_timeout` option in milliseconds. Controller shutdown is bounded to 1 second.
-- `Solve.subscribe/3` normally returns the controller's current value. If a live controller
-  cannot answer within 1 second, it returns the app's last accepted snapshot and retries
-  attachment in the background; a timeout does not restart the controller.
-- Dependency graphs are eventually consistent. Collection dependencies are installed as whole,
-  versioned snapshots, so user callbacks never enumerate partially applied membership/order changes.
-- `Solve.Lookup` caches values and event refs without coordinator calls on warm reads. Named-app
-  restarts trigger resubscription on the next lookup. Direct event tuples remain tied to the
-  original controller instance; use fresh lookup values after updates or explicit dispatch for routing.
-- Auto lookup mode handles its own `:solve_lookup_down` monitor messages. In manual/helper mode,
-  forward these messages to `Solve.Lookup.handle_message/1` as well as update envelopes:
-
-  ```elixir
-  def handle_info({:solve_lookup_down, _, :process, _, _} = message, state) do
-    Solve.Lookup.handle_message(message)
-    {:noreply, state}
-  end
-  ```
-
-Raw update subscribers implementing their own caches should compare the optional update `version`
-metadata. `Solve.Lookup` rejects obsolete versions automatically. Versionless manually constructed
-updates cannot overwrite an already versioned runtime ref. `Solve.Lookup.cleanup/0` clears retired
-app refs and monitors without unsubscribing from live apps.
 
 ## Writing an application
 
@@ -109,6 +77,9 @@ internal state of `%{hello: "Hello"}`
 The second module defines an app that starts that controller under a name
 `:hello`
 
+
+Each example assumes a fresh app. Stop the previous one with `GenServer.stop(app_pid)`
+before starting a new app definition.
 
 You can start an app like any GenServer:
 ```
@@ -234,7 +205,7 @@ This module now needs to implement at least one function named `increment`
 and one function named `decrement`.
 
 Solve will accept function definitions with arity `1-5` so
-for `events: [:example event]` one of these needs to be implemented.
+for `events: [:example_event]` one of these needs to be implemented.
 
 ```elixir
 def example_event(event_payload)
@@ -254,6 +225,7 @@ def increment(val, state = %{count: count}), do: %{state | count: count + val}
 ```
 
 If we start our app we can use `Solve.dispatch/4` to send events to controllers.
+Dispatch is asynchronous; the examples show results after updates have propagated.
 
 ```
 iex(4)> {:ok, app_pid} = MyApp.App.start_link()
@@ -267,6 +239,7 @@ iex(7)> Solve.subscribe(app_pid, :counter)
 ```
 
 Since we are subscribed, we will also receive a message for each exposed state change.
+Message examples show only the relevant fields.
 ```
 iex(8)> flush
 %Solve.Message{
@@ -539,7 +512,7 @@ defmodule MyApp.Notifications do
   def notify(message, state), do: [message | state]
 
   def dismiss(_, []), do: []
-  def dismiss(index, state) when is_integer(index), do: Enum.delete_at(state, index)
+  def dismiss(index, state) when is_integer(index), do: List.delete_at(state, index)
   def dismiss(_, [_ | rest]), do: rest
 
   # Expose has to return plain map, so we can't use state directly
@@ -687,14 +660,6 @@ iex(30)> flush
 %Solve.Message{
   type: :update,
   payload: %Solve.Update{
-    app: #PID<0.233.0>,
-    controller_name: :notifications,
-    exposed_state: %{notifications: []}
-  }
-}
-%Solve.Message{
-  type: :update,
-  payload: %Solve.Update{
     app: #PID<0.236.0>,
     controller_name: :notifications,
     exposed_state: %{notifications: ["Credits change: 300"]}
@@ -711,7 +676,7 @@ iex(30)> flush
   }
 }
 ```
-After few seconds
+Five seconds after the first notification was added
 ```
 %Solve.Message{
   type: :update,
@@ -723,7 +688,7 @@ After few seconds
 }
 :ok
 ```
-After another 5 seconds
+When the second notification expires
 ```
 iex(31)> flush
 %Solve.Message{
@@ -905,8 +870,9 @@ the process cache and call the `handle_solve_updated` callback.
 
 In the example, a new scene is rendered into GenServer state on each solve update.
 
-`MyApp.Presenter.show()` IO.puts the scene from the state, it now always
-reflects the state of our Solve application.
+`MyApp.Presenter.show()` IO.puts the scene from the state. It reflects the application
+once pending updates have been processed. Wait for new counters to appear before
+sending events to them.
 
 ```
 iex(4)> {:ok, app_pid} = MyApp.App.start_link()
