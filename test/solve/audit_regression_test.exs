@@ -3,6 +3,13 @@ defmodule Solve.AuditRegressionTest do
 
   alias Solve.Collection
 
+  defmodule Value do
+    use Solve.Controller, events: [:set]
+    @impl true
+    def init(params, _dependencies), do: Map.take(params, [:value])
+    def set(value), do: %{value: value}
+  end
+
   test "collection identity and membership use exact comparisons" do
     collection = Collection.empty() |> Collection.put(1, :integer) |> Collection.put(1.0, :float)
     assert Collection.delete(collection, 1.0) == %Collection{ids: [1], items: %{1 => :integer}}
@@ -17,6 +24,36 @@ defmodule Solve.AuditRegressionTest do
     for ids <- [[:missing], [:a, :a], []] do
       assert_raise ArgumentError, fn -> Collection.reorder(collection, ids) end
     end
+  end
+
+  test "pre-populated bindings cannot hide self or unknown graph edges" do
+    for {source, reason} <- [
+          a: {:self_dependency, :a},
+          missing: {:unknown_dependency, :a, :missing}
+        ] do
+      spec =
+        Solve.ControllerSpec.controller!(
+          name: :a,
+          module: Value,
+          dependency_bindings: [%{key: :dep, source: source, kind: :single, filter: nil}]
+        )
+
+      assert Solve.DependencyGraph.compile([spec]) == {:error, reason}
+    end
+  end
+
+  test "graph canonicalization is idempotent and rejects inconsistent or cyclic bindings" do
+    import Solve.ControllerSpec
+    a = controller!(name: :a, module: Value)
+    b = controller!(name: :b, module: Value, dependencies: [:a])
+    assert {:ok, normalized} = Solve.ControllerSpec.validate(b)
+    assert Solve.ControllerSpec.validate(normalized) == {:ok, normalized}
+
+    assert {:error, {:inconsistent_dependency_sources, :b}} =
+             Solve.ControllerSpec.validate(%{normalized | dependencies: [:wrong]})
+
+    circular = %{a | dependency_bindings: [%{key: :b, source: :b, kind: :single, filter: nil}]}
+    assert {:error, {:cycle, _}} = Solve.DependencyGraph.compile([circular, normalized])
   end
 
   test "bulk collections and operation sequences preserve exact ordered keys" do
