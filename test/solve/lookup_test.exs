@@ -247,6 +247,11 @@ defmodule Solve.LookupTest do
       end
     end
 
+    def handle_info({:solve_lookup_down, _, :process, _, _} = message, state) do
+      handle_message(message)
+      {:noreply, state}
+    end
+
     def handle_info(message, state) do
       {:noreply, %{state | unhandled: [message | state.unhandled]}}
     end
@@ -400,10 +405,14 @@ defmodule Solve.LookupTest do
   end
 
   test "handle_message/1 updates local lookup cache for update envelopes" do
-    app = start_app(LookupSolve, %{initial: 1})
+    app = start_app(LookupSolve, %{initial: 4})
+    assert Solve.Lookup.solve(app, :counter).count == 4
+    Solve.dispatch(app, :counter, :increment, %{})
+
+    assert_receive %Solve.Message{payload: %Solve.Update{exposed_state: %{count: 5}}} = message
 
     assert %{^app => %Solve.Lookup.Updated{refs: [:counter], collections: []}} =
-             Solve.Lookup.handle_message(Solve.Message.update(app, :counter, %{count: 5}))
+             Solve.Lookup.handle_message(message)
 
     assert Solve.Lookup.solve(app, :counter).count == 5
   end
@@ -588,26 +597,38 @@ defmodule Solve.LookupTest do
   test "handle_message/1 reports collection source updates in Updated.collections" do
     app = start_app(CollectionLookupSolve, %{columns: [%{id: 1, title: "Todo"}]})
 
-    updated =
-      Solve.Lookup.handle_message(
-        Solve.Message.update(app, :column, %Collection{
-          ids: [1],
-          items: %{1 => %{id: 1, title: "Todo"}}
-        })
-      )
+    assert Solve.Lookup.collection(app, :column).items[1].title == "Todo"
+    Solve.dispatch(app, {:column, 1}, :rename, "Backlog")
 
-    assert %{^app => %Solve.Lookup.Updated{refs: [], collections: [:column]}} = updated
+    assert_receive %Solve.Message{
+                     payload: %Solve.Update{
+                       controller_name: :column,
+                       exposed_state: %Collection{items: %{1 => %{title: "Backlog"}}}
+                     }
+                   } = message
+
+    assert %{^app => %Solve.Lookup.Updated{refs: [], collections: [:column]}} =
+             Solve.Lookup.handle_message(message)
+
+    assert Solve.Lookup.collection(app, :column).items[1].title == "Backlog"
   end
 
   test "handle_message/1 reports collected child updates in Updated.refs" do
     app = start_app(CollectionLookupSolve, %{columns: [%{id: 1, title: "Todo"}]})
 
-    updated =
-      Solve.Lookup.handle_message(
-        Solve.Message.update(app, {:column, 1}, %{id: 1, title: "Backlog"})
-      )
+    assert Solve.Lookup.solve(app, {:column, 1}).title == "Todo"
+    Solve.dispatch(app, {:column, 1}, :rename, "Backlog")
 
-    assert %{^app => %Solve.Lookup.Updated{refs: [{:column, 1}], collections: []}} = updated
+    assert_receive %Solve.Message{
+                     payload: %Solve.Update{
+                       controller_name: {:column, 1},
+                       exposed_state: %{title: "Backlog"}
+                     }
+                   } = message
+
+    assert %{^app => %Solve.Lookup.Updated{refs: [{:column, 1}], collections: []}} =
+             Solve.Lookup.handle_message(message)
+
     assert Solve.Lookup.solve(app, {:column, 1}).title == "Backlog"
   end
 

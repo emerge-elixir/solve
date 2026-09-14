@@ -5,20 +5,18 @@ set -euo pipefail
 mode="${1:-all}"
 
 run_quality() {
-  mix format --check-formatted
-  mix compile --warnings-as-errors
-  mix credo --strict
+  MIX_ENV=test mix quality.fast
 }
 
 run_tests() {
-  mix test
+  MIX_ENV=test mix test
 }
 
 run_dialyzer() {
   local output_file
   output_file="$(mktemp)"
 
-  if mix dialyzer >"${output_file}" 2>&1; then
+  if MIX_ENV=dev mix dialyzer >"${output_file}" 2>&1; then
     cat "${output_file}"
     rm -f "${output_file}"
     return 0
@@ -30,7 +28,7 @@ run_dialyzer() {
     echo "Detected a stale Dialyzer PLT; rebuilding local PLTs and retrying..." >&2
     rm -f _build/dev/dialyxir_*.plt _build/dev/dialyxir_*.plt.hash
     rm -f "${output_file}"
-    mix dialyzer
+    MIX_ENV=dev mix dialyzer
     return 0
   fi
 

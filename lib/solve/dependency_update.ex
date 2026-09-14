@@ -2,7 +2,7 @@ defmodule Solve.DependencyUpdate do
   @moduledoc false
 
   @enforce_keys [:app, :key, :op]
-  defstruct [:app, :key, :op, :id, :value, :ids]
+  defstruct [:app, :key, :op, :id, :value, :ids, :version]
 
   @type op :: :replace | :collection_put | :collection_delete | :collection_reorder
 
@@ -12,12 +12,13 @@ defmodule Solve.DependencyUpdate do
           op: op(),
           id: Solve.Collection.id() | nil,
           value: term(),
-          ids: [Solve.Collection.id()] | nil
+          ids: [Solve.Collection.id()] | nil,
+          version: Solve.Update.version()
         }
 
-  @spec replace(GenServer.server() | nil, atom(), term()) :: t()
-  def replace(app, key, value) when is_atom(key) do
-    %__MODULE__{app: app, key: key, op: :replace, value: value}
+  @spec replace(GenServer.server() | nil, atom(), term(), Solve.Update.version()) :: t()
+  def replace(app, key, value, version \\ nil) when is_atom(key) do
+    %__MODULE__{app: app, key: key, op: :replace, value: value, version: version}
   end
 
   @spec collection_put(GenServer.server() | nil, atom(), Solve.Collection.id(), map()) :: t()

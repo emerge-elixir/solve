@@ -33,8 +33,6 @@ and are not expected to change significantly.
 
 Implementation is very sloppy and will eventually be completely replaced.
 
-Module documentation is coming soon.
-
 Currently only properly tested with [Emerge](https://emerge.hexdocs.pm/readme.html)
 
 [LiveView](https://phoenix-live-view.hexdocs.pm/Phoenix.LiveView.html) adapter is also in the works.
@@ -46,7 +44,7 @@ Add `solve` to your dependencies:
 ```elixir
 def deps do
   [
-    {:solve, "~> 0.2.2"}
+    {:solve, "~> 0.2.3"}
   ]
 end
 ```
@@ -80,6 +78,9 @@ The second module defines an app that starts that controller under a name
 `:hello`
 
 
+Each example assumes a fresh app. Stop the previous one with `GenServer.stop(app_pid)`
+before starting a new app definition.
+
 You can start an app like any GenServer:
 ```
 iex(4)> {:ok, app_pid} = MyApp.App.start_link()
@@ -92,6 +93,12 @@ iex(5)> Solve.subscribe(app_pid, :hello)
 ```
 Subscribing to a controller returns its currently exposed data and
 you also receive a message with new information whenever it changes.
+
+You can unsubscribe using:
+```elixir
+:ok = Solve.unsubscribe(app_pid, :hello)
+```
+Already queued updates may still arrive.
 
 ## Exposing data
 
@@ -204,7 +211,7 @@ This module now needs to implement at least one function named `increment`
 and one function named `decrement`.
 
 Solve will accept function definitions with arity `1-5` so
-for `events: [:example event]` one of these needs to be implemented.
+for `events: [:example_event]` one of these needs to be implemented.
 
 ```elixir
 def example_event(event_payload)
@@ -224,6 +231,7 @@ def increment(val, state = %{count: count}), do: %{state | count: count + val}
 ```
 
 If we start our app we can use `Solve.dispatch/4` to send events to controllers.
+Dispatch is asynchronous; the examples show results after updates have propagated.
 
 ```
 iex(4)> {:ok, app_pid} = MyApp.App.start_link()
@@ -237,6 +245,7 @@ iex(7)> Solve.subscribe(app_pid, :counter)
 ```
 
 Since we are subscribed, we will also receive a message for each exposed state change.
+Message examples show only the relevant fields.
 ```
 iex(8)> flush
 %Solve.Message{
@@ -509,7 +518,7 @@ defmodule MyApp.Notifications do
   def notify(message, state), do: [message | state]
 
   def dismiss(_, []), do: []
-  def dismiss(index, state) when is_integer(index), do: Enum.delete_at(state, index)
+  def dismiss(index, state) when is_integer(index), do: List.delete_at(state, index)
   def dismiss(_, [_ | rest]), do: rest
 
   # Expose has to return plain map, so we can't use state directly
@@ -657,14 +666,6 @@ iex(30)> flush
 %Solve.Message{
   type: :update,
   payload: %Solve.Update{
-    app: #PID<0.233.0>,
-    controller_name: :notifications,
-    exposed_state: %{notifications: []}
-  }
-}
-%Solve.Message{
-  type: :update,
-  payload: %Solve.Update{
     app: #PID<0.236.0>,
     controller_name: :notifications,
     exposed_state: %{notifications: ["Credits change: 300"]}
@@ -681,7 +682,7 @@ iex(30)> flush
   }
 }
 ```
-After few seconds
+Five seconds after the first notification was added
 ```
 %Solve.Message{
   type: :update,
@@ -693,7 +694,7 @@ After few seconds
 }
 :ok
 ```
-After another 5 seconds
+When the second notification expires
 ```
 iex(31)> flush
 %Solve.Message{
@@ -869,14 +870,26 @@ We are using a few convenience helpers from Solve.Lookup here `solve`, `event`, 
 controller, subscribe to it and cache it to the process dictionary. Next time it is called it will
 use the value cached in process dictionary.
 
+You can use
+
+```elixir
+:ok = Solve.Lookup.unsubscribe(app_pid, :n_counters)
+```
+
+This clears that cached ref and requests raw detachment. Queued updates cannot
+recreate it. A later `solve` or `collection` read explicitly subscribes again.
+Unsubscribe does not edit the presenter's scene or call `handle_solve_updated`.
+
 `use Solve.Lookup` will add a couple of handle_info clauses that match on Solve.Message.
 When message is received they will update
 the process cache and call the `handle_solve_updated` callback.
+Only updates for targets already acquired through `solve` or `collection` are accepted.
 
 In the example, a new scene is rendered into GenServer state on each solve update.
 
-`MyApp.Presenter.show()` IO.puts the scene from the state, it now always
-reflects the state of our Solve application.
+`MyApp.Presenter.show()` IO.puts the scene from the state. It reflects the application
+once pending updates have been processed. Wait for new counters to appear before
+sending events to them.
 
 ```
 iex(4)> {:ok, app_pid} = MyApp.App.start_link()

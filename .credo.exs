@@ -10,11 +10,7 @@
       checks: [
         {Credo.Check.Refactor.Apply, false},
         {Credo.Check.Refactor.CondStatements, false},
-        {Credo.Check.Refactor.CyclomaticComplexity, false},
-        {Credo.Check.Refactor.FilterFilter, false},
-        {Credo.Check.Refactor.NegatedConditionsWithElse, false},
-        {Credo.Check.Refactor.Nesting, false},
-        {Credo.Check.Refactor.RedundantWithClauseResult, false}
+        {Credo.Check.Refactor.NegatedConditionsWithElse, false}
       ]
     }
   ]

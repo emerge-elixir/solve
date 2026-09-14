@@ -2,7 +2,7 @@ defmodule Solve.MixProject do
   use Mix.Project
 
   @description "Declarative UI agnostic state management architecture"
-  @version "0.2.2"
+  @version "0.2.3"
   @source_url "https://github.com/emerge-elixir/solve"
 
   def project do
@@ -47,12 +47,7 @@ defmodule Solve.MixProject do
 
   defp aliases do
     [
-      quality: [
-        "format --check-formatted",
-        "compile --warnings-as-errors",
-        "credo --strict",
-        "dialyzer"
-      ],
+      quality: ["cmd ./ci-tests.sh quality", "cmd ./ci-tests.sh dialyzer"],
       "quality.fast": [
         "format --check-formatted",
         "compile --warnings-as-errors",

@@ -14,8 +14,7 @@ defmodule Solve.DependencyGraph do
   @spec resolve_module!(module(), keyword()) :: compiled_graph()
   def resolve_module!(module, opts \\ []) do
     with :ok <- ensure_controllers_callback(module),
-         {:ok, controller_specs} <- ControllerSpec.validate_many(module.controllers()),
-         {:ok, dependency_graph} <- compile(controller_specs) do
+         {:ok, dependency_graph} <- compile(module.controllers()) do
       dependency_graph
     else
       {:error, reason} ->
@@ -41,12 +40,12 @@ defmodule Solve.DependencyGraph do
        %{
          controller_specs_by_name: controller_specs_by_name,
          sorted_controller_names: sorted_controller_names,
-         dependents_map: build_dependents_map(controller_specs_by_name)
+         dependents_map: ordered_dependents(controller_specs_by_name, sorted_controller_names)
        }}
     end
   end
 
-  def compile(other), do: {:error, {:invalid_controller_specs, other}}
+  def compile(other), do: {:error, {:invalid_controllers_return, other}}
 
   defp ensure_controllers_callback(module) do
     case Code.ensure_compiled(module) do
@@ -188,6 +187,10 @@ defmodule Solve.DependencyGraph do
     "invalid controller graph in #{inspect(module)}: expected a list of %Solve.ControllerSpec{}, got #{inspect(value)}"
   end
 
+  defp format_error(module, {:inconsistent_dependency_sources, name}) do
+    "invalid controller graph in #{inspect(module)}: controller #{inspect(name)} dependency sources do not match its bindings"
+  end
+
   defp format_error(module, reason) do
     "invalid controller graph in #{inspect(module)}: #{inspect(reason)}"
   end
@@ -200,6 +203,14 @@ defmodule Solve.DependencyGraph do
       Enum.reduce(spec.dependencies, acc, fn dependency_name, acc_inner ->
         Map.update!(acc_inner, dependency_name, &[controller_name | &1])
       end)
+    end)
+  end
+
+  defp ordered_dependents(specs, sorted_names) do
+    ranks = sorted_names |> Enum.with_index() |> Map.new()
+
+    Map.new(build_dependents_map(specs), fn {name, dependents} ->
+      {name, Enum.sort_by(dependents, &Map.fetch!(ranks, &1))}
     end)
   end
 
@@ -230,42 +241,42 @@ defmodule Solve.DependencyGraph do
 
   defp validate_dependency_references(controller_specs_by_name) do
     Enum.reduce_while(controller_specs_by_name, :ok, fn {controller_name, controller_spec}, :ok ->
-      case Enum.find(
-             controller_spec.dependencies,
-             &(not Map.has_key?(controller_specs_by_name, &1))
-           ) do
-        nil ->
+      case Enum.reject(controller_spec.dependencies, &Map.has_key?(controller_specs_by_name, &1)) do
+        [] ->
           {:cont, :ok}
 
-        dependency_name ->
+        [dependency_name | _] ->
           {:halt, {:error, {:unknown_dependency, controller_name, dependency_name}}}
       end
     end)
   end
 
-  defp validate_dependency_binding_variants(controller_specs_by_name) do
-    Enum.reduce_while(controller_specs_by_name, :ok, fn {controller_name, controller_spec}, :ok ->
-      case Enum.find_value(controller_spec.dependency_bindings, fn binding ->
-             case Map.get(controller_specs_by_name, binding.source) do
-               nil ->
-                 nil
+  defp validate_dependency_binding_variants(specs) do
+    reason =
+      Enum.find_value(specs, fn {name, spec} ->
+        Enum.find_value(spec.dependency_bindings, fn binding ->
+          binding_variant_error(name, binding, Map.get(specs, binding.source))
+        end)
+      end)
 
-               %ControllerSpec{variant: :collection} when binding.kind == :single ->
-                 {:plain_dependency_on_collection, controller_name, binding.source}
-
-               %ControllerSpec{variant: :singleton} when binding.kind == :collection ->
-                 {:collection_dependency_on_singleton, controller_name, binding.key,
-                  binding.source}
-
-               _ ->
-                 nil
-             end
-           end) do
-        nil -> {:cont, :ok}
-        reason -> {:halt, {:error, reason}}
-      end
-    end)
+    if reason, do: {:error, reason}, else: :ok
   end
+
+  defp binding_variant_error(controller, %{kind: :single, source: source}, %ControllerSpec{
+         variant: :collection
+       }) do
+    {:plain_dependency_on_collection, controller, source}
+  end
+
+  defp binding_variant_error(
+         controller,
+         %{kind: :collection, key: key, source: source},
+         %ControllerSpec{variant: :singleton}
+       ) do
+    {:collection_dependency_on_singleton, controller, key, source}
+  end
+
+  defp binding_variant_error(_controller, _binding, _spec), do: nil
 
   defp validate_self_dependencies(controller_specs_by_name) do
     Enum.reduce_while(controller_specs_by_name, :ok, fn {controller_name, controller_spec}, :ok ->
@@ -299,40 +310,32 @@ defmodule Solve.DependencyGraph do
       |> Enum.filter(fn {_node, degree} -> degree == 0 end)
       |> Enum.map(fn {node, _degree} -> node end)
 
-    process_queue(initial_queue, dependents_map, in_degrees, all_nodes, [])
+    process_queue(
+      :queue.from_list(initial_queue),
+      dependents_map,
+      in_degrees,
+      length(all_nodes),
+      []
+    )
   end
 
-  defp process_queue([], _dependents_map, _in_degrees, all_nodes, result) do
-    if length(result) == length(all_nodes) do
-      {:ok, Enum.reverse(result)}
-    else
-      {:error, :cycle}
+  defp process_queue(queue, dependents_map, in_degrees, count, result) do
+    case :queue.out(queue) do
+      {:empty, _} ->
+        if length(result) == count, do: {:ok, Enum.reverse(result)}, else: {:error, :cycle}
+
+      {{:value, node}, rest} ->
+        {queue, degrees} =
+          Enum.reduce(Map.get(dependents_map, node, []), {rest, in_degrees}, fn dependent,
+                                                                                {q, ds} ->
+            degree = Map.fetch!(ds, dependent) - 1
+
+            {if(degree == 0, do: :queue.in(dependent, q), else: q),
+             Map.put(ds, dependent, degree)}
+          end)
+
+        process_queue(queue, dependents_map, degrees, count, [node | result])
     end
-  end
-
-  defp process_queue([node | rest], dependents_map, in_degrees, all_nodes, result) do
-    new_in_degrees = Map.delete(in_degrees, node)
-    dependents = Map.get(dependents_map, node, [])
-
-    {new_queue, updated_in_degrees} =
-      Enum.reduce(dependents, {rest, new_in_degrees}, fn dependent, {queue, degrees} ->
-        case Map.get(degrees, dependent) do
-          nil ->
-            {queue, degrees}
-
-          degree ->
-            new_degree = degree - 1
-            new_degrees = Map.put(degrees, dependent, new_degree)
-
-            if new_degree == 0 do
-              {queue ++ [dependent], new_degrees}
-            else
-              {queue, new_degrees}
-            end
-        end
-      end)
-
-    process_queue(new_queue, dependents_map, updated_in_degrees, all_nodes, [node | result])
   end
 
   defp do_find_cycle(node, controller_specs_by_name, visited, stack) do
@@ -348,13 +351,17 @@ defmodule Solve.DependencyGraph do
         stack = [node | stack]
         dependencies = controller_specs_by_name |> Map.fetch!(node) |> Map.get(:dependencies, [])
 
-        Enum.reduce_while(dependencies, {:ok, visited}, fn dependency, {:ok, acc_visited} ->
-          case do_find_cycle(dependency, controller_specs_by_name, acc_visited, stack) do
-            {:cycle, cycle, new_visited} -> {:halt, {:cycle, cycle, new_visited}}
-            {:ok, new_visited} -> {:cont, {:ok, new_visited}}
-          end
-        end)
+        visit_dependencies(dependencies, controller_specs_by_name, visited, stack)
     end
+  end
+
+  defp visit_dependencies(dependencies, specs, visited, stack) do
+    Enum.reduce_while(dependencies, {:ok, visited}, fn dependency, {:ok, acc} ->
+      case do_find_cycle(dependency, specs, acc, stack) do
+        {:cycle, _, _} = cycle -> {:halt, cycle}
+        {:ok, next} -> {:cont, {:ok, next}}
+      end
+    end)
   end
 
   defp cycle_from_stack(node, stack) do

@@ -137,28 +137,36 @@ defmodule Solve.ControllerSpec do
              controller_spec.name,
              controller_spec.dependency_bindings
            ) do
-      {:ok, controller_spec.dependencies, controller_spec.dependency_bindings}
+      sources = controller_spec.dependency_bindings |> Enum.map(& &1.source) |> Enum.uniq()
+
+      if controller_spec.dependencies == [] or
+           MapSet.new(controller_spec.dependencies) == MapSet.new(sources) do
+        {:ok, sources, controller_spec.dependency_bindings}
+      else
+        {:error, {:inconsistent_dependency_sources, controller_spec.name}}
+      end
     end
   end
 
   defp normalize_dependencies(_name, []), do: {:ok, [], []}
 
   defp normalize_dependencies(name, dependencies) when is_list(dependencies) do
-    Enum.reduce_while(dependencies, {:ok, [], [], MapSet.new()}, fn dependency_spec,
-                                                                    {:ok, sources, bindings,
-                                                                     binding_keys} ->
+    Enum.reduce_while(dependencies, {:ok, [], MapSet.new()}, fn dependency_spec,
+                                                                {:ok, bindings, keys} ->
       with {:ok, binding} <- normalize_dependency_spec(name, dependency_spec),
-           :ok <- validate_binding_key(name, binding.key, binding_keys) do
-        sources = if binding.source in sources, do: sources, else: sources ++ [binding.source]
-        binding_keys = MapSet.put(binding_keys, binding.key)
-        {:cont, {:ok, sources, bindings ++ [binding], binding_keys}}
+           :ok <- validate_binding_key(name, binding.key, keys) do
+        {:cont, {:ok, [binding | bindings], MapSet.put(keys, binding.key)}}
       else
         {:error, reason} -> {:halt, {:error, reason}}
       end
     end)
     |> case do
-      {:ok, sources, bindings, _binding_keys} -> {:ok, sources, bindings}
-      {:error, reason} -> {:error, reason}
+      {:ok, bindings, _keys} ->
+        bindings = Enum.reverse(bindings)
+        {:ok, bindings |> Enum.map(& &1.source) |> Enum.uniq(), bindings}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

@@ -129,7 +129,7 @@ defmodule Solve.Controller do
   require Logger
   alias Solve.Collection
   alias Solve.DependencyUpdate
-  alias Solve.Message
+  alias Solve.Update
 
   @genserver_start_options [:name, :timeout, :debug, :spawn_opt, :hibernate_after]
 
@@ -186,6 +186,17 @@ defmodule Solve.Controller do
         Solve.Controller.__handle_subscribe__(subscriber, server_state)
       end
 
+      def handle_call({:subscribe_snapshot, subscriber}, _from, server_state) do
+        {:reply, _value, server_state} =
+          Solve.Controller.__handle_subscribe__(subscriber, server_state)
+
+        {:reply, Solve.Controller.__snapshot__(server_state), server_state}
+      end
+
+      def handle_call({:subscribe_dependency, subscriber, key}, _from, server_state) do
+        Solve.Controller.__handle_dependency_subscribe__(subscriber, key, server_state)
+      end
+
       @impl GenServer
       def handle_call({:subscribe_with, subscriber, encoder}, _from, server_state) do
         Solve.Controller.__handle_subscribe_with__(subscriber, encoder, server_state)
@@ -194,6 +205,10 @@ defmodule Solve.Controller do
       @impl GenServer
       def handle_call({:unsubscribe, subscription_ref}, _from, server_state) do
         Solve.Controller.__handle_unsubscribe__(subscription_ref, server_state)
+      end
+
+      def handle_call({:unsubscribe_external, subscriber}, _from, server_state) do
+        Solve.Controller.__handle_external_unsubscribe__(subscriber, server_state)
       end
 
       @impl GenServer
@@ -244,56 +259,8 @@ defmodule Solve.Controller do
         {event, arities}
       end)
 
-    invalid_callbacks =
-      event_arities
-      |> Enum.filter(fn {_event, arities} -> not valid_event_arities?(arities) end)
-      |> Enum.filter(fn {_event, arities} -> length(arities) <= 1 end)
-
-    if invalid_callbacks != [] do
-      callbacks = Enum.map_join(invalid_callbacks, ", ", &format_invalid_event_callback/1)
-
-      raise CompileError,
-        file: env.file,
-        line: 1,
-        description:
-          "#{inspect(env.module)} must define declared event callback(s) with exactly one arity between /1 and /5: #{callbacks}"
-    end
-
-    duplicate_callbacks =
-      event_arities
-      |> Enum.filter(fn {_event, arities} -> length(arities) > 1 end)
-
-    if duplicate_callbacks != [] do
-      callbacks = Enum.map_join(duplicate_callbacks, "; ", &format_duplicate_event_callback/1)
-
-      raise CompileError,
-        file: env.file,
-        line: 1,
-        description:
-          "#{inspect(env.module)} must not define declared event callback(s) at multiple arities: #{callbacks}"
-    end
-
-    invalid_handle_info_arities = Enum.reject(handle_info_arities, &valid_handle_info_arity?/1)
-
-    if invalid_handle_info_arities != [] do
-      callbacks = Enum.map_join(invalid_handle_info_arities, ", ", &format_handle_info_callback/1)
-
-      raise CompileError,
-        file: env.file,
-        line: 1,
-        description:
-          "#{inspect(env.module)} must define handle_info callback(s) with exactly one arity between /2 and /5: #{callbacks}"
-    end
-
-    if length(handle_info_arities) > 1 do
-      callbacks = Enum.map_join(handle_info_arities, ", ", &format_handle_info_callback/1)
-
-      raise CompileError,
-        file: env.file,
-        line: 1,
-        description:
-          "#{inspect(env.module)} must not define handle_info callback(s) at multiple arities: #{callbacks}"
-    end
+    validate_event_arities!(event_arities, env)
+    validate_handle_info_arities!(handle_info_arities, env)
 
     resolved_event_arities = Enum.map(event_arities, fn {event, [arity]} -> {event, arity} end)
     handle_info_arity = List.first(handle_info_arities)
@@ -320,59 +287,106 @@ defmodule Solve.Controller do
 
       @impl GenServer
       def handle_info(message, server_state) do
-        case message do
-          {:solve_event, event} when is_atom(event) ->
-            Solve.Controller.__handle_direct_event__(event, %{}, server_state)
-
-          {:solve_event, event, payload} when is_atom(event) ->
-            Solve.Controller.__handle_direct_event__(event, payload, server_state)
-
-          %Solve.Message{
-            type: :update,
-            payload: %Solve.Update{
-              app: solve_app,
-              controller_name: dependency_name,
-              exposed_state: exposed_state
-            }
-          } ->
-            Solve.Controller.__handle_dependency_update__(
-              solve_app,
-              dependency_name,
-              exposed_state,
-              server_state
-            )
-
-          %Solve.Message{} ->
-            {:noreply, server_state}
-
-          %Solve.DependencyUpdate{} = dependency_update ->
-            Solve.Controller.__handle_dependency_update_message__(dependency_update, server_state)
-
-          {:DOWN, ref, :process, subscriber, _reason}
-          when is_reference(ref) and is_pid(subscriber) ->
-            if Solve.Controller.__subscriber_monitor_match__?(ref, subscriber, server_state) do
-              Solve.Controller.__handle_subscriber_down__(subscriber, server_state)
-            else
-              Solve.Controller.__handle_fallback_info__(
-                message,
-                __MODULE__,
-                @solve_controller_handle_info_arity,
-                server_state,
-                fn -> super(message, server_state.state) end
-              )
-            end
-
-          _message ->
-            Solve.Controller.__handle_fallback_info__(
-              message,
-              __MODULE__,
-              @solve_controller_handle_info_arity,
-              server_state,
-              fn -> super(message, server_state.state) end
-            )
-        end
+        Solve.Controller.__handle_info__(message, server_state, fn ->
+          super(message, server_state.state)
+        end)
       end
     end
+  end
+
+  defp validate_event_arities!(event_arities, env) do
+    invalid_callbacks =
+      event_arities
+      |> Enum.filter(fn {_event, arities} ->
+        not valid_event_arities?(arities) and length(arities) <= 1
+      end)
+
+    if invalid_callbacks != [] do
+      callbacks = Enum.map_join(invalid_callbacks, ", ", &format_invalid_event_callback/1)
+
+      raise CompileError,
+        file: env.file,
+        line: 1,
+        description:
+          "#{inspect(env.module)} must define declared event callback(s) with exactly one arity between /1 and /5: #{callbacks}"
+    end
+
+    duplicate_callbacks =
+      event_arities
+      |> Enum.filter(fn {_event, arities} -> length(arities) > 1 end)
+
+    if duplicate_callbacks != [] do
+      callbacks = Enum.map_join(duplicate_callbacks, "; ", &format_duplicate_event_callback/1)
+
+      raise CompileError,
+        file: env.file,
+        line: 1,
+        description:
+          "#{inspect(env.module)} must not define declared event callback(s) at multiple arities: #{callbacks}"
+    end
+  end
+
+  defp validate_handle_info_arities!(handle_info_arities, env) do
+    invalid_handle_info_arities = Enum.reject(handle_info_arities, &valid_handle_info_arity?/1)
+
+    if invalid_handle_info_arities != [] do
+      callbacks = Enum.map_join(invalid_handle_info_arities, ", ", &format_handle_info_callback/1)
+
+      raise CompileError,
+        file: env.file,
+        line: 1,
+        description:
+          "#{inspect(env.module)} must define handle_info callback(s) with exactly one arity between /2 and /5: #{callbacks}"
+    end
+
+    if length(handle_info_arities) > 1 do
+      callbacks = Enum.map_join(handle_info_arities, ", ", &format_handle_info_callback/1)
+
+      raise CompileError,
+        file: env.file,
+        line: 1,
+        description:
+          "#{inspect(env.module)} must not define handle_info callback(s) at multiple arities: #{callbacks}"
+    end
+  end
+
+  @doc false
+  def __handle_info__({:solve_event, event}, state, _fallback) when is_atom(event),
+    do: __handle_direct_event__(event, %{}, state)
+
+  def __handle_info__({:solve_event, event, payload}, state, _fallback) when is_atom(event),
+    do: __handle_direct_event__(event, payload, state)
+
+  def __handle_info__(
+        %Solve.Message{type: :update, payload: %Update{} = update},
+        state,
+        _fallback
+      ) do
+    __handle_dependency_update__(update.app, update.controller_name, update.exposed_state, state)
+  end
+
+  def __handle_info__(%Solve.Message{}, state, _fallback), do: {:noreply, state}
+
+  def __handle_info__(%DependencyUpdate{} = update, state, _fallback),
+    do: __handle_dependency_update_message__(update, state)
+
+  def __handle_info__({:DOWN, ref, :process, subscriber, _reason} = message, state, fallback)
+      when is_reference(ref) and is_pid(subscriber) do
+    if __subscriber_monitor_match__?(ref, subscriber, state),
+      do: __handle_subscriber_down__(subscriber, state),
+      else: fallback_info(message, state, fallback)
+  end
+
+  def __handle_info__(message, state, fallback), do: fallback_info(message, state, fallback)
+
+  defp fallback_info(message, state, fallback) do
+    __handle_fallback_info__(
+      message,
+      state.module,
+      state.module.__solve_handle_info_arity__(),
+      state,
+      fallback
+    )
   end
 
   @doc """
@@ -398,6 +412,16 @@ defmodule Solve.Controller do
   end
 
   @doc false
+  def subscribe_snapshot(controller, subscriber, timeout \\ 1_000) do
+    GenServer.call(controller, {:subscribe_snapshot, subscriber}, timeout)
+  end
+
+  @doc false
+  def subscribe_dependency(controller, subscriber, key) do
+    GenServer.call(controller, {:subscribe_dependency, subscriber, key}, 1_000)
+  end
+
+  @doc false
   @spec subscribe_with(GenServer.server(), pid(), dependency_encoder()) ::
           {:ok, map(), reference()}
   def subscribe_with(controller, subscriber, encoder)
@@ -419,6 +443,20 @@ defmodule Solve.Controller do
   def unsubscribe(_controller, subscription_ref) do
     raise ArgumentError,
           "unsubscribe/2 expects a subscription reference, got: #{inspect(subscription_ref)}"
+  end
+
+  @doc false
+  # The runtime validates replies from custom controller implementations.
+  @spec unsubscribe_external(GenServer.server(), pid(), timeout()) :: term()
+  def unsubscribe_external(controller, subscriber, timeout \\ 1_000)
+
+  def unsubscribe_external(controller, subscriber, timeout) when is_pid(subscriber) do
+    GenServer.call(controller, {:unsubscribe_external, subscriber}, timeout)
+  end
+
+  def unsubscribe_external(_controller, subscriber, _timeout) do
+    raise ArgumentError,
+          "unsubscribe_external/3 expects a pid subscriber, got: #{inspect(subscriber)}"
   end
 
   @doc """
@@ -465,11 +503,33 @@ defmodule Solve.Controller do
          dependencies: dependencies,
          callbacks: callbacks,
          exposed_state: exposed_state,
+         generation: Keyword.get(opts, :generation),
+         revision: 0,
+         dependency_versions: Keyword.get(opts, :dependency_versions, %{}),
          subscribers: %{},
          subscriber_monitor_refs_by_pid: %{},
          external_subscription_refs_by_pid: %{}
        }}
     end
+  end
+
+  @doc false
+  def __snapshot__(server_state) do
+    %Update{
+      app: server_state.solve_app,
+      controller_name: server_state.controller_name,
+      exposed_state: server_state.exposed_state,
+      version: if(server_state.generation, do: {server_state.generation, server_state.revision}),
+      pid: self(),
+      events: server_state.module.__events__()
+    }
+  end
+
+  @doc false
+  def __handle_dependency_subscribe__(subscriber, key, server_state) do
+    ref = make_ref()
+    state = put_subscription(server_state, ref, subscriber, {:dependency, key})
+    {:reply, {:ok, __snapshot__(state), ref}, state}
   end
 
   @doc false
@@ -533,6 +593,14 @@ defmodule Solve.Controller do
   end
 
   @doc false
+  def __handle_external_unsubscribe__(subscriber, server_state) when is_pid(subscriber) do
+    case Map.get(server_state.external_subscription_refs_by_pid, subscriber) do
+      nil -> {:reply, :ok, server_state}
+      ref -> {:reply, :ok, delete_subscription(server_state, ref)}
+    end
+  end
+
+  @doc false
   def __handle_callbacks_update__(callbacks, server_state) when is_map(callbacks) do
     {:noreply, %{server_state | callbacks: callbacks}}
   end
@@ -585,13 +653,10 @@ defmodule Solve.Controller do
         exposed_state,
         %{solve_app: solve_app} = server_state
       ) do
-    server_state =
-      apply_dependency_update(
-        DependencyUpdate.replace(solve_app, dependency_name, exposed_state),
-        server_state
-      )
-
-    {:noreply, refresh_exposed_state(server_state)}
+    __handle_dependency_update_message__(
+      DependencyUpdate.replace(solve_app, dependency_name, exposed_state),
+      server_state
+    )
   end
 
   def __handle_dependency_update__(_solve_app, _dependency_name, _exposed_state, server_state) do
@@ -603,8 +668,19 @@ defmodule Solve.Controller do
         %DependencyUpdate{app: solve_app} = dependency_update,
         %{solve_app: solve_app} = server_state
       ) do
-    server_state = apply_dependency_update(dependency_update, server_state)
-    {:noreply, refresh_exposed_state(server_state)}
+    previous = Map.get(server_state.dependency_versions, dependency_update.key)
+
+    if (server_state.generation == nil or dependency_update.version != nil) and
+         Update.newer?(dependency_update.version, previous) do
+      server_state =
+        server_state
+        |> apply_versioned_dependency_update(dependency_update)
+        |> refresh_exposed_state()
+
+      {:noreply, server_state}
+    else
+      {:noreply, server_state}
+    end
   end
 
   def __handle_dependency_update_message__(%DependencyUpdate{}, server_state) do
@@ -664,7 +740,7 @@ defmodule Solve.Controller do
         apply(
           module,
           :handle_info,
-          handle_info_args(
+          event_args(
             handle_info_arity,
             message,
             server_state.state,
@@ -745,11 +821,6 @@ defmodule Solve.Controller do
     |> Enum.take(event_arity)
   end
 
-  defp handle_info_args(handle_info_arity, message, state, dependencies, callbacks, init_params) do
-    [message, state, dependencies, callbacks, init_params]
-    |> Enum.take(handle_info_arity)
-  end
-
   defp with_solve_app(solve_app, fun) when is_function(fun, 0) do
     missing_app = make_ref()
     previous_app = Process.get(:solve_app, missing_app)
@@ -772,6 +843,11 @@ defmodule Solve.Controller do
 
   defp declared_event?(module, event) do
     event in module.__events__()
+  end
+
+  defp apply_versioned_dependency_update(server_state, update) do
+    server_state = apply_dependency_update(update, server_state)
+    put_in(server_state.dependency_versions[update.key], update.version)
   end
 
   defp apply_dependency_update(
@@ -839,22 +915,12 @@ defmodule Solve.Controller do
               server_state.external_subscription_refs_by_pid
           end
 
-        has_other_subscriptions? =
-          Enum.any?(subscribers, fn {_ref, entry} -> entry.subscriber == subscriber end)
-
         monitor_refs =
-          if has_other_subscriptions? do
+          retain_subscriber_monitor(
+            subscribers,
+            subscriber,
             server_state.subscriber_monitor_refs_by_pid
-          else
-            case Map.pop(server_state.subscriber_monitor_refs_by_pid, subscriber) do
-              {nil, monitor_refs} ->
-                monitor_refs
-
-              {monitor_ref, monitor_refs} ->
-                Process.demonitor(monitor_ref, [:flush])
-                monitor_refs
-            end
-          end
+          )
 
         %{
           server_state
@@ -862,6 +928,16 @@ defmodule Solve.Controller do
             subscriber_monitor_refs_by_pid: monitor_refs,
             external_subscription_refs_by_pid: external_refs
         }
+    end
+  end
+
+  defp retain_subscriber_monitor(subscribers, subscriber, monitor_refs) do
+    if Enum.any?(subscribers, fn {_ref, entry} -> entry.subscriber == subscriber end) do
+      monitor_refs
+    else
+      {ref, remaining} = Map.pop(monitor_refs, subscriber)
+      if ref, do: Process.demonitor(ref, [:flush])
+      remaining
     end
   end
 
@@ -890,8 +966,14 @@ defmodule Solve.Controller do
     if server_state.exposed_state === new_exposed_state do
       %{server_state | exposed_state: new_exposed_state}
     else
+      server_state = %{
+        server_state
+        | exposed_state: new_exposed_state,
+          revision: server_state.revision + 1
+      }
+
       broadcast_update(server_state, new_exposed_state)
-      %{server_state | exposed_state: new_exposed_state}
+      server_state
     end
   end
 
@@ -905,11 +987,20 @@ defmodule Solve.Controller do
   end
 
   defp build_subscriber_message(
-         %{kind: {:external, solve_app, controller_name}},
-         _server_state,
-         new_exposed_state
+         %{kind: {:external, _solve_app, _controller_name}},
+         server_state,
+         _new_exposed_state
        ) do
-    Message.update(solve_app, controller_name, new_exposed_state)
+    Update.message(__snapshot__(server_state))
+  end
+
+  defp build_subscriber_message(%{kind: {:dependency, key}}, server_state, new_exposed_state) do
+    DependencyUpdate.replace(
+      server_state.solve_app,
+      key,
+      new_exposed_state,
+      __snapshot__(server_state).version
+    )
   end
 
   defp build_subscriber_message(%{kind: {:internal, encoder}}, _server_state, new_exposed_state) do
