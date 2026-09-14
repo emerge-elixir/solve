@@ -60,6 +60,19 @@ defmodule Solve.Runtime do
     end
   end
 
+  def handle_call({:unsubscribe, target, subscriber}, {caller, _tag}, state)
+      when is_pid(subscriber) do
+    pid = target_pid(target, state)
+
+    if pid == caller and subscriber != self() and Process.alive?(pid) do
+      {:reply, {:error, :reentrant_unsubscribe}, state}
+    else
+      state = unregister_subscriber(target, subscriber, state)
+      result = if subscriber == self(), do: :ok, else: unsubscribe_external(pid, subscriber)
+      {:reply, result, state}
+    end
+  end
+
   def handle_call({:controller_pid, target}, _from, state) do
     {:reply, target_pid(target, state), state}
   end
@@ -118,11 +131,11 @@ defmodule Solve.Runtime do
     {:stop, {:controller_supervisor_exit, reason}, state}
   end
 
-  def handle_info({:retry_attachment, target, subscriber, generation, attempt}, state) do
+  def handle_info({:retry_attachment, target, subscriber, generation, token, attempt}, state) do
     key = {target, subscriber}
 
     cond do
-      Map.get(state.pending_attachments, key) != generation ->
+      Map.get(state.pending_attachments, key) != {generation, token} ->
         {:noreply, state}
 
       target_generation(target, state) == generation and subscribed?(target, subscriber, state) ->
@@ -623,15 +636,18 @@ defmodule Solve.Runtime do
         state
 
       true ->
-        generation = target_generation(target, state)
+        {generation, token} =
+          Map.get_lazy(state.pending_attachments, key, fn ->
+            {target_generation(target, state), make_ref()}
+          end)
 
         Process.send_after(
           self(),
-          {:retry_attachment, target, subscriber, generation, attempt + 1},
+          {:retry_attachment, target, subscriber, generation, token, attempt + 1},
           @retry_delay
         )
 
-        put_in(state.pending_attachments[key], generation)
+        put_in(state.pending_attachments[key], {generation, token})
     end
   end
 
@@ -663,6 +679,31 @@ defmodule Solve.Runtime do
     MapSet.member?(Map.get(state.subscribers, target, MapSet.new()), subscriber)
   end
 
+  defp unregister_subscriber(target, subscriber, state) do
+    remaining = Map.get(state.subscribers, target, MapSet.new()) |> MapSet.delete(subscriber)
+
+    subscribers =
+      if MapSet.size(remaining) == 0,
+        do: Map.delete(state.subscribers, target),
+        else: Map.put(state.subscribers, target, remaining)
+
+    monitors =
+      if Enum.any?(subscribers, fn {_, members} -> MapSet.member?(members, subscriber) end) do
+        state.subscriber_monitors
+      else
+        {ref, monitors} = Map.pop(state.subscriber_monitors, subscriber)
+        if ref, do: Process.demonitor(ref, [:flush])
+        monitors
+      end
+
+    %{
+      state
+      | subscribers: subscribers,
+        subscriber_monitors: monitors,
+        pending_attachments: Map.delete(state.pending_attachments, {target, subscriber})
+    }
+  end
+
   defp remove_subscriber(subscriber, state) do
     subscribers =
       Enum.reduce(state.subscribers, %{}, fn {target, members}, acc ->
@@ -678,6 +719,25 @@ defmodule Solve.Runtime do
         subscriber_monitors: Map.delete(state.subscriber_monitors, subscriber),
         pending_attachments: pending
     }
+  end
+
+  defp unsubscribe_external(nil, _subscriber), do: :ok
+
+  defp unsubscribe_external(pid, subscriber) do
+    case Controller.unsubscribe_external(pid, subscriber) do
+      :ok -> :ok
+      other -> {:error, {:unsubscribe_failed, {:unexpected_reply, other}}}
+    end
+  catch
+    :exit, reason ->
+      if Process.alive?(pid) do
+        case reason do
+          {:timeout, _} -> {:error, :timeout}
+          _ -> {:error, {:unsubscribe_failed, reason}}
+        end
+      else
+        :ok
+      end
   end
 
   defp safe_snapshot(pid, subscriber) do

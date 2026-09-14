@@ -74,6 +74,50 @@ defmodule Solve do
     raise ArgumentError, "subscribe/3 expects a pid subscriber, got: #{inspect(subscriber)}"
   end
 
+  @doc """
+  Removes a PID's raw subscription to a singleton, collection source, or collection item.
+
+  Subscriptions are not reference counted. Repeating this call is idempotent unless
+  another subscribe intervenes. Source and item subscriptions are independent.
+  This does not stop the controller, remove graph dependencies, revoke event handles,
+  or clear `Solve.Lookup` caches. Warm lookup reads will not resubscribe automatically.
+
+  On `:ok`, explicit interest and reattachment retries are removed and any live target
+  has acknowledged external detachment. Exception: when `subscriber` is the app PID,
+  its mandatory internal observer stays attached and continues receiving updates.
+  Already-sent or queued messages may still arrive; no final nil update is sent.
+
+  A controller calling this for its own target would block its own acknowledgement.
+  Such calls return `{:error, :reentrant_unsubscribe}` without changing state, unless
+  only explicit app-PID interest is being removed. Indirect synchronous callback
+  cycles can still time out. Calls from the app's own params/collect callbacks retain
+  normal `GenServer.call/2` self-call restrictions.
+
+  If the controller does not acknowledge within one second, returns
+  `{:error, :timeout}` with logical interest removed but physical detachment unconfirmed.
+  Other handshake failures return `{:error, {:unsubscribe_failed, reason}}` with the
+  same logical effect. These failures do not restart the controller.
+
+  The outer app call retains normal `GenServer.call/2` exits, including its default
+  five-second timeout. After an outer timeout, even logical removal is unconfirmed.
+  Neither timeout cancels an already-sent request; it may execute later.
+
+  Retry only while the intended state is still unsubscribed: a new call removes any
+  newer subscription for that PID/target. Names resolve to the current app instance;
+  use the original app PID if a retry must not affect a replacement app.
+  """
+  @spec unsubscribe(GenServer.server(), controller_target(), pid()) ::
+          :ok | {:error, :timeout | :reentrant_unsubscribe | {:unsubscribe_failed, term()}}
+  def unsubscribe(app, controller_name, subscriber \\ self())
+
+  def unsubscribe(app, controller_name, subscriber) when is_pid(subscriber) do
+    GenServer.call(app, {:unsubscribe, controller_name, subscriber})
+  end
+
+  def unsubscribe(_app, _controller_name, subscriber) do
+    raise ArgumentError, "unsubscribe/3 expects a pid subscriber, got: #{inspect(subscriber)}"
+  end
+
   @spec controller_pid(GenServer.server(), controller_target()) :: pid() | nil
   def controller_pid(app, controller_name) do
     GenServer.call(app, {:controller_pid, controller_name})

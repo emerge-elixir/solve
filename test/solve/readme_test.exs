@@ -115,6 +115,22 @@ defmodule Solve.ReadmeTest do
     assert Solve.subscribe(app, :hello) == %{hello: "Hello"}
   end
 
+  test "unsubscribe example removes raw interest without stopping hello" do
+    app = start_app(Basic.App)
+    Solve.subscribe(app, :hello)
+    pid = Solve.controller_pid(app, :hello)
+
+    code =
+      @readme
+      |> Examples.blocks("Writing an application")
+      |> Enum.find(&String.contains?(&1, "Solve.unsubscribe("))
+
+    assert {:ok, _binding} = Code.eval_string(code, app_pid: app)
+    assert Solve.controller_pid(app, :hello) == pid
+    refute Map.has_key?(:sys.get_state(app).subscribers, :hello)
+    refute Map.has_key?(:sys.get_state(pid).external_subscription_refs_by_pid, self())
+  end
+
   test "expose customizes the public map" do
     app = start_app(Exposed.App)
     assert Solve.subscribe(app, :hello) == %{exposed: "Hello World"}

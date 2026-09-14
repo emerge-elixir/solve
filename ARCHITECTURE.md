@@ -151,13 +151,20 @@ updates are still delivered directly by their controller using `%Solve.Message{t
 A controller subscription handshake is bounded to 1,000 ms. If the process is known dead, the
 call returns nil and its monitor drives the normal restart policy. A timeout alone is not a
 crash: a live target returns its last accepted cached value, retains the registration, and gets
-up to three deferred attachment retries. Retries are tied to the target generation and subscriber.
+up to three deferred attachment retries. Retries are tied to the target generation, subscriber,
+and a unique attachment-chain token, so canceled retries cannot affect a later subscription.
 No duplicate instance is started merely because an observer could not attach promptly.
 
 Subscriber monitors remove registrations after subscriber death. Waiting registrations for absent
 collection IDs remain intentionally, so those subscribers receive a future start notification.
 Raw subscribers implementing their own cache should compare versions across lifecycle messages;
 `Solve.Lookup` handles this automatically.
+
+`Solve.unsubscribe/2,3` removes raw target interest and awaits live-controller external detachment
+for up to one second. It preserves dependencies and the mandatory app observer. Direct reentrancy
+is rejected before mutation. Other nested errors remove logical interest but leave physical
+completion unconfirmed; outer app-call timeout exits leave even logical completion unknown.
+This raw API does not clear lookup caches or drain queued messages.
 
 ### Dispatch and introspection
 

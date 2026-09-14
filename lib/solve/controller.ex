@@ -207,6 +207,10 @@ defmodule Solve.Controller do
         Solve.Controller.__handle_unsubscribe__(subscription_ref, server_state)
       end
 
+      def handle_call({:unsubscribe_external, subscriber}, _from, server_state) do
+        Solve.Controller.__handle_external_unsubscribe__(subscriber, server_state)
+      end
+
       @impl GenServer
       def handle_cast({:update_callbacks, callbacks}, server_state) do
         Solve.Controller.__handle_callbacks_update__(callbacks, server_state)
@@ -441,6 +445,20 @@ defmodule Solve.Controller do
           "unsubscribe/2 expects a subscription reference, got: #{inspect(subscription_ref)}"
   end
 
+  @doc false
+  # The runtime validates replies from custom controller implementations.
+  @spec unsubscribe_external(GenServer.server(), pid(), timeout()) :: term()
+  def unsubscribe_external(controller, subscriber, timeout \\ 1_000)
+
+  def unsubscribe_external(controller, subscriber, timeout) when is_pid(subscriber) do
+    GenServer.call(controller, {:unsubscribe_external, subscriber}, timeout)
+  end
+
+  def unsubscribe_external(_controller, subscriber, _timeout) do
+    raise ArgumentError,
+          "unsubscribe_external/3 expects a pid subscriber, got: #{inspect(subscriber)}"
+  end
+
   @doc """
   Dispatches an event to a controller.
   """
@@ -572,6 +590,14 @@ defmodule Solve.Controller do
       end
 
     {:reply, :ok, server_state}
+  end
+
+  @doc false
+  def __handle_external_unsubscribe__(subscriber, server_state) when is_pid(subscriber) do
+    case Map.get(server_state.external_subscription_refs_by_pid, subscriber) do
+      nil -> {:reply, :ok, server_state}
+      ref -> {:reply, :ok, delete_subscription(server_state, ref)}
+    end
   end
 
   @doc false

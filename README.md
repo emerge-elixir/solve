@@ -94,6 +94,12 @@ iex(5)> Solve.subscribe(app_pid, :hello)
 Subscribing to a controller returns its currently exposed data and
 you also receive a message with new information whenever it changes.
 
+You can unsubscribe using:
+```elixir
+:ok = Solve.unsubscribe(app_pid, :hello)
+```
+Already queued updates may still arrive.
+
 ## Exposing data
 
 By default controller exposes it's internal state, which can be modified

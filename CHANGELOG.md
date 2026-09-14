@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Fixed
+- Give pending subscription attachment retries distinct tokens so canceled work cannot affect a new subscription in the same controller generation.
 - Reject stale controller-instance updates and out-of-order dependency/lookup snapshots.
 - Install filtered and unfiltered collection dependencies atomically, preventing invalid intermediate collections.
 - Keep controller subscription failures isolated from the app, with bounded live-target attachment retries.
@@ -23,6 +24,7 @@
 - Restore Credo complexity, nesting, repeated-filter, and redundant-with checks. CI covers Elixir 1.18/OTP 27, Elixir 1.19/OTP 28, and Elixir 1.20/OTP 29 with separate caches.
 
 ### Added
+- `Solve.unsubscribe/2` and `/3` remove raw subscriptions without stopping controllers or disturbing internal observers. Live-controller detachment is bounded to one second; nested timeout errors remove logical interest, while outer app-call timeout exits leave completion unknown. Direct reentrant calls are rejected before mutation. Lookup caches are not cleared.
 - `Solve.Collection.new/1` for validated ordered bulk construction.
 - `Solve.Lookup.cleanup/0` for retired app cache/monitor cleanup.
 - Deterministic audit regression tests and `bench/runtime.exs` for construction, warm lookup, and collection fan-out measurements.
