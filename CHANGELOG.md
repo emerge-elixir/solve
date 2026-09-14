@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Fixed
+- Keep lookup aliases tied to cached interests, preserve live old-app refs on name rebind, and prevent dispatch or failed acquisitions from creating ownership aliases.
 - Give pending subscription attachment retries distinct tokens so canceled work cannot affect a new subscription in the same controller generation.
 - Reject stale controller-instance updates and out-of-order dependency/lookup snapshots.
 - Install filtered and unfiltered collection dependencies atomically, preventing invalid intermediate collections.
@@ -16,7 +17,8 @@
 
 ### Changed
 - Explicit app dispatch requires `Solve.dispatch/4`; pass `%{}` for no payload. Implicit `/2` and `/3` remain available in controller context.
-- Add optional version/routing metadata to update envelopes. Versionless manual updates cannot override managed versioned refs.
+- **Breaking:** Lookup accepts only canonical-PID, versioned updates for targets explicitly acquired through `solve` or `collection`. `handle_message/1` no longer seeds caches or subscribes from unsolicited/versionless updates; manual consumers must acquire first and forward complete runtime envelopes.
+- Add optional version/routing metadata to raw update envelopes. App-managed dependencies require versioned updates.
 - Collection dependencies now receive app-owned snapshots instead of direct child patches; single dependencies and external item updates remain direct.
 - Controller initialization defaults to 5,000 ms (`controller_start_timeout` app option); supervised shutdown is bounded to 1,000 ms.
 - Warm lookup reads no longer query controller metadata. Manual/helper users should forward owned `:solve_lookup_down` messages or clean up retired refs explicitly.

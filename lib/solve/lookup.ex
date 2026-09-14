@@ -92,7 +92,7 @@ defmodule Solve.Lookup do
 
   @spec solve(GenServer.server() | nil, target()) :: map() | nil
   def solve(app, target) do
-    case ensure_ref(resolve_app!(app), target) do
+    case read_ref(app, target) do
       nil ->
         nil
 
@@ -110,7 +110,7 @@ defmodule Solve.Lookup do
 
   @spec collection(GenServer.server() | nil, atom()) :: Solve.Collection.t(map())
   def collection(app, source) when is_atom(source) do
-    case ensure_ref(resolve_app!(app), source) do
+    case read_ref(app, source) do
       %Ref{kind: :collection, value: value} ->
         value
 
@@ -179,8 +179,11 @@ defmodule Solve.Lookup do
   Consumes update/dispatch envelopes, or owned `:solve_lookup_down` monitor messages.
 
   Manual mode should forward the tagged monitor messages here as well as envelopes.
-  Versionless manual updates can populate a legacy ref, but cannot overwrite a
-  versioned runtime ref. Updates for retired app processes are ignored.
+  Acquire a target with `solve/2` or `collection/2` before forwarding its updates.
+  Only versioned updates carrying the canonical app PID for an existing ref are
+  accepted. Unsolicited, versionless, obsolete, and retired-app updates are ignored;
+  messages never create subscriptions or seed the cache. Forward the complete runtime
+  envelope rather than rebuilding an update from its value.
   """
   @spec handle_message(
           Solve.Message.t()
@@ -206,23 +209,32 @@ defmodule Solve.Lookup do
     %{}
   end
 
-  def handle_message(%Solve.Message{type: :update, payload: %Update{} = update}) do
-    app = resolve_message_app(update.app)
+  def handle_message(%Solve.Message{
+        type: :update,
+        payload: %Update{app: app, version: {generation, revision}} = update
+      })
+      when is_pid(app) and is_integer(generation) and generation >= 0 and
+             is_integer(revision) and revision >= 0 do
+    case lookup_ref(app, update.controller_name) do
+      nil ->
+        %{}
 
-    if app != nil and alive?(app) do
-      accept_update(%{update | app: app})
-    else
-      if app, do: forget_app(app)
-      %{}
+      ref ->
+        if alive?(app) do
+          accept_update(update, ref)
+        else
+          forget_app(app)
+          %{}
+        end
     end
   end
 
-  defp accept_update(update) do
-    current = lookup_ref(update.app, update.controller_name)
-    previous = if current, do: current.version
+  def handle_message(%Solve.Message{type: :update, payload: %Update{}}), do: %{}
 
-    if Update.newer?(update.version, previous) do
-      ref = update |> complete_legacy_update() |> put_ref()
+  defp accept_update(update, current) do
+    if current.kind == update.kind and Update.newer?(update.version, current.version) do
+      ref = %{current | value: augment_value(update), version: update.version}
+      Process.put(@cache_key, put_in(cache(), [:apps, ref.app, :refs, ref.controller_name], ref))
 
       updated =
         case ref.kind do
@@ -240,7 +252,25 @@ defmodule Solve.Lookup do
   @spec cleanup() :: :ok
   def cleanup do
     Enum.each(cache().apps, fn {pid, _} -> if not alive?(pid), do: forget_app(pid) end)
+    cache = cache()
+    aliases = Map.filter(cache.aliases, fn {_, pid} -> Map.has_key?(cache.apps, pid) end)
+    Process.put(@cache_key, %{cache | aliases: aliases})
     :ok
+  end
+
+  defp read_ref(app, target) do
+    app = context_app!(app)
+    previous = Map.get(cache().aliases, app)
+    if previous != nil and not alive?(previous), do: forget_app(previous)
+    pid = resolve_app!(app)
+    ref = ensure_ref(pid, target)
+
+    if ref != nil and not is_pid(app) do
+      cache = cache()
+      Process.put(@cache_key, %{cache | aliases: Map.put(cache.aliases, app, pid)})
+    end
+
+    ref
   end
 
   defp ensure_ref(app, target) do
@@ -278,15 +308,6 @@ defmodule Solve.Lookup do
     Process.put(@cache_key, %{cache | apps: Map.put(cache.apps, update.app, app_cache)})
     ref
   end
-
-  defp complete_legacy_update(%Update{version: nil} = update) do
-    case Solve.subscribe_snapshot(update.app, update.controller_name) do
-      nil -> update
-      metadata -> %{metadata | exposed_state: update.exposed_state, version: nil}
-    end
-  end
-
-  defp complete_legacy_update(update), do: update
 
   defp augment_value(
          %Update{kind: :collection, exposed_state: %Solve.Collection{} = collection} = update
@@ -342,15 +363,19 @@ defmodule Solve.Lookup do
     Process.put(@cache_key, %{cache | apps: Map.delete(cache.apps, pid), aliases: aliases})
   end
 
-  defp resolve_app!(nil) do
+  defp context_app!(nil) do
     case Process.get(:solve_app) do
       nil ->
         raise ArgumentError, "Solve.Lookup could not resolve a solve app for the current process"
 
       app ->
-        resolve_app!(app)
+        app
     end
   end
+
+  defp context_app!(app), do: app
+
+  defp resolve_app!(nil), do: resolve_app!(context_app!(nil))
 
   defp resolve_app!(app) when is_pid(app) do
     if alive?(app) do
@@ -362,30 +387,23 @@ defmodule Solve.Lookup do
   end
 
   defp resolve_app!(app) do
-    pid = resolve_message_app(app)
-    previous = Map.get(cache().aliases, app)
-    if previous != nil and previous != pid, do: forget_app(previous)
+    pid = resolve_named_app(app)
 
     if is_pid(pid) do
-      cache = cache()
-      Process.put(@cache_key, %{cache | aliases: Map.put(cache.aliases, app, pid)})
       pid
     else
       exit({:noproc, {__MODULE__, :resolve_app, [app]}})
     end
   end
 
-  defp resolve_message_app(app) when is_pid(app), do: app
-  defp resolve_message_app(nil), do: resolve_app!(nil)
-
-  defp resolve_message_app({name, remote_node}) when is_atom(name) and is_atom(remote_node) do
+  defp resolve_named_app({name, remote_node}) when is_atom(name) and is_atom(remote_node) do
     case :rpc.call(remote_node, Process, :whereis, [name]) do
       pid when is_pid(pid) -> pid
       _ -> nil
     end
   end
 
-  defp resolve_message_app(app), do: GenServer.whereis(app)
+  defp resolve_named_app(app), do: GenServer.whereis(app)
 
   defp alive?(pid) when node(pid) == node(), do: Process.alive?(pid)
 

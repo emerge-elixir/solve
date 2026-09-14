@@ -873,6 +873,7 @@ use the value cached in process dictionary.
 `use Solve.Lookup` will add a couple of handle_info clauses that match on Solve.Message.
 When message is received they will update
 the process cache and call the `handle_solve_updated` callback.
+Only updates for targets already acquired through `solve` or `collection` are accepted.
 
 In the example, a new scene is rendered into GenServer state on each solve update.
 

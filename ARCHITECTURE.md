@@ -68,9 +68,9 @@ Membership, exact value changes, order changes, and child routing changes advanc
 Even a same-value child replacement refreshes collection lookup event refs.
 
 The public `Message.update/3` and `Update.new/3` constructors still create versionless envelopes.
-Standalone/manual usage remains supported, but versionless messages cannot override an existing
-versioned lookup ref or update app-managed controller dependencies. Runtime-to-app updates must
-identify the current managed instance.
+Standalone/raw usage remains supported, but versionless messages cannot update lookup refs or
+app-managed controller dependencies. Lookup requires explicit acquisition and complete versioned
+runtime envelopes. Runtime-to-app updates must identify the current managed instance.
 
 Versions establish ordering per target/binding, not a transaction across the whole graph.
 The graph remains eventually consistent; independent upstream events can expose intermediate
@@ -181,7 +181,9 @@ This raw API does not clear lookup caches or drain queued messages.
 Lookup caches refs by concrete app PID and target in the caller's process dictionary. Names
 (including global/via names) resolve to the current PID; aliases do not duplicate cached refs.
 A named-app restart is detected on the next read and causes a fresh subscription. An explicit
-old PID is never rebound to another app.
+old PID is never rebound to another app. Only reads that install or reuse a ref record aliases;
+dispatch does not change lookup ownership. Rebinding a name to another live app retains the old
+app's explicit refs.
 
 An internal subscription snapshot returns value, kind, declared events, target PID(s), and version
 coherently. Item maps are augmented with reserved `:events_` tuples. Collection items are augmented
@@ -198,7 +200,10 @@ replacement. Process update envelopes and fetch fresh lookup values, or use expl
 Auto mode installs handlers for nil, `%Solve.Message{}`, and owned tagged monitor messages:
 `{:solve_lookup_down, ref, :process, app_pid, reason}`. Other DOWN messages remain the caller's
 responsibility. Accepted updates invoke `handle_solve_updated/2` with updates grouped by app PID;
-obsolete updates and monitor cleanup return no updates.
+obsolete updates and monitor cleanup return no updates. Update acceptance requires a valid version,
+a canonical app PID, and an existing ref acquired through `solve` or `collection`. Unsolicited,
+versionless, and name-addressed update envelopes return no updates without resolving addresses,
+subscribing, or creating cache metadata.
 
 Manual mode installs no handlers. Forward envelopes and the owned tagged monitor messages to
 `Solve.Lookup.handle_message/1`. Helper mode likewise requires the host process to handle its
