@@ -1,36 +1,26 @@
 # Changelog
 
-## [Unreleased]
-
-### Fixed
-- Keep lookup aliases tied to cached interests, preserve live old-app refs on name rebind, and prevent dispatch or failed acquisitions from creating ownership aliases.
-- Give pending subscription attachment retries distinct tokens so canceled work cannot affect a new subscription in the same controller generation.
-- Reject stale controller-instance updates and out-of-order dependency/lookup snapshots.
-- Install filtered and unfiltered collection dependencies atomically, preventing invalid intermediate collections.
-- Keep controller subscription failures isolated from the app, with bounded live-target attachment retries.
-- Supervise temporary controller children so normal shutdown, partial startup failure, and owner death clean them up.
-- Invalidate lookup refs when named apps restart and refresh collection routing after same-value child replacement.
-- Prune removed targets, empty subscriber registrations, and expired restart history.
-- Use exact collection key/value comparisons, correct nil membership, and validate reorder permutations.
-- Derive graph edges from validated bindings and reject inconsistent pre-populated specs.
-- Repair `mix quality` environment selection and share checks with CI.
-
-### Changed
-- Explicit app dispatch requires `Solve.dispatch/4`; pass `%{}` for no payload. Implicit `/2` and `/3` remain available in controller context.
-- **Breaking:** Lookup accepts only canonical-PID, versioned updates for targets explicitly acquired through `solve` or `collection`. `handle_message/1` no longer seeds caches or subscribes from unsolicited/versionless updates; manual consumers must acquire first and forward complete runtime envelopes.
-- Add optional version/routing metadata to raw update envelopes. App-managed dependencies require versioned updates.
-- Collection dependencies now receive app-owned snapshots instead of direct child patches; single dependencies and external item updates remain direct.
-- Controller initialization defaults to 5,000 ms (`controller_start_timeout` app option); supervised shutdown is bounded to 1,000 ms.
-- Warm lookup reads no longer query controller metadata. Manual/helper users should forward owned `:solve_lookup_down` messages or clean up retired refs explicitly.
-- Consolidate runtime target state and lifecycle code; build bulk collections and graph queues without quadratic append loops.
-- Restore Credo complexity, nesting, repeated-filter, and redundant-with checks. CI covers Elixir 1.18/OTP 27, Elixir 1.19/OTP 28, and Elixir 1.20/OTP 29 with separate caches.
+## [0.2.3] - 2026-09-14
 
 ### Added
-- `Solve.Lookup.unsubscribe/1` and `/2` release process-local lookup interests and request raw detachment. Names identify cached owners, not replacement apps; queued updates cannot recreate removed refs. Raw reentrancy rejection preserves the cache, while other failures clear it without claiming confirmed physical detachment.
-- `Solve.unsubscribe/2` and `/3` remove raw subscriptions without stopping controllers or disturbing internal observers. Live-controller detachment is bounded to one second; nested timeout errors remove logical interest, while outer app-call timeout exits leave completion unknown. Direct reentrant calls are rejected before mutation. Lookup caches are not cleared.
-- `Solve.Collection.new/1` for validated ordered bulk construction.
-- `Solve.Lookup.cleanup/0` for retired app cache/monitor cleanup.
-- Deterministic audit regression tests and `bench/runtime.exs` for construction, warm lookup, and collection fan-out measurements.
+- `Solve.unsubscribe/2` and `/3` to stop receiving raw updates without stopping the controller.
+- `Solve.Lookup.unsubscribe/1` and `/2` to release a process-local lookup subscription and its cached value. A later lookup subscribes again.
+- `Solve.Collection.new/1` to build an ordered collection from `{id, value}` pairs.
+- `Solve.Lookup.cleanup/0` to clear cached data for app instances that have stopped.
+
+### Changed
+- **Breaking:** Explicit app dispatch requires `Solve.dispatch(app, target, event, payload)`. Pass `%{}` when no payload is needed; implicit `/2` and `/3` remain available in controller context.
+- **Breaking:** Acquire lookup targets through `solve` or `collection` before forwarding updates. `Solve.Lookup.handle_message/1` no longer creates subscriptions or seeds the cache from unsolicited or versionless updates. Forward complete runtime envelopes rather than rebuilding them from values.
+- Controller startup now times out after five seconds by default. Set the app's `:controller_start_timeout` option for slower initialization.
+- Reduce overhead of repeated cached lookup reads.
+
+### Fixed
+- Refresh lookup values and event handlers correctly after controller replacement or app restart.
+- Keep collection dependencies consistent during item changes, reordering, and replacement.
+- Correct collection handling of nil values and distinct numeric keys such as `1` and `1.0`; reject invalid reorder operations.
+- Avoid restarting slow controllers when a subscription times out.
+- Clean up controller processes when their app stops or initialization fails.
+- Reject invalid controller dependency definitions with clearer errors.
 
 ## [0.2.2] - 2026-08-19
 
