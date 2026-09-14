@@ -9,8 +9,18 @@ on:
 
 jobs:
   ci:
-    name: Elixir CI
+    name: Elixir ${{ matrix.elixir }} / OTP ${{ matrix.otp }}
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - elixir: "1.18.4"
+            otp: "27.3.4.3"
+          - elixir: "1.19.5"
+            otp: "28.3"
+          - elixir: "1.20.2"
+            otp: "29.0.5"
 
     steps:
       - name: Checkout source code
@@ -19,8 +29,8 @@ jobs:
       - name: Set up Elixir and OTP
         uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.19.5"
-          otp-version: "28.3"
+          elixir-version: ${{ matrix.elixir }}
+          otp-version: ${{ matrix.otp }}
 
       - name: Cache Mix dependencies and build
         uses: actions/cache@v5
@@ -28,9 +38,9 @@ jobs:
           path: |
             deps
             _build
-          key: ${{ runner.os }}-mix-${{ hashFiles('mix.lock') }}
+          key: ${{ runner.os }}-otp-${{ matrix.otp }}-elixir-${{ matrix.elixir }}-mix-${{ hashFiles('mix.lock') }}
           restore-keys: |
-            ${{ runner.os }}-mix-
+            ${{ runner.os }}-otp-${{ matrix.otp }}-elixir-${{ matrix.elixir }}-mix-
 
       - name: Install Hex and Rebar
         run: |

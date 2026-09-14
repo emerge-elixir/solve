@@ -47,12 +47,7 @@ defmodule Solve.MixProject do
 
   defp aliases do
     [
-      quality: [
-        "format --check-formatted",
-        "compile --warnings-as-errors",
-        "credo --strict",
-        "dialyzer"
-      ],
+      quality: ["cmd ./ci-tests.sh quality", "cmd ./ci-tests.sh dialyzer"],
       "quality.fast": [
         "format --check-formatted",
         "compile --warnings-as-errors",
