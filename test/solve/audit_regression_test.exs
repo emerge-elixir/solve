@@ -10,6 +10,11 @@ defmodule Solve.AuditRegressionTest do
     def set(value), do: %{value: value}
   end
 
+  setup do
+    Process.flag(:trap_exit, true)
+    :ok
+  end
+
   test "collection identity and membership use exact comparisons" do
     collection = Collection.empty() |> Collection.put(1, :integer) |> Collection.put(1.0, :float)
     assert Collection.delete(collection, 1.0) == %Collection{ids: [1], items: %{1 => :integer}}
@@ -40,6 +45,28 @@ defmodule Solve.AuditRegressionTest do
 
       assert Solve.DependencyGraph.compile([spec]) == {:error, reason}
     end
+  end
+
+  test "managed dependencies ignore older revisions, generations and unversioned messages" do
+    {:ok, controller} =
+      Value.start_link(
+        solve_app: self(),
+        params: %{value: 0},
+        generation: 10,
+        dependencies: %{source: %{value: 1}},
+        dependency_versions: %{source: {4, 1}}
+      )
+
+    on_exit(fn -> Process.exit(controller, :kill) end)
+    send(controller, Solve.DependencyUpdate.replace(self(), :source, %{value: 2}, {5, 0}))
+
+    for version <- [{4, 99}, {5, 0}, nil] do
+      send(controller, Solve.DependencyUpdate.replace(self(), :source, %{value: 999}, version))
+    end
+
+    assert :sys.get_state(controller).dependencies.source == %{value: 2}
+    send(controller, Solve.DependencyUpdate.replace(self(), :source, %{value: 3}, {5, 1}))
+    assert :sys.get_state(controller).dependencies.source == %{value: 3}
   end
 
   test "graph canonicalization is idempotent and rejects inconsistent or cyclic bindings" do
