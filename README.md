@@ -870,6 +870,16 @@ We are using a few convenience helpers from Solve.Lookup here `solve`, `event`, 
 controller, subscribe to it and cache it to the process dictionary. Next time it is called it will
 use the value cached in process dictionary.
 
+You can use
+
+```elixir
+:ok = Solve.Lookup.unsubscribe(app_pid, :n_counters)
+```
+
+This clears that cached ref and requests raw detachment. Queued updates cannot
+recreate it. A later `solve` or `collection` read explicitly subscribes again.
+Unsubscribe does not edit the presenter's scene or call `handle_solve_updated`.
+
 `use Solve.Lookup` will add a couple of handle_info clauses that match on Solve.Message.
 When message is received they will update
 the process cache and call the `handle_solve_updated` callback.

@@ -124,6 +124,77 @@ defmodule Solve.Lookup do
     end
   end
 
+  @doc """
+  Releases a lookup interest using the calling process's `:solve_app` context.
+
+  See `unsubscribe/2` for ownership and partial-failure semantics.
+  """
+  @spec unsubscribe(target()) :: :ok | {:error, term()}
+  def unsubscribe(target), do: unsubscribe(nil, target)
+
+  @doc """
+  Releases the calling process's cached interest in a target and requests raw detachment.
+
+  Use an app PID or a name previously used to acquire a lookup. Names identify their
+  cached app instance: this function never resolves a name to discover a replacement
+  app. An unknown alias or missing ref returns `:ok` without an app call. Passing
+  `nil` uses the calling process's `:solve_app` context.
+
+  Removes only this target. Collection sources and individual items are independent;
+  repeated reads and aliases share one interest, not reference counts. The last ref
+  for an app also releases its lookup monitor and aliases. Queued updates cannot
+  recreate a removed ref; a later `solve/2` or `collection/2` explicitly reacquires it.
+  No update callback is invoked and previously returned event tuples remain usable.
+
+  A raw reentrancy error preserves the cache unchanged. Other raw errors remove the
+  ref but leave physical detachment unconfirmed. Outer app-call exits also remove the
+  ref before propagating; confirmed app death is treated as successful cleanup.
+
+  `:ok` for a missing ref certifies only a local no-op, not physical detachment. After
+  a timeout, another lookup unsubscribe does not retry the raw operation. Use
+  `Solve.unsubscribe/2` with the original app PID if confirmation is needed, or to
+  release raw subscriptions that have no lookup ref (including failed acquisitions).
+  """
+  @spec unsubscribe(GenServer.server() | nil, target()) :: :ok | {:error, term()}
+  def unsubscribe(app, target) do
+    app = context_app!(app)
+    pid = if is_pid(app), do: app, else: Map.get(cache().aliases, app)
+
+    case lookup_ref(pid, target) do
+      nil -> :ok
+      %Ref{} -> unsubscribe_ref(pid, target)
+    end
+  end
+
+  defp unsubscribe_ref(app, target) do
+    if locally_dead?(app) do
+      forget_app(app)
+      :ok
+    else
+      case Solve.unsubscribe(app, target, self()) do
+        {:error, :reentrant_unsubscribe} = error ->
+          error
+
+        result ->
+          forget_ref(app, target)
+          result
+      end
+    end
+  catch
+    :exit, reason ->
+      if app_gone?(app, reason) do
+        forget_app(app)
+        :ok
+      else
+        forget_ref(app, target)
+        :erlang.raise(:exit, reason, __STACKTRACE__)
+      end
+  end
+
+  defp app_gone?(app, {:noproc, {GenServer, :call, [app, _request, _timeout]}}), do: true
+  defp app_gone?(app, _reason), do: locally_dead?(app)
+  defp locally_dead?(pid), do: node(pid) == node() and not Process.alive?(pid)
+
   @type dispatch_event ::
           {pid(), {:solve_event, atom()}} | {pid(), {:solve_event, atom(), term()}}
 
@@ -350,6 +421,16 @@ defmodule Solve.Lookup do
 
   defp lookup_ref(app, target), do: get_in(cache(), [:apps, app, :refs, target])
   defp cache, do: Process.get(@cache_key, %{apps: %{}, aliases: %{}})
+
+  defp forget_ref(app, target) do
+    refs = Map.delete(cache().apps[app].refs, target)
+
+    if map_size(refs) == 0 do
+      forget_app(app)
+    else
+      Process.put(@cache_key, put_in(cache(), [:apps, app, :refs], refs))
+    end
+  end
 
   defp forget_app(pid) do
     cache = cache()

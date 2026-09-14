@@ -183,7 +183,8 @@ Lookup caches refs by concrete app PID and target in the caller's process dictio
 A named-app restart is detected on the next read and causes a fresh subscription. An explicit
 old PID is never rebound to another app. Only reads that install or reuse a ref record aliases;
 dispatch does not change lookup ownership. Rebinding a name to another live app retains the old
-app's explicit refs.
+app's explicit refs. Release them before reading through the rebound name, or retain the old PID
+for cleanup.
 
 An internal subscription snapshot returns value, kind, declared events, target PID(s), and version
 coherently. Item maps are augmented with reserved `:events_` tuples. Collection items are augmented
@@ -194,6 +195,30 @@ or registry name can still involve registry/node work.
 Direct event tuples are instance-bound: previously copied tuples do not magically retarget after
 replacement. Process update envelopes and fetch fresh lookup values, or use explicit
 `Solve.dispatch/4` when lifecycle-safe routing is required.
+
+### Releasing lookup interests
+
+`Solve.Lookup.unsubscribe/1,2` operates on the calling process's cached interest. It uses an
+explicit PID or a previously acquired alias's cached PID, never a freshly resolved name. An
+unknown alias or missing target ref is a local `:ok` no-op, even if a raw subscription exists.
+A new acquisition through a reused name binds that alias to the new instance; there are no
+historical acquisition handles or per-alias reference counts.
+
+For an existing ref, Lookup calls raw unsubscribe on the pinned PID. Success removes that ref;
+raw reentrancy rejection preserves it unchanged. Other errors remove it with physical cleanup
+unconfirmed, and outer call exits are re-raised after local removal. Confirmed app death removes
+all of that app's refs; a remote disconnect alone is not confirmation. A second lookup unsubscribe
+after an error is a local no-op, not a physical retry. Use raw unsubscribe with the original PID
+when that confirmation is needed.
+
+Only the requested target is removed; collection sources and separately acquired items remain
+independent. The last ref releases the owned app monitor and all its aliases. No tombstones or
+cleanup workers are retained. Updates cannot create refs, so queued messages are ignored while
+the target is absent. An explicit later read reacquires it; versions still govern update ordering
+after reacquisition, without introducing per-subscription message epochs.
+
+Unsubscribe does not invoke an update callback, modify a saved scene, stop controllers, or revoke
+returned event tuples. Render code that reads the target again intentionally resubscribes.
 
 ### Auto, manual, and helper modes
 

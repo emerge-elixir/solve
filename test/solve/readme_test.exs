@@ -280,6 +280,22 @@ defmodule Solve.ReadmeTest do
     assert Solve.subscribe(app, {:counter, 1}) == %{count: 7}
   end
 
+  test "lookup unsubscribe example releases the calling process's cached interest" do
+    app = start_app(Presenter.App)
+    assert Solve.Lookup.solve(app, :n_counters).count == 0
+    controller = Solve.controller_pid(app, :n_counters)
+
+    code =
+      @readme
+      |> Examples.blocks("Looking up data inside of Solve application")
+      |> Enum.find(&String.contains?(&1, "Solve.Lookup.unsubscribe("))
+
+    assert {:ok, _binding} = Code.eval_string(code, app_pid: app)
+    assert Process.get({Solve.Lookup, :cache}) == %{apps: %{}, aliases: %{}}
+    refute Map.has_key?(:sys.get_state(app).subscribers, :n_counters)
+    assert Solve.controller_pid(app, :n_counters) == controller
+  end
+
   test "presenter renders collections and dispatches direct item events" do
     app = start_app(Presenter.App)
     {:ok, presenter} = Presenter.Presenter.start_link(app)

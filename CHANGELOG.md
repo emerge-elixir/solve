@@ -26,6 +26,7 @@
 - Restore Credo complexity, nesting, repeated-filter, and redundant-with checks. CI covers Elixir 1.18/OTP 27, Elixir 1.19/OTP 28, and Elixir 1.20/OTP 29 with separate caches.
 
 ### Added
+- `Solve.Lookup.unsubscribe/1` and `/2` release process-local lookup interests and request raw detachment. Names identify cached owners, not replacement apps; queued updates cannot recreate removed refs. Raw reentrancy rejection preserves the cache, while other failures clear it without claiming confirmed physical detachment.
 - `Solve.unsubscribe/2` and `/3` remove raw subscriptions without stopping controllers or disturbing internal observers. Live-controller detachment is bounded to one second; nested timeout errors remove logical interest, while outer app-call timeout exits leave completion unknown. Direct reentrant calls are rejected before mutation. Lookup caches are not cleared.
 - `Solve.Collection.new/1` for validated ordered bulk construction.
 - `Solve.Lookup.cleanup/0` for retired app cache/monitor cleanup.
