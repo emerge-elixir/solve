@@ -1,367 +1,200 @@
 # Solve architecture
 
-Solve is a controller-graph runtime built from one coordinating `Solve` process, a set of
-controller `GenServer`s, and optional collection sources that materialize ordered child sets.
+Solve runs a static controller graph using a coordinating app GenServer, an app-owned
+`DynamicSupervisor`, and one GenServer per running controller. `Solve` contains the public API
+and generated app callbacks; `lib/solve/runtime.ex` owns reconciliation and lifecycle implementation.
 
-The `Solve` app process owns graph validation, controller lifecycle, dependency reconciliation,
-source- and target-level exposed-state caching, and external subscriber tracking. Controller
-instances own their internal state and expose plain-map public views through `expose/3`.
+## Sources, targets, and state ownership
 
-## Core model
+- A **source** is a declared atom, such as `:counter` or `:column`.
+- A singleton source runs at its own atom target.
+- A collection source is virtual. Its concrete children run at targets such as `{:column, 3}`.
+- The graph is source-level and static; collection IDs and controller instances are dynamic.
 
-### Sources and targets
+The runtime keeps one record per running target: PID, monitor, params, callbacks, latest
+versioned exposed snapshot, and singleton dependency subscription refs. Removed collection
+targets are deleted rather than retained as stopped records.
 
-Solve distinguishes between static source names and concrete runtime targets.
+Source-level state holds materialized collection snapshots and singleton stopped snapshots.
+A live singleton's authoritative value comes from its target record. Graph metadata and declared
+events are compiled/cached at startup. External subscription registrations and recent restart
+history are separate from target existence.
 
-- a source name is an atom such as `:counter` or `:column`
-- a singleton source runs at target `:counter`
-- a collected child runs at a tuple target like `{:column, 3}`
-- a collection source itself is virtual; it does not own a controller pid
-
-The dependency graph is static and source-level. Runtime lifecycle, subscriptions, and dispatch can
-operate on either source names or concrete targets.
-
-### Solve app runtime
-
-Each `use Solve` module starts a single app `GenServer` that:
-
-- validates the controller graph on boot
-- starts, stops, and replaces singleton targets and collection child targets
-- caches the latest exposed state for each source and each running target
-- materializes `%Solve.Collection{ids, items}` values for collection sources
-- tracks external subscribers per source or target
-- reconciles dependents when upstream state, params, or collection membership change
-
-### Controller graph
-
-The app module defines `controllers/0` with `controller!/1` specs. Each spec declares:
-
-- a controller name
-- a controller module
-- a variant, `:singleton` or `:collection`
-- dependency bindings
-- params, either as a literal value or a unary function
-- for collection sources, a `collect/1` callback returning ordered child ids and params
-- optional callbacks passed to event handlers
-
-Inside a `use Solve` module, callback functions can call bare `dispatch/2` or `dispatch/3`.
-That implicit app resolution is only guaranteed while a controller event handler is executing.
-
-Solve normalizes dependency bindings into source-level graph edges plus local dependency keys.
-
-Examples:
-
-- `:user`
-- `current_user: :user`
-- `columns: collection(:column)`
-- `visible_columns: collection(:column, fn id, item -> item.visible? end)`
-
-### Controllers
-
-Each concrete controller instance is its own `GenServer` built on `Solve.Controller`. A running
-instance owns:
-
-- internal user state
-- a cached snapshot of dependency values
-- declared event handlers
-- an `expose/3` projection for subscribers and dependent controllers
-
-Internal state can be any term. The public exposed state for a running instance must always be a
-plain map.
-
-Collection sources are different: Solve materializes them as `%Solve.Collection{ids, items}` from
-the exposed state of their child targets. The child controllers themselves are ordinary controllers
-and do not know they came from a collection source.
-
-### Exposed state
-
-Solve treats exposed state as the shared boundary between processes.
-
-- subscribers see exposed state, not internal state
-- dependent controllers read exposed state from upstream singletons or collected children
-- the Solve app caches exposed state to drive reconciliation
-- `nil` is reserved to mean a singleton or collected child is off or stopped
-- collection sources expose `%Solve.Collection{}` instead of `nil`
-
-### Messages
-
-External update communication uses `%Solve.Message{}` envelopes:
-
-- `%Solve.Message{type: :update, payload: %Solve.Update{...}}`
-- `%Solve.Message{type: :dispatch, payload: %Solve.Dispatch{...}}`
-
-Lookup item event refs also expose direct `{pid, {:solve_event, ...}}` tuples for immediate sends.
-
-Internal controller-to-controller dependency updates use `%Solve.DependencyUpdate{}`.
-
-This lets the same controller broadcast turn into:
-
-- an external `%Solve.Message{}` for UI or `Solve.Lookup` subscribers
-- a `:replace` dependency patch for single bindings
-- `:collection_put`, `:collection_delete`, or `:collection_reorder` patches for collection bindings
+Controllers own user state, dependency values/versions, callbacks, and subscriber monitors. User
+state can be any term. A running controller's `expose/3` must return a plain map. `nil` means an
+item target is off; a collection source always exposes `%Solve.Collection{ids, items}`.
 
 ## Graph compilation
 
-Graph validation happens on app boot, before any controllers start.
+`controllers/0` returns `controller!/1` specifications. Dependencies can be plain, aliased,
+or collection bindings:
 
-Validation enforces:
+```elixir
+:user
+current_user: :user
+columns: collection(:column)
+visible_columns: collection(:column, fn _id, item -> item.visible? end)
+```
 
-- controller names are unique atoms
-- controller modules are valid module atoms
-- dependency sources reference known controllers
-- dependency keys do not repeat
-- controllers do not depend on themselves
-- collection bindings only point at collection sources
-- plain bindings do not point at collection sources
-- the graph is acyclic
+Validation produces canonical bindings and derives source edges from them. Pre-populated
+bindings cannot hide self-dependencies, unknown sources, or cycles; conflicting supplied source
+lists are rejected. Revalidating a normalized spec preserves its graph.
 
-The compiled graph produces:
+Compilation verifies unique atom names and binding keys, module atoms, params/collect/callback
+shapes, binding/source variants, known references, and acyclicity. A queue-based topological
+sort produces startup order. Direct-dependent lists are preordered once for reconciliation.
 
-- `controller_specs_by_name`
-- `sorted_controller_names`
-- `dependents_map`
+## Versions and message ordering
 
-This gives Solve a stable source-level dependency order plus fast direct-dependent lookup.
+Runtime item updates carry optional public `%Solve.Update{}` metadata:
 
-## Controller lifecycle
+- `app`: the concrete app-instance PID
+- `controller_name` and `exposed_state`: the existing public payload
+- `version`: `{generation, revision}`
+- `pid`, `events`, `kind`, and `routes`: routing/lookup metadata
 
-On boot, Solve walks the source graph in topological order and reconciles each source.
+An app-wide monotonically increasing counter allocates item generations on start, replacement,
+and stop. Generations are not reused when a collection ID is removed and recreated. Each
+controller increments its revision on an exact (`!==`) exposed-value change. A subscription
+handshake returns value, routing metadata, and version together.
 
-### Singleton sources
+The app accepts item updates only from the current target PID/generation with a newer revision.
+Singleton dependents and lookup refs reject obsolete generations, duplicate revisions, and
+older subscription snapshots. Nil/stopped notifications have a newer generation, so delayed
+messages cannot resurrect a retired instance.
 
-For a singleton source, the runtime:
+Collection sources have their own monotonically increasing revisions within generation zero.
+Membership, exact value changes, order changes, and child routing changes advance that revision.
+Even a same-value child replacement refreshes collection lookup event refs.
 
-1. builds a snapshot of dependency values
-2. resolves params from dependencies and app params
-3. compares new params with previous params
-4. keeps stopped, stops, starts, keeps running, or atomically replaces the target
+The public `Message.update/3` and `Update.new/3` constructors still create versionless envelopes.
+Standalone/manual usage remains supported, but versionless messages cannot override an existing
+versioned lookup ref or update app-managed controller dependencies. Runtime-to-app updates must
+identify the current managed instance.
 
-Callback maps do not participate in lifecycle reconciliation. If callbacks change while params stay
-equal, Solve keeps the running target and updates its callbacks in place.
+Versions establish ordering per target/binding, not a transaction across the whole graph.
+The graph remains eventually consistent; independent upstream events can expose intermediate
+but valid snapshots.
 
-Params control existence:
+## Lifecycle and failure handling
 
-- truthy params mean the target should run
-- `nil` or `false` mean the target should be stopped
+On startup the app reconciles sources in topological order. Params determine existence:
 
-Replacement is start-new-then-stop-old. The new controller is registered before the old one is
-shut down, which avoids a gap in availability.
+- nil/false -> stopped
+- truthy -> running
+- changed truthy params -> replacement
+- equal params -> retain the PID and reconcile dependencies
 
-### Collection sources
+Callback-only changes update the existing process; they do not restart it. Replacement starts
+and registers the new instance before shutting down the old one. Both remain supervisor-owned
+until the old instance exits.
 
-For a collection source, the runtime:
+Collection `collect/1` returns ordered `{id, params}` or `{id, [params: ..., callbacks: ...]}`
+entries. IDs must be unique under exact key identity. Falsy child params leave that child off.
+The materialized collection contains only running children, in collect order. Per-child callbacks
+are merged with the source's callbacks.
 
-1. builds a snapshot of source-level dependency values
-2. resolves collection params from dependencies and app params
-3. runs `collect/1` to produce ordered `{id, opts}` tuples
-4. diffs ids against the current materialized collection
-5. starts, stops, or replaces child targets like `{:column, id}`
-6. rebuilds `%Solve.Collection{ids, items}` from the child exposed state
+Every controller is a **temporary** child of the app-owned `DynamicSupervisor`. Only the app
+chooses restarts and charges its retry budget; there is no competing supervisor restart loop.
+Target monitors drive failure handling. Planned removals retire/demonitor the old record so a
+late DOWN cannot charge a second failure.
 
-`collect/1` is responsible for order. Solve preserves that order in `collection.ids`.
-Collected child replacement is params-based for a given `id`. If only collected callbacks change,
-Solve keeps the existing child pid and updates its callbacks in place.
+On a crash, the app publishes the stopped value, reconciles dependents, then retries the source.
+More than three failures for a target within five seconds stops the app. Startup failures use
+the same budget. Recent history survives removal/recreation within the window; a timer prunes
+expired history even while idle.
+
+Controller initialization defaults to a 5,000 ms timeout. Apps may set a positive
+`controller_start_timeout` option. Controller shutdown is bounded at 1,000 ms before supervisor
+forced termination. Normal app stop awaits supervisor shutdown; abnormal/forced owner death and
+failed initialization also release owned children. The startup timeout bounds a supervisor
+waiting for a child's initialization acknowledgement.
 
 ## Dependency propagation
 
-### Direct encoded subscriptions
+### Single bindings: direct versioned updates
 
-Controllers subscribe directly to their upstream dependencies when they start.
+A dependent subscribes directly to its running singleton source. The initial handshake and
+later `%Solve.DependencyUpdate{op: :replace}` messages carry a complete value and version.
+The dependent atomically replaces that binding and recomputes exposure only for newer versions.
+On source replacement, the app reattaches the dependent; on stop it sends a versioned nil value.
+Failed attachment attempts are retried a bounded number of times.
 
-Binding kinds matter:
+### Collection bindings: app-owned atomic snapshots
 
-- a single binding stores one map or `nil` under its local dependency key
-- an unfiltered collection binding stores a `%Solve.Collection{}` and subscribes to all child
-  targets in the source collection
-- a filtered collection binding stores a `%Solve.Collection{}` and subscribes only to child
-  targets whose current `{id, item}` match the filter
+The app already observes each collection child for lifecycle decisions. Accepted child updates
+rebuild the collection source. Filtered and unfiltered dependency values are derived exclusively
+from that accepted source snapshot and sent as versioned `:replace` dependency messages.
 
-Controllers still broadcast directly. Subscribers now carry encoder functions, so a broadcast can
-be transformed before delivery.
+The dependent installs the whole collection before running `expose/3`. It never sees membership,
+items, and order from different revisions. There are no runtime direct child-to-dependent
+collection subscriptions or separate runtime reorder patches.
 
-Examples:
+This intentionally favors one writer and valid intermediate state over the previous multi-writer
+patch mechanism. Full snapshot copying costs grow with collection size and fan-out; measure them
+with `mix run bench/runtime.exs`. Any future incremental optimization must retain one authoritative
+writer and apply its batch atomically.
 
-- single binding encoder -> `%Solve.DependencyUpdate{op: :replace, ...}`
-- collection binding encoder -> `%Solve.DependencyUpdate{op: :collection_put, ...}`
-- filtered collection binding encoder -> either `:collection_put` or `:collection_delete`
+Low-level standalone controller tests/clients may still use the existing collection patch
+constructors. Public `Collection.reorder/2` requires a unique permutation of current keys and
+rejects invalid input immediately. `Collection.new/1` builds ordered collections in one pass and
+rejects duplicates. Numeric keys such as `1` and `1.0` are distinct.
 
-### Solve app responsibilities
+## External APIs
 
-The Solve app also subscribes to every running singleton and collected child. That lets it:
+### Subscription
 
-- refresh its target-level cache
-- materialize source-level `%Solve.Collection{}` values
-- decide whether direct dependents should start, stop, stay running, or be replaced
-- add or remove dependency subscriptions when collection membership or filters change
+`Solve.subscribe(app, target_or_source, subscriber \\ self())` registers a PID and returns the
+raw exposed map, collection, or nil. Collection source updates come from the app; running item
+updates are still delivered directly by their controller using `%Solve.Message{type: :update}`.
 
-This keeps state propagation direct while leaving lifecycle decisions with the app process.
+A controller subscription handshake is bounded to 1,000 ms. If the process is known dead, the
+call returns nil and its monitor drives the normal restart policy. A timeout alone is not a
+crash: a live target returns its last accepted cached value, retains the registration, and gets
+up to three deferred attachment retries. Retries are tied to the target generation and subscriber.
+No duplicate instance is started merely because an observer could not attach promptly.
 
-## External interaction APIs
+Subscriber monitors remove registrations after subscriber death. Waiting registrations for absent
+collection IDs remain intentionally, so those subscribers receive a future start notification.
+Raw subscribers implementing their own cache should compare versions across lifecycle messages;
+`Solve.Lookup` handles this automatically.
 
-### `Solve.subscribe/3`
+### Dispatch and introspection
 
-`Solve.subscribe(app, target_or_source, subscriber)`:
-
-- records the subscriber at the app level
-- monitors the subscriber process
-- subscribes it directly to the concrete controller if that target is running
-- returns the current raw exposed state, `%Solve.Collection{}`, or `nil`
-
-Examples:
-
-- `Solve.subscribe(app, :counter)` -> `%{...}` or `nil`
-- `Solve.subscribe(app, :column)` -> `%Solve.Collection{...}`
-- `Solve.subscribe(app, {:column, 3})` -> `%{...}` or `nil`
-
-### `Solve.dispatch/4`
-
-`Solve.dispatch(app, target, event, payload)` routes an event through the Solve app using the
-current controller pid for that target.
-
-- if the target is running, the event is forwarded to it
-- if the target is stopped, unknown, or a collection source atom, dispatch is a silent no-op
-
-### Introspection helpers
-
-Solve also exposes:
-
-- `Solve.controller_pid/2` to read the current pid for a singleton or collected child target
-- `Solve.controller_events/2` to read the declared event names for a singleton, collection source,
-  or collected child target
-- `Solve.controller_variant/2` to read whether a source is `:singleton` or `:collection`
+- Explicit app dispatch is **`Solve.dispatch(app, target, event, payload)`**. Supply `%{}` when
+  no payload is needed. There is no explicit-app default producing an ambiguous `/3` overload.
+- Implicit `Solve.dispatch(target, event)` and `/3` use controller process context during event
+  or Solve-style `handle_info` callbacks. Callback functions can use the imported bare helpers.
+- Unknown/stopped targets and virtual collection sources silently ignore dispatch.
+- `controller_pid/2`, `controller_events/2`, and `controller_variant/2` expose routing metadata.
+- Undeclared events are logged and discarded.
 
 ## Solve.Lookup
 
-`Solve.Lookup` is a process-local wrapper and cache around `Solve.subscribe/3`
-and `Solve.dispatch/4`.
+Lookup caches refs by concrete app PID and target in the caller's process dictionary. Names
+(including global/via names) resolve to the current PID; aliases do not duplicate cached refs.
+A named-app restart is detected on the next read and causes a fresh subscription. An explicit
+old PID is never rebound to another app.
 
-The README covers the most common public usage patterns, including UI code and
-ordinary long-running processes.
+An internal subscription snapshot returns value, kind, declared events, target PID(s), and version
+coherently. Item maps are augmented with reserved `:events_` tuples. Collection items are augmented
+using the snapshot's routing map. Augmentation happens on installation/update, not on each read.
+Warm singleton and collection reads make zero calls to the Solve coordinator. Resolving a remote
+or registry name can still involve registry/node work.
 
-It stores three lookup shapes:
+Direct event tuples are instance-bound: previously copied tuples do not magically retarget after
+replacement. Process update envelopes and fetch fresh lookup values, or use explicit
+`Solve.dispatch/4` when lifecycle-safe routing is required.
 
-- singleton item lookups via `solve(app, :counter)`
-- collected child item lookups via `solve(app, {:column, 1})`
-- collection source lookups via `collection(app, :column)`
+### Auto, manual, and helper modes
 
-Item lookups are augmented with `:events_` direct event tuples. Collection lookups return
-`%Solve.Collection{}` whose items are augmented item maps. The collection wrapper itself has no
-events.
+Auto mode installs handlers for nil, `%Solve.Message{}`, and owned tagged monitor messages:
+`{:solve_lookup_down, ref, :process, app_pid, reason}`. Other DOWN messages remain the caller's
+responsibility. Accepted updates invoke `handle_solve_updated/2` with updates grouped by app PID;
+obsolete updates and monitor cleanup return no updates.
 
-`handle_message/1` refreshes the local cache and returns updates grouped by app as
-`%Solve.Lookup.Updated{refs, collections}`.
-
-### Auto mode
-
-`use Solve.Lookup` defaults to `handle_info: :auto`.
-
-Injected `handle_info/2` clauses:
-
-- ignore `nil`
-- consume `%Solve.Message{}` envelopes
-- refresh the local cache through `handle_message/1`
-- call `handle_solve_updated/2` with `%Solve.Lookup.Updated{refs, collections}`
-
-### Manual mode
-
-With `handle_info: :manual`, no `handle_info/2` clauses are injected. The caller matches
-`%Solve.Message{}` itself, calls `handle_message/1`, and decides what to do with the returned map
-of updated refs and collections.
-
-## Message shapes
-
-Singleton or child updates use `%Solve.Update{}`:
-
-```elixir
-%Solve.Message{
-  type: :update,
-  payload: %Solve.Update{
-    app: app,
-    controller_name: :counter,
-    exposed_state: %{count: 1}
-  }
-}
-
-%Solve.Message{
-  type: :update,
-  payload: %Solve.Update{
-    app: app,
-    controller_name: {:column, 1},
-    exposed_state: %{id: 1, title: "Todo"}
-  }
-}
-```
-
-Collection source updates use the same envelope with a collection payload:
-
-```elixir
-%Solve.Message{
-  type: :update,
-  payload: %Solve.Update{
-    app: app,
-    controller_name: :column,
-    exposed_state: %Solve.Collection{ids: [1], items: %{1 => %{id: 1, title: "Todo"}}}
-  }
-}
-```
-
-Deferred event dispatch still uses `%Solve.Dispatch{}` and can target either a singleton or a
-collected child target.
-
-## Invariants
-
-The runtime depends on a few fixed rules:
-
-- the source graph must be valid before runtime starts
-- singleton sources map to at most one active target pid
-- collection sources map to zero or more active child target pids
-- running controller instances must expose plain non-struct maps
-- `nil` means a singleton or collected child is off or stopped
-- collection source values are always `%Solve.Collection{}`
-- `:events_` is reserved for `Solve.Lookup` augmentation
-- downstream controllers only see upstream exposed state, never upstream internal state
-- dispatch to unknown or stopped targets is a no-op
-- undeclared controller events are logged and discarded
-
-## Typical flows
-
-### Boot
-
-1. Solve validates and compiles the source graph.
-2. Solve reconciles sources in dependency order.
-3. Running targets subscribe to their dependency targets.
-4. Solve subscribes to each running target and caches both target and source exposed state.
-
-### Event dispatch
-
-1. A process either calls `Solve.dispatch/4`, sends a deferred dispatch envelope, or sends a direct
-   `{pid, {:solve_event, ...}}` tuple produced by `Solve.Lookup`.
-2. The event reaches the current singleton or collected-child controller.
-3. The controller updates internal state and recomputes `expose/3`.
-4. If the exposed map changed, the controller broadcasts an update envelope.
-
-### Upstream state change
-
-1. An upstream singleton or collected child broadcasts a new exposed map.
-2. Dependent controllers receive the encoded dependency update directly.
-3. The Solve app refreshes its target cache and, if needed, its source `%Solve.Collection{}`.
-4. Solve reconciles direct dependents to decide whether to keep, stop, start, replace, attach, or detach subscriptions.
-
-### Collection reconcile
-
-1. A collection source re-runs `collect/1` because its upstream state changed.
-2. Solve diffs ordered ids against the existing materialized collection.
-3. Solve starts, stops, or replaces child targets like `{:column, id}`.
-4. Solve rebuilds the source `%Solve.Collection{}` and notifies external collection subscribers.
-5. Solve reevaluates collection bindings in dependents and adds or removes child subscriptions.
-
-### Crash and restart
-
-1. A controller target exits unexpectedly.
-2. Solve marks that target stopped and notifies external subscribers with an update carrying `nil`.
-3. If the target belonged to a collection source, Solve removes it from the materialized collection.
-4. Solve reconciles dependents against the new state.
-5. Solve attempts restart within a bounded retry budget.
-6. If the restart budget is exhausted, the Solve app stops.
-
-For public usage examples, see `README.md`.
+Manual mode installs no handlers. Forward envelopes and the owned tagged monitor messages to
+`Solve.Lookup.handle_message/1`. Helper mode likewise requires the host process to handle its
+messages. `Solve.Lookup.cleanup/0` can drop retired-instance refs/monitors explicitly; it is not
+an unsubscribe API for live apps. Auto monitor cleanup is silent and does not try to render or
+query an app that has exited.

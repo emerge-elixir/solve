@@ -31,9 +31,8 @@ are not lumped together with rendering code.
 This project is still in early stages. Core API parts mentioned in this README are stable
 and are not expected to change significantly.
 
-Implementation is very sloppy and will eventually be completely replaced.
-
-Module documentation is coming soon.
+The runtime is actively evolving. Private runtime state and internal subscription protocols are not
+a stable API. See [the architecture guide](ARCHITECTURE.md) for lifecycle and consistency guarantees.
 
 Currently only properly tested with [Emerge](https://emerge.hexdocs.pm/readme.html)
 
@@ -50,6 +49,37 @@ def deps do
   ]
 end
 ```
+
+## Runtime and compatibility notes
+
+- Use `Solve.dispatch(app, target, event, payload)` for explicit app dispatch. Pass `%{}`
+  when there is no payload. Implicit `/2` and `/3` are for controller callback context;
+  there is no explicit-app three-argument overload.
+- Each app owns a controller supervisor. Normal shutdown, failed startup, and owner death
+  clean up its controllers. Initialization defaults to 5 seconds; override it with a positive
+  `controller_start_timeout` option in milliseconds. Controller shutdown is bounded to 1 second.
+- `Solve.subscribe/3` normally returns the controller's current value. If a live controller
+  cannot answer within 1 second, it returns the app's last accepted snapshot and retries
+  attachment in the background; a timeout does not restart the controller.
+- Dependency graphs are eventually consistent. Collection dependencies are installed as whole,
+  versioned snapshots, so user callbacks never enumerate partially applied membership/order changes.
+- `Solve.Lookup` caches values and event refs without coordinator calls on warm reads. Named-app
+  restarts trigger resubscription on the next lookup. Direct event tuples remain tied to the
+  original controller instance; use fresh lookup values after updates or explicit dispatch for routing.
+- Auto lookup mode handles its own `:solve_lookup_down` monitor messages. In manual/helper mode,
+  forward these messages to `Solve.Lookup.handle_message/1` as well as update envelopes:
+
+  ```elixir
+  def handle_info({:solve_lookup_down, _, :process, _, _} = message, state) do
+    Solve.Lookup.handle_message(message)
+    {:noreply, state}
+  end
+  ```
+
+Raw update subscribers implementing their own caches should compare the optional update `version`
+metadata. `Solve.Lookup` rejects obsolete versions automatically. Versionless manually constructed
+updates cannot overwrite an already versioned runtime ref. `Solve.Lookup.cleanup/0` clears retired
+app refs and monitors without unsubscribing from live apps.
 
 ## Writing an application
 
