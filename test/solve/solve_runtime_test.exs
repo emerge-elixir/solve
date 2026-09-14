@@ -537,9 +537,9 @@ defmodule Solve.RuntimeTest do
 
     state = :sys.get_state(app)
 
-    assert state.controller_status_by_name == %{derived: :started, source: :started}
-    assert is_pid(state.controller_pids_by_name.source)
-    assert is_pid(state.controller_pids_by_name.derived)
+    assert Map.keys(state.targets) |> Enum.sort() == [:derived, :source]
+    assert is_pid(state.targets.source.pid)
+    assert is_pid(state.targets.derived.pid)
   end
 
   test "controllers start, replace, stop, and restart from params changes" do
@@ -1083,7 +1083,7 @@ defmodule Solve.RuntimeTest do
   end
 
   defp await_target_callbacks(app, target, expected, attempts) do
-    callbacks = :sys.get_state(app).controller_callbacks_by_target |> Map.get(target)
+    callbacks = :sys.get_state(app).targets |> Map.fetch!(target) |> Map.fetch!(:callbacks)
 
     if callbacks == expected do
       callbacks
