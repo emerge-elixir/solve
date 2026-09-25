@@ -178,29 +178,82 @@ This raw API does not clear lookup caches or drain queued messages.
 
 ## Solve.Lookup
 
-Lookup caches refs by concrete app PID and target in the caller's process dictionary. Names
-(including global/via names) resolve to the current PID; aliases do not duplicate cached refs.
-A named-app restart is detected on the next read and causes a fresh subscription. An explicit
-old PID is never rebound to another app. Only reads that install or reuse a ref record aliases;
-dispatch does not change lookup ownership. Rebinding a name to another live app retains the old
-app's explicit refs. Release them before reading through the rebound name, or retain the old PID
-for cleanup.
+Lookup caches refs by canonical app PID and exact target in the caller's process dictionary.
+Aliases share refs, not reference counts. Warm remote PID reads and remote `{name, node}` reads
+use that cache with **zero RPC, resolver or snapshot calls**. Nil inactive refs and empty
+collections are real hits. Update acceptance and cleanup also avoid remote liveness probes.
+Local/global/via names retain resolver semantics; reserved global names are not remote tuples.
 
-An internal subscription snapshot returns value, kind, declared events, target PID(s), and version
-coherently. Item maps are augmented with reserved `:events_` tuples. Collection items are augmented
-using the snapshot's routing map. Augmentation happens on installation/update, not on each read.
-Warm singleton and collection reads make zero calls to the Solve coordinator. Resolving a remote
-or registry name can still involve registry/node work.
+A warm remote name stays pinned while its owned app monitor is valid, even if the registration
+is rebound while the old process lives. A new target (or unsubscribe followed by reacquisition)
+resolves the current registration. Old PID interests remain independently addressable. Explicit
+named dispatch resolves the current name without changing lookup aliases; copied direct event
+tuples and PID dispatch remain instance-bound. A send is not an admission or delivery receipt.
 
-Direct event tuples are instance-bound: previously copied tuples do not magically retarget after
-replacement. Process update envelopes and fetch fresh lookup values, or use explicit
-`Solve.dispatch/4` when lifecycle-safe routing is required.
+Cold resolution and snapshot acquisition share `config :solve, lookup_timeout: 5_000`.
+The budget must be a positive integer and is validated on acquisition, not cache hits. Explicit
+remote resolution uses a finite RPC timeout. Custom registry code and VM/distribution suspension
+are not hard real-time bounded by that budget. A failed snapshot may already have registered
+raw interest on the server; no local ref is not proof of physical detachment.
+
+Snapshots contain value, kind, target/event PIDs and version coherently. Augmentation happens
+on installation/update, not on every read. Runtime updates require an existing acquired ref,
+canonical app PID, matching kind and a newer nonnegative generation/revision. Unsolicited,
+versionless and retired updates cannot create ownership.
+
+### Availability and automatic recovery
+
+A matching owned app DOWN retires active values/routes/aliases and retains **desired interests**
+(original addresses and exact targets). A lazy owner-scoped watcher observes node-up and probes
+only unavailable bindings. Named apps can recover after app-only restart, node restart, or a
+client starting before the app. Pinned PIDs can recover after a partition if still alive, but
+never follow a replacement PID. Healthy bindings have no periodic liveness polling.
+
+```elixir
+config :solve,
+  lookup_timeout: 5_000,
+  lookup_recovery: [initial_delay: 250, max_delay: 30_000, jitter: 0.2]
+```
+
+Base delays double up to 30 seconds, with downward jitter bounded by 20%. The cap is a maximum
+delay, not an attempt count. Node-up can expedite pending discovery without overlapping work
+or resetting pacing. A watcher has at most one discovery probe in flight. It neither starts
+Erlang distribution nor selects cookies, peers or application authority.
+
+The watcher owns no controller subscriptions or data cache. It returns fenced candidate PIDs;
+the consumer sends its own subscribe/unsubscribe requests, preserving sender ordering. Recovery
+rounds have a finite shared request budget. Partial snapshots and newer pushes are staged in
+the consumer's refs until that binding's wanted set is ready. Then `handle_solve_updated/2`
+runs even for unchanged values, allowing the UI to replace obsolete event routes. Reconnection
+to a surviving app PID still resubscribes: the app may have retired the old subscriber.
+
+Recovery messages/timers are fenced against stale watcher, binding and timer tokens. Cancellation,
+new attempts and watcher crashes cannot resurrect removed interests. Internal watcher failure
+preserves desired interests and backoff; owner death cancels watcher/probe resources. Confirmed
+unknown targets or incompatible snapshots on a replacement are surfaced as unavailable, not
+fabricated as inactive controller values.
+
+`Solve.Lookup.status(app)` returns `:unknown`, `{:connected, pid}`, `{:reconnecting, reason}` or
+`{:unavailable, reason}` using local metadata only. Initial cold reads can exit while starting
+recovery. Reads of a watched unavailable binding exit immediately, without restarting backoff;
+additional offline targets are retained as desired interests. Status-aware rendering can keep
+its last scene or display an offline indicator. The optional auto-mode lifecycle callback is
+`handle_solve_connection_changed(app_address, status, state)`; it returns `{:ok, state}` and
+runs before a recovery data callback. Retry failures within the same phase do not spam it.
+Readiness is per requested address: consumers observing several app addresses must gate each
+one independently, since updates from a healthy binding can arrive while another is offline.
+
+Reachability means **last observed lifecycle state**, not a heartbeat guarantee. Backoff begins
+at detected failure; a short silent WiFi stall may produce no DOWN at all. Transport-buffered
+actions may arrive late. Lookup adds no replay, expiration, hardware cancellation or authority
+failover. Applications must still enforce command freshness/admission and decide offline UI.
 
 ### Releasing lookup interests
 
 `Solve.Lookup.unsubscribe/1,2` operates on the calling process's cached interest. It uses an
 explicit PID or a previously acquired alias's cached PID, never a freshly resolved name. An
-unknown alias or missing target ref is a local `:ok` no-op, even if a raw subscription exists.
+unknown alias or missing interest is a local `:ok` no-op, even if a raw subscription exists.
+A pending interest without a ref is canceled locally without resolving a replacement name.
 A new acquisition through a reused name binds that alias to the new instance; there are no
 historical acquisition handles or per-alias reference counts.
 
@@ -212,8 +265,9 @@ after an error is a local no-op, not a physical retry. Use raw unsubscribe with 
 when that confirmation is needed.
 
 Only the requested target is removed; collection sources and separately acquired items remain
-independent. The last ref releases the owned app monitor and all its aliases. No tombstones or
-cleanup workers are retained. Updates cannot create refs, so queued messages are ignored while
+independent. Cancellation removes equivalent desired routes as well as active refs. The last ref
+releases the owned app monitor/aliases, and the last pending interest stops recovery work. Raw
+unsubscribe alone does not edit Lookup intent; use Lookup unsubscribe to prevent recovery. Updates cannot create refs, so queued messages are ignored while
 the target is absent. An explicit later read reacquires it; versions still govern update ordering
 after reacquisition, without introducing per-subscription message epochs.
 
@@ -222,16 +276,14 @@ returned event tuples. Render code that reads the target again intentionally res
 
 ### Auto, manual, and helper modes
 
-Auto mode installs handlers for nil, `%Solve.Message{}`, and owned tagged monitor messages:
-`{:solve_lookup_down, ref, :process, app_pid, reason}`. Other DOWN messages remain the caller's
-responsibility. Accepted updates invoke `handle_solve_updated/2` with updates grouped by app PID;
-obsolete updates and monitor cleanup return no updates. Update acceptance requires a valid version,
-a canonical app PID, and an existing ref acquired through `solve` or `collection`. Unsolicited,
-versionless, and name-addressed update envelopes return no updates without resolving addresses,
-subscribing, or creating cache metadata.
+Auto mode installs handlers for nil, `%Solve.Message{}`, the two owned DOWN tags
+`:solve_lookup_down` and `:solve_lookup_watcher_down`, and private three-tuples
+`{:solve_lookup, kind, payload}`. Ordinary updates and completed restorations return changes
+grouped by app PID. DOWN does not invoke a data callback with fake nil values; the optional
+connection callback handles lifecycle UI. Foreign monitor refs do not alter Lookup ownership.
 
-Manual mode installs no handlers. Forward envelopes and the owned tagged monitor messages to
-`Solve.Lookup.handle_message/1`. Helper mode likewise requires the host process to handle its
-messages. `Solve.Lookup.cleanup/0` can drop retired-instance refs/monitors explicitly; it is not
-an unsubscribe API for live apps. Auto monitor cleanup is silent and does not try to render or
-query an app that has exited.
+Manual and helper modes install no handlers. Forward all of the above Lookup envelopes to
+`Solve.Lookup.handle_message/1`, and rerender when its result is nonempty. Inspect `status/1`
+for lifecycle UI. Ignoring the recovery messages prevents automatic restoration. Cleanup does
+not drain the mailbox or probe remote nodes; it only retires known-dead local apps and orphan
+active aliases. It is not an unsubscribe API and does not cancel still-wanted recovery intent.

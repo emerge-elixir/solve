@@ -920,6 +920,87 @@ Counter(4): 20
 :ok
 ```
 
+## Looking up data on another node
+
+Our application and its presenter don't have to run on the same node.
+Instead of an app PID, we can give Lookup its registered name and node.
+
+Let's make a small presenter that shows the number of counters in our application,
+and a waiting message when the application is unavailable.
+
+```elixir
+defmodule MyApp.RemotePresenter do
+  use GenServer
+  use Solve.Lookup
+
+  def start_link(app), do: GenServer.start_link(__MODULE__, app, name: __MODULE__)
+  def show(), do: GenServer.call(__MODULE__, :show) |> IO.puts()
+
+  @impl GenServer
+  def init(app), do: {:ok, %{app: app, scene: render(app)}}
+
+  @impl GenServer
+  def handle_call(:show, _from, state), do: {:reply, state.scene, state}
+
+  @impl Solve.Lookup
+  def handle_solve_updated(_updated, state) do
+    {:ok, %{state | scene: render(state.app)}}
+  end
+
+  @impl Solve.Lookup
+  def handle_solve_connection_changed(_app, {:connected, _pid}, state), do: {:ok, state}
+
+  def handle_solve_connection_changed(_app, _status, state) do
+    {:ok, %{state | scene: "Waiting for application..."}}
+  end
+
+  defp render(app) do
+    counter = solve(app, :n_counters)
+    "Number of counters: #{counter.count}"
+  catch
+    :exit, _reason -> "Waiting for application..."
+  end
+end
+```
+
+The catch lets our presenter start before the application is available.
+Lookup keeps trying to connect, and calls `handle_solve_updated` when it has data.
+The connection callback handles the other direction: it replaces the scene with
+our waiting message when Lookup detects that the application has disconnected.
+
+With the two Erlang nodes already connected, we can start the presenter first:
+
+```
+iex(1)> MyApp.RemotePresenter.start_link({MyApp.App, :"app@my-computer"})
+{:ok, #PID<0.201.0>}
+iex(2)> MyApp.RemotePresenter.show()
+Waiting for application...
+:ok
+```
+
+On `app@my-computer`, start the application from the previous example:
+
+```
+iex(1)> MyApp.App.start_link()
+{:ok, #PID<0.199.0>}
+```
+
+Once Lookup has connected to the application, our presenter shows its state:
+
+```
+iex(3)> MyApp.RemotePresenter.show()
+Number of counters: 0
+:ok
+```
+
+Updates arrive just as they did with a local app. If the application stops and
+starts again, Lookup subscribes again and our presenter renders its new state.
+We use a registered name here because the replacement application has a different PID.
+
+Retries use exponential backoff, up to 30 seconds between attempts. See the
+[Lookup architecture notes](ARCHITECTURE.md#availability-and-automatic-recovery)
+for configuration and manual message handling.
+
 ## Acknowledgements and similar projects
 
 Solve is based on [Keechma Next](https://github.com/keechma/keechma-next/), a clojurescript web framework.

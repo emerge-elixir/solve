@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Make warm remote Lookup reads, pushed updates and cleanup query-free using owned
+  process monitors instead of synchronous liveness/name RPCs.
+- Add finite cold-acquisition budgets and fix global atom-key name classification.
+- Retain Lookup subscription intent across outages and automatically restore named
+  apps with owner-scoped watching and capped exponential backoff. Add cached
+  `status/1` and optional `handle_solve_connection_changed/3` lifecycle callbacks.
+- Fence recovery/cancellation races and notify data consumers after fresh snapshots
+  and event routes are installed. Unsubscribe now cancels pending recovery intent.
+- Remote warm names stay pinned until invalidation/reacquisition. Manual/helpers
+  users must forward the new private recovery messages; see the README for migration.
+
 ## [0.2.3] - 2026-09-14
 
 ### Added
