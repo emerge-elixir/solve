@@ -159,8 +159,8 @@ defmodule Solve do
   end
 
   @doc false
-  def subscribe_snapshot(app, target, subscriber \\ self()) do
-    GenServer.call(app, {:snapshot, target, subscriber})
+  def subscribe_snapshot(app, target, subscriber \\ self(), timeout \\ 5_000) do
+    GenServer.call(app, {:snapshot, target, subscriber}, timeout)
   end
 
   defp resolve_current_app! do

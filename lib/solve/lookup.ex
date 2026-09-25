@@ -1,6 +1,11 @@
 defmodule Solve.Lookup do
   @moduledoc """
   Process-local facade for interacting with a Solve app.
+
+  Warm remote reads use owned process monitors rather than synchronous liveness
+  or name-resolution RPCs. Remote names stay pinned until invalidation or a cold
+  acquisition. Configure a finite cold-request budget with `:lookup_timeout`
+  under application `:solve` (default: 5,000 ms).
   """
 
   defmodule Ref do
@@ -23,6 +28,7 @@ defmodule Solve.Lookup do
   @cache_key {__MODULE__, :cache}
   @down_tag :solve_lookup_down
 
+  alias Solve.Lookup.Transport
   alias Solve.Update
 
   @type target :: Solve.controller_target()
@@ -291,11 +297,11 @@ defmodule Solve.Lookup do
         %{}
 
       ref ->
-        if alive?(app) do
-          accept_update(update, ref)
-        else
+        if locally_dead?(app) do
           forget_app(app)
           %{}
+        else
+          accept_update(update, ref)
         end
     end
   end
@@ -322,7 +328,7 @@ defmodule Solve.Lookup do
   @doc "Drops cached refs and monitors for retired local app instances. No live subscriptions are removed."
   @spec cleanup() :: :ok
   def cleanup do
-    Enum.each(cache().apps, fn {pid, _} -> if not alive?(pid), do: forget_app(pid) end)
+    Enum.each(cache().apps, fn {pid, _} -> if locally_dead?(pid), do: forget_app(pid) end)
     cache = cache()
     aliases = Map.filter(cache.aliases, fn {_, pid} -> Map.has_key?(cache.apps, pid) end)
     Process.put(@cache_key, %{cache | aliases: aliases})
@@ -331,29 +337,50 @@ defmodule Solve.Lookup do
 
   defp read_ref(app, target) do
     app = context_app!(app)
-    previous = Map.get(cache().aliases, app)
-    if previous != nil and not alive?(previous), do: forget_app(previous)
-    pid = resolve_app!(app)
-    ref = ensure_ref(pid, target)
+    ref = cached_ref(app, target) || acquire(app, target)
 
     if ref != nil and not is_pid(app) do
-      cache = cache()
-      Process.put(@cache_key, %{cache | aliases: Map.put(cache.aliases, app, pid)})
+      Process.put(@cache_key, %{cache() | aliases: Map.put(cache().aliases, app, ref.app)})
     end
 
     ref
   end
 
-  defp ensure_ref(app, target) do
-    case lookup_ref(app, target) do
-      nil ->
-        case Solve.subscribe_snapshot(app, target) do
-          nil -> nil
-          update -> put_ref(update)
-        end
+  defp cached_pid(app) do
+    cond do
+      is_pid(app) -> app
+      Transport.remote_name?(app) -> cache().aliases[app]
+      not Map.has_key?(cache().aliases, app) -> nil
+      true -> GenServer.whereis(app)
+    end
+  end
 
-      ref ->
-        ref
+  defp cached_ref(app, target) do
+    pid = cached_pid(app)
+
+    cond do
+      pid == nil ->
+        nil
+
+      locally_dead?(pid) ->
+        forget_app(pid)
+        nil
+
+      true ->
+        lookup_ref(pid, target)
+    end
+  end
+
+  defp acquire(app, target) do
+    deadline = Transport.deadline(Transport.timeout!())
+    pid = Transport.resolve!(app, deadline)
+    lookup_ref(pid, target) || restore_ref(pid, target, deadline)
+  end
+
+  defp restore_ref(pid, target, deadline) do
+    case Solve.subscribe_snapshot(pid, target, self(), Transport.remaining!(deadline)) do
+      nil -> nil
+      update -> put_ref(update)
     end
   end
 
@@ -456,42 +483,19 @@ defmodule Solve.Lookup do
 
   defp context_app!(app), do: app
 
-  defp resolve_app!(nil), do: resolve_app!(context_app!(nil))
-
-  defp resolve_app!(app) when is_pid(app) do
-    if alive?(app) do
-      app
-    else
-      forget_app(app)
-      exit({:noproc, {__MODULE__, :resolve_app, [app]}})
-    end
-  end
-
   defp resolve_app!(app) do
-    pid = resolve_named_app(app)
+    app = context_app!(app)
 
-    if is_pid(pid) do
-      pid
-    else
-      exit({:noproc, {__MODULE__, :resolve_app, [app]}})
-    end
-  end
+    cond do
+      not is_pid(app) ->
+        Transport.resolve!(app, Transport.deadline(Transport.timeout!()))
 
-  defp resolve_named_app({name, remote_node}) when is_atom(name) and is_atom(remote_node) do
-    case :rpc.call(remote_node, Process, :whereis, [name]) do
-      pid when is_pid(pid) -> pid
-      _ -> nil
-    end
-  end
+      locally_dead?(app) ->
+        forget_app(app)
+        exit({:noproc, {__MODULE__, :resolve_app, [app]}})
 
-  defp resolve_named_app(app), do: GenServer.whereis(app)
-
-  defp alive?(pid) when node(pid) == node(), do: Process.alive?(pid)
-
-  defp alive?(pid) do
-    case :rpc.call(node(pid), Process, :alive?, [pid]) do
-      true -> true
-      _ -> false
+      true ->
+        app
     end
   end
 
