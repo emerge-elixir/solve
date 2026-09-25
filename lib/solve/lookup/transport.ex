@@ -40,6 +40,17 @@ defmodule Solve.Lookup.Transport do
 
   def resolve!(app, _deadline), do: named!(app, GenServer.whereis(app))
 
+  def probe!(app, deadline) do
+    pid = resolve!(app, deadline)
+
+    alive? =
+      if node(pid) == node(),
+        do: Process.alive?(pid),
+        else: rpc!(node(pid), Process, :alive?, [pid], deadline)
+
+    if alive?, do: pid, else: missing!(app)
+  end
+
   defp named!(_app, pid) when is_pid(pid), do: pid
   defp named!(app, _), do: missing!(app)
   defp missing!(app), do: exit({:noproc, {Solve.Lookup, :resolve_app, [app]}})
