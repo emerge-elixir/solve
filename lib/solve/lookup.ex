@@ -1,6 +1,24 @@
 defmodule Solve.Lookup do
   @moduledoc """
-  Process-local facade for interacting with a Solve app.
+  Process-local, monitor-backed subscriptions to a Solve app.
+
+  Warm remote reads use the caller's cache without liveness or name-resolution
+  RPCs. An owned app DOWN invalidates values and event routes but retains desired
+  subscriptions. A lazy watcher restores them with capped exponential backoff.
+  No controller state or actions are forwarded through the watcher.
+
+  Configure `:lookup_timeout` (default 5,000 ms) and `:lookup_recovery`
+  (`initial_delay: 250, max_delay: 30_000, jitter: 0.2`) under application `:solve`.
+  The delay cap is not an attempt limit. Healthy apps are not polled.
+
+  `status/1` reports observed availability. Initial cold acquisition can exit;
+  reads while reconnecting exit immediately without additional network work.
+  Recovery invokes the ordinary data callback after fresh refs are installed.
+  The optional `handle_solve_connection_changed/3` callback allows offline UI and
+  input gating without attempting to render unavailable data.
+
+  Distribution startup, credentials, command admission and protection against
+  delayed transport delivery remain application responsibilities.
   """
 
   defmodule Ref do
@@ -23,12 +41,20 @@ defmodule Solve.Lookup do
   @cache_key {__MODULE__, :cache}
   @down_tag :solve_lookup_down
 
+  alias Solve.Lookup.Recovery
+  alias Solve.Lookup.Transport
+  alias Solve.Lookup.Watcher
   alias Solve.Update
 
   @type target :: Solve.controller_target()
 
   @callback handle_solve_updated(map(), term()) :: {:ok, term()}
-  @optional_callbacks handle_solve_updated: 2
+  @type connection_status ::
+          :unknown | {:connected, pid()} | {:reconnecting, term()} | {:unavailable, term()}
+
+  @callback handle_solve_connection_changed(GenServer.server(), connection_status(), term()) ::
+              {:ok, term()}
+  @optional_callbacks handle_solve_updated: 2, handle_solve_connection_changed: 3
 
   defmacro __using__(opts \\ []) do
     %{imports: imports, mode: mode, handle_info_mode: handle_info_mode} =
@@ -47,13 +73,32 @@ defmodule Solve.Lookup do
             {:noreply, state}
           end
 
-          def handle_info({:solve_lookup_down, _ref, :process, _pid, _reason} = message, state) do
-            Solve.Lookup.handle_message(message)
-            {:noreply, state}
+          def handle_info({tag, _ref, :process, _pid, _reason} = message, state)
+              when tag in [:solve_lookup_down, :solve_lookup_watcher_down] do
+            Solve.Lookup.__handle_update__(
+              message,
+              state,
+              &handle_solve_updated/2,
+              &handle_solve_connection_changed/3
+            )
+          end
+
+          def handle_info({:solve_lookup, _kind, _payload} = message, state) do
+            Solve.Lookup.__handle_update__(
+              message,
+              state,
+              &handle_solve_updated/2,
+              &handle_solve_connection_changed/3
+            )
           end
 
           def handle_info(%Solve.Message{} = message, state) do
-            Solve.Lookup.__handle_update__(message, state, &handle_solve_updated/2)
+            Solve.Lookup.__handle_update__(
+              message,
+              state,
+              &handle_solve_updated/2,
+              &handle_solve_connection_changed/3
+            )
           end
         end
       end
@@ -61,14 +106,27 @@ defmodule Solve.Lookup do
   end
 
   @doc false
-  def __handle_update__(message, state, callback) do
-    case handle_message(message) do
-      updated when map_size(updated) == 0 ->
-        {:noreply, state}
+  def __handle_update__(
+        message,
+        state,
+        callback,
+        connection_callback \\ fn _, _, state -> {:ok, state} end
+      ) do
+    pending = Recovery.take_notifications()
+    updated = handle_message(message)
+    changes = Map.new(pending ++ Recovery.take_notifications())
 
-      updated ->
-        {:ok, next} = callback.(updated, state)
-        {:noreply, next}
+    state =
+      Enum.reduce(changes, state, fn {app, status}, acc ->
+        {:ok, next} = connection_callback.(app, status, acc)
+        next
+      end)
+
+    if map_size(updated) == 0 do
+      {:noreply, state}
+    else
+      {:ok, next} = callback.(updated, state)
+      {:noreply, next}
     end
   end
 
@@ -84,7 +142,15 @@ defmodule Solve.Lookup do
           "#{inspect(env.module)} must define handle_solve_updated/2 when using Solve.Lookup in :auto mode"
     end
 
-    quote(do: :ok)
+    if handle_info_mode == :auto and
+         not MapSet.member?(definitions, {:handle_solve_connection_changed, 3}) do
+      quote do
+        @impl Solve.Lookup
+        def handle_solve_connection_changed(_app, _status, state), do: {:ok, state}
+      end
+    else
+      quote(do: :ok)
+    end
   end
 
   @spec solve(target()) :: map() | nil
@@ -92,7 +158,7 @@ defmodule Solve.Lookup do
 
   @spec solve(GenServer.server() | nil, target()) :: map() | nil
   def solve(app, target) do
-    case read_ref(app, target) do
+    case read_ref(app, target, :item) do
       nil ->
         nil
 
@@ -110,7 +176,7 @@ defmodule Solve.Lookup do
 
   @spec collection(GenServer.server() | nil, atom()) :: Solve.Collection.t(map())
   def collection(app, source) when is_atom(source) do
-    case read_ref(app, source) do
+    case read_ref(app, source, :collection) do
       %Ref{kind: :collection, value: value} ->
         value
 
@@ -137,7 +203,8 @@ defmodule Solve.Lookup do
 
   Use an app PID or a name previously used to acquire a lookup. Names identify their
   cached app instance: this function never resolves a name to discover a replacement
-  app. An unknown alias or missing ref returns `:ok` without an app call. Passing
+  app. Pending recovery intent is canceled even when no active ref remains. An
+  unknown alias or missing interest returns `:ok` without an app call. Passing
   `nil` uses the calling process's `:solve_app` context.
 
   Removes only this target. Collection sources and individual items are independent;
@@ -145,6 +212,10 @@ defmodule Solve.Lookup do
   for an app also releases its lookup monitor and aliases. Queued updates cannot
   recreate a removed ref; a later `solve/2` or `collection/2` explicitly reacquires it.
   No update callback is invoked and previously returned event tuples remain usable.
+  Cancellation also removes equivalent recovery intent and fences queued retries;
+  releasing the last pending interest stops its watcher. Raw `Solve.unsubscribe`
+  alone does not cancel Lookup intent. Partial recovery refs use the same pinned
+  raw-detachment semantics as active refs.
 
   A raw reentrancy error preserves the cache unchanged. Other raw errors remove the
   ref but leave physical detachment unconfirmed. Outer app-call exits also remove the
@@ -160,15 +231,21 @@ defmodule Solve.Lookup do
     app = context_app!(app)
     pid = if is_pid(app), do: app, else: Map.get(cache().aliases, app)
 
-    case lookup_ref(pid, target) do
-      nil -> :ok
-      %Ref{} -> unsubscribe_ref(pid, target)
+    binding = Recovery.get_binding(app)
+    pid = pid || (binding && binding.pid)
+
+    if lookup_ref(pid, target) do
+      unsubscribe_ref(pid, target)
+    else
+      Recovery.cancel(app, pid, target)
+      :ok
     end
   end
 
   defp unsubscribe_ref(app, target) do
     if locally_dead?(app) do
-      forget_app(app)
+      Recovery.cancel(app, app, target)
+      retire_app(app, :noproc)
       :ok
     else
       case Solve.unsubscribe(app, target, self()) do
@@ -176,14 +253,17 @@ defmodule Solve.Lookup do
           error
 
         result ->
+          Recovery.cancel(app, app, target)
           forget_ref(app, target)
           result
       end
     end
   catch
     :exit, reason ->
+      Recovery.cancel(app, app, target)
+
       if app_gone?(app, reason) do
-        forget_app(app)
+        retire_app(app, :noproc)
         :ok
       else
         forget_ref(app, target)
@@ -247,9 +327,13 @@ defmodule Solve.Lookup do
   def events(_value), do: nil
 
   @doc """
-  Consumes update/dispatch envelopes, or owned `:solve_lookup_down` monitor messages.
+  Consumes update/dispatch envelopes and owned lifecycle/recovery messages.
 
-  Manual mode should forward the tagged monitor messages here as well as envelopes.
+  Manual/helpers consumers must forward `%Solve.Message{}`, both tagged DOWN forms
+  (`:solve_lookup_down`, `:solve_lookup_watcher_down`), and
+  `{:solve_lookup, kind, payload}` messages. Foreign monitor refs are ignored.
+  Successful recovery returns the same grouped `Updated` data as normal updates.
+  Use `status/1` to inspect availability in a manually wired consumer.
   Acquire a target with `solve/2` or `collection/2` before forwarding its updates.
   Only versioned updates carrying the canonical app PID for an existing ref are
   accepted. Unsolicited, versionless, obsolete, and retired-app updates are ignored;
@@ -258,16 +342,52 @@ defmodule Solve.Lookup do
   """
   @spec handle_message(
           Solve.Message.t()
-          | {:solve_lookup_down, reference(), :process, pid(), term()}
+          | {:solve_lookup_down | :solve_lookup_watcher_down, reference(), :process, pid(),
+             term()}
+          | {:solve_lookup, atom(), term()}
         ) :: map()
-  def handle_message({@down_tag, ref, :process, pid, _reason}) do
+  def handle_message({@down_tag, ref, :process, pid, reason}) do
     case Map.get(cache().apps, pid) do
-      %{monitor: ^ref} -> forget_app(pid)
+      %{monitor: ^ref} -> retire_app(pid, reason)
       _ -> :ok
     end
 
     %{}
   end
+
+  def handle_message({:solve_lookup_watcher_down, ref, :process, pid, _reason}) do
+    Recovery.watcher_down(ref, pid)
+    %{}
+  end
+
+  def handle_message({:solve_lookup, :recover, {watcher, app, token, pid}})
+      when is_pid(watcher) and is_reference(token) and is_pid(pid) do
+    case Recovery.candidate(watcher, app, token, pid) do
+      nil -> %{}
+      binding -> restore(app, pid, binding)
+    end
+  end
+
+  def handle_message({:solve_lookup, :failed, {watcher, app, token, failure, delay}}) do
+    case Recovery.failed(watcher, app, token, failure, delay) do
+      {:retire, pid, reason} -> retire_app(pid, reason)
+      _ -> :ok
+    end
+
+    %{}
+  end
+
+  def handle_message({:solve_lookup, :restart, token}) do
+    Recovery.restart(token)
+    %{}
+  end
+
+  def handle_message({:solve_lookup, :notify, nil}) do
+    Recovery.take_notifications()
+    %{}
+  end
+
+  def handle_message({:solve_lookup, _kind, _payload}), do: %{}
 
   def handle_message(%Solve.Message{type: :dispatch, payload: %Solve.Dispatch{} = dispatch}) do
     Solve.dispatch(
@@ -291,11 +411,11 @@ defmodule Solve.Lookup do
         %{}
 
       ref ->
-        if alive?(app) do
-          accept_update(update, ref)
-        else
-          forget_app(app)
+        if locally_dead?(app) do
+          retire_app(app, :noproc)
           %{}
+        else
+          accept_update(update, ref)
         end
     end
   end
@@ -313,7 +433,9 @@ defmodule Solve.Lookup do
           :item -> %Updated{refs: [ref.controller_name], collections: []}
         end
 
-      %{update.app => updated}
+      if Recovery.visible?(update.app, ref.controller_name),
+        do: %{update.app => updated},
+        else: %{}
     else
       %{}
     end
@@ -322,40 +444,175 @@ defmodule Solve.Lookup do
   @doc "Drops cached refs and monitors for retired local app instances. No live subscriptions are removed."
   @spec cleanup() :: :ok
   def cleanup do
-    Enum.each(cache().apps, fn {pid, _} -> if not alive?(pid), do: forget_app(pid) end)
+    Enum.each(cache().apps, fn {pid, _} -> if locally_dead?(pid), do: retire_app(pid, :noproc) end)
+
     cache = cache()
     aliases = Map.filter(cache.aliases, fn {_, pid} -> Map.has_key?(cache.apps, pid) end)
     Process.put(@cache_key, %{cache | aliases: aliases})
     :ok
   end
 
-  defp read_ref(app, target) do
+  @doc """
+  Reports the calling process's observed connection state, without resolving names,
+  polling processes, or performing network work. `nil` uses the current app context.
+
+  `{:connected, pid}` means this address's wanted set is installed and no failure has
+  been consumed. It is not an instantaneous health check: a silent network stall
+  can precede Erlang's failure detection. `:unknown` means no retained interest through that address.
+  Named apps automatically reconnect; a confirmed dead explicit PID is unavailable
+  and cannot follow a replacement. Unsubscribe to cancel or deliberately reacquire.
+  """
+  @spec status(GenServer.server() | nil) ::
+          :unknown | {:connected, pid()} | {:reconnecting, term()} | {:unavailable, term()}
+  def status(app), do: Recovery.status(context_app!(app))
+
+  defp read_ref(app, target, kind) do
     app = context_app!(app)
-    previous = Map.get(cache().aliases, app)
-    if previous != nil and not alive?(previous), do: forget_app(previous)
-    pid = resolve_app!(app)
-    ref = ensure_ref(pid, target)
+    Recovery.request(app, target, kind)
 
-    if ref != nil and not is_pid(app) do
-      cache = cache()
-      Process.put(@cache_key, %{cache | aliases: Map.put(cache.aliases, app, pid)})
-    end
-
-    ref
-  end
-
-  defp ensure_ref(app, target) do
-    case lookup_ref(app, target) do
+    case cached_ref(app, target, kind) do
       nil ->
-        case Solve.subscribe_snapshot(app, target) do
-          nil -> nil
-          update -> put_ref(update)
-        end
+        acquire(app, target, kind)
 
       ref ->
+        record_binding(app, ref, Recovery.config_for(ref.app))
         ref
     end
   end
+
+  defp cached_pid(app) do
+    cond do
+      is_pid(app) -> app
+      Transport.remote_name?(app) -> cache().aliases[app]
+      not Map.has_key?(cache().aliases, app) -> nil
+      true -> GenServer.whereis(app)
+    end
+  end
+
+  defp cached_ref(app, target, kind) do
+    pid = cached_pid(app)
+
+    cond do
+      pid == nil ->
+        nil
+
+      locally_dead?(pid) ->
+        retire_app(pid, :noproc)
+        Recovery.pending!(app)
+        nil
+
+      lookup_ref(pid, target) != nil and not Recovery.visible?(pid, target) ->
+        pending_read(app, pid, target, kind)
+
+      true ->
+        lookup_ref(pid, target)
+    end
+  end
+
+  defp pending_read(app, pid, target, kind) do
+    config = Recovery.config_for(pid)
+    Recovery.failed_acquisition(app, pid, target, kind, {:recovering, pid}, config)
+    Recovery.pending!(app)
+  end
+
+  defp acquire(app, target, kind) do
+    config = Watcher.config!()
+    deadline = Transport.deadline(config.timeout)
+    pid = acquire_pid(app, target, kind, config, deadline)
+
+    if lookup_ref(pid, target) != nil and not Recovery.visible?(pid, target),
+      do: pending_read(app, pid, target, kind)
+
+    try do
+      case lookup_ref(pid, target) || restore_ref(pid, target, deadline) do
+        nil ->
+          nil
+
+        ref ->
+          record_binding(app, ref, config)
+          ref
+      end
+    catch
+      :exit, reason ->
+        Recovery.failed_acquisition(app, pid, target, kind, reason, config)
+        :erlang.raise(:exit, reason, __STACKTRACE__)
+    end
+  end
+
+  defp acquire_pid(app, target, kind, config, deadline) do
+    Transport.resolve!(app, deadline)
+  catch
+    :exit, reason ->
+      Recovery.failed_acquisition(app, nil, target, kind, reason, config)
+      :erlang.raise(:exit, reason, __STACKTRACE__)
+  end
+
+  defp record_binding(app, ref, config) do
+    Recovery.remember(app, ref.app, ref.controller_name, ref.kind, config)
+
+    if not is_pid(app) do
+      Process.put(@cache_key, %{cache() | aliases: Map.put(cache().aliases, app, ref.app)})
+    end
+  end
+
+  defp restore(app, pid, binding) do
+    deadline = Transport.deadline(binding.config.timeout)
+
+    Enum.each(binding.targets, fn {target, kind} ->
+      ref = lookup_ref(pid, target) || restore_ref(pid, target, deadline)
+      if ref == nil, do: throw({:unknown_target, target})
+      if ref.kind != kind, do: throw({:changed_kind, target})
+    end)
+
+    if not is_pid(app) do
+      Process.put(@cache_key, %{cache() | aliases: Map.put(cache().aliases, app, pid)})
+    end
+
+    Recovery.complete(app)
+    restored_updates(pid, binding.targets)
+  rescue
+    error ->
+      Recovery.terminal(app, {:invalid_snapshot, Exception.message(error)})
+      %{}
+  catch
+    :exit, reason ->
+      if disconnected_call?(reason) do
+        retire_app(pid, disconnect_reason(reason))
+      else
+        Recovery.retry(app, reason)
+      end
+
+      %{}
+
+    :throw, reason ->
+      Recovery.terminal(app, reason)
+      %{}
+  end
+
+  defp restore_ref(pid, target, deadline) do
+    case Solve.subscribe_snapshot(pid, target, self(), Transport.remaining!(deadline)) do
+      nil -> nil
+      update -> put_ref(update)
+    end
+  end
+
+  defp restored_updates(pid, targets) do
+    refs = Map.take(cache().apps[pid].refs, Map.keys(targets))
+
+    updated =
+      Enum.reduce(refs, %Updated{refs: [], collections: []}, fn
+        {target, %{kind: :item}}, acc -> %{acc | refs: [target | acc.refs]}
+        {target, %{kind: :collection}}, acc -> %{acc | collections: [target | acc.collections]}
+      end)
+
+    %{pid => updated}
+  end
+
+  defp disconnected_call?({:noproc, _}), do: true
+  defp disconnected_call?({{:nodedown, _}, _}), do: true
+  defp disconnected_call?(_), do: false
+  defp disconnect_reason({:noproc, _}), do: :noproc
+  defp disconnect_reason(_), do: :noconnection
 
   defp put_ref(update) do
     value = augment_value(update)
@@ -456,43 +713,25 @@ defmodule Solve.Lookup do
 
   defp context_app!(app), do: app
 
-  defp resolve_app!(nil), do: resolve_app!(context_app!(nil))
-
-  defp resolve_app!(app) when is_pid(app) do
-    if alive?(app) do
-      app
-    else
-      forget_app(app)
-      exit({:noproc, {__MODULE__, :resolve_app, [app]}})
-    end
-  end
-
   defp resolve_app!(app) do
-    pid = resolve_named_app(app)
+    app = context_app!(app)
 
-    if is_pid(pid) do
-      pid
-    else
-      exit({:noproc, {__MODULE__, :resolve_app, [app]}})
+    cond do
+      not is_pid(app) ->
+        Transport.resolve!(app, Transport.deadline(Transport.timeout!()))
+
+      locally_dead?(app) ->
+        retire_app(app, :noproc)
+        exit({:noproc, {__MODULE__, :resolve_app, [app]}})
+
+      true ->
+        app
     end
   end
 
-  defp resolve_named_app({name, remote_node}) when is_atom(name) and is_atom(remote_node) do
-    case :rpc.call(remote_node, Process, :whereis, [name]) do
-      pid when is_pid(pid) -> pid
-      _ -> nil
-    end
-  end
-
-  defp resolve_named_app(app), do: GenServer.whereis(app)
-
-  defp alive?(pid) when node(pid) == node(), do: Process.alive?(pid)
-
-  defp alive?(pid) do
-    case :rpc.call(node(pid), Process, :alive?, [pid]) do
-      true -> true
-      _ -> false
-    end
+  defp retire_app(pid, reason) do
+    forget_app(pid)
+    Recovery.invalidate(pid, reason)
   end
 
   defp validate_options!(:helpers, _caller) do
