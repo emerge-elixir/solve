@@ -15,16 +15,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - elixir: "1.18.4"
-            otp: "27.3.4.3"
-          - elixir: "1.19.5"
-            otp: "28.3"
-          - elixir: "1.20.2"
-            otp: "29.0.5"
+          - elixir: "1.18.5"
+            otp: "27.3.4.18"
+          - elixir: "1.19.6"
+            otp: "28.5.0.7"
+          - elixir: "1.20.4"
+            otp: "29.1.1"
 
     steps:
       - name: Checkout source code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Set up Elixir and OTP
         uses: erlef/setup-beam@v1
@@ -33,7 +33,7 @@ jobs:
           otp-version: ${{ matrix.otp }}
 
       - name: Cache Mix dependencies and build
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             deps

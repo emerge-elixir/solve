@@ -1,17 +1,23 @@
 # Changelog
 
-## Unreleased
+## [0.3.0] - 2026-09-27
 
-- Make warm remote Lookup reads, pushed updates and cleanup query-free using owned
-  process monitors instead of synchronous liveness/name RPCs.
-- Add finite cold-acquisition budgets and fix global atom-key name classification.
-- Retain Lookup subscription intent across outages and automatically restore named
-  apps with owner-scoped watching and capped exponential backoff. Add cached
-  `status/1` and optional `handle_solve_connection_changed/3` lifecycle callbacks.
-- Fence recovery/cancellation races and notify data consumers after fresh snapshots
-  and event routes are installed. Unsubscribe now cancels pending recovery intent.
-- Remote warm names stay pinned until invalidation/reacquisition. Manual/helpers
-  users must forward the new private recovery messages; see the README for migration.
+### Added
+- Automatically restore Lookup subscriptions after outages and named app restarts, using owner-scoped watching and capped exponential backoff.
+- `Solve.Lookup.status/1` to read cached connection status and the optional `handle_solve_connection_changed/3` callback for lifecycle-aware consumers.
+- Configurable finite cold-acquisition timeouts and recovery backoff through `:lookup_timeout` and `:lookup_recovery`.
+
+### Changed
+- Warm remote Lookup reads, pushed updates, and cleanup no longer make synchronous liveness or name-resolution RPCs; they use owned process monitors instead.
+- Remote names stay pinned to their acquired app until invalidation and reacquisition.
+- Lookup retains subscription intent across outages. `Solve.Lookup.unsubscribe/1,2` cancels pending recovery as well as active subscriptions; cleanup and raw unsubscribe do not cancel recovery intent.
+- **Migration:** Manual and helper-mode consumers must forward owned DOWN messages and private `{:solve_lookup, kind, payload}` recovery messages to `Solve.Lookup.handle_message/1`. Auto mode handles these messages automatically. See [manual message handling](ARCHITECTURE.md#auto-manual-and-helper-modes).
+- Refresh development dependencies and Elixir/OTP and CI tooling while retaining Elixir 1.18 support.
+
+### Fixed
+- Correct global atom-key name classification.
+- Fence recovery and cancellation races so stale work cannot restore canceled subscriptions.
+- Notify data consumers after fresh snapshots and event routes are installed, even when recovered values are unchanged.
 
 ## [0.2.3] - 2026-09-14
 

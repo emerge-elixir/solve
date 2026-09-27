@@ -2,7 +2,7 @@ defmodule Solve.MixProject do
   use Mix.Project
 
   @description "Declarative UI agnostic state management architecture"
-  @version "0.2.3"
+  @version "0.3.0"
   @source_url "https://github.com/emerge-elixir/solve"
 
   def project do
@@ -39,9 +39,9 @@ defmodule Solve.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:ex_doc, "~> 0.34", only: :dev, runtime: false, warn_if_outdated: true},
-      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
-      {:dialyxir, "~> 1.4", only: [:dev], runtime: false}
+      {:ex_doc, "~> 0.40.4", only: :dev, runtime: false, warn_if_outdated: true},
+      {:credo, "~> 1.7.19", only: [:dev, :test], runtime: false},
+      {:dialyxir, "~> 1.4.8", only: [:dev], runtime: false}
     ]
   end
 
