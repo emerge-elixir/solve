@@ -77,6 +77,19 @@ internal state of `%{hello: "Hello"}`
 The second module defines an app that starts that controller under a name
 `:hello`
 
+`use Solve` also defines `child_spec/1`, so apps can be added directly to a supervision tree:
+
+```elixir
+children = [
+  {MyApp.App, name: MyApp.App, params: %{}}
+]
+
+Supervisor.start_link(children, strategy: :one_for_one)
+```
+
+The default child spec is a permanent worker with ID `{MyApp.App, name}`; the name
+falls back to the app module. This allows differently named instances under the same
+supervisor. You can override `child_spec/1` in your app when needed.
 
 Each example assumes a fresh app. Stop the previous one with `GenServer.stop(app_pid)`
 before starting a new app definition.
