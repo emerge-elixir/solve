@@ -8,6 +8,10 @@ defmodule Solve do
   Apps own a temporary-child supervisor. `start_link/1` accepts `:name`, `:params`,
   and a positive `:controller_start_timeout` in milliseconds (default 5,000).
   Controller shutdown is bounded to 1,000 ms.
+
+  `use Solve` defines an overridable `child_spec/1` for supervision. It starts the
+  app as a permanent worker with ID `{__MODULE__, name}`, where `name` defaults
+  to the app module. All child options are passed unchanged to `start_link/1`.
   """
 
   alias Solve.Collection
@@ -39,6 +43,20 @@ defmodule Solve do
         name = Keyword.get(opts, :name, __MODULE__)
         GenServer.start_link(__MODULE__, opts, name: name)
       end
+
+      @doc """
+      Returns a permanent worker child specification for this app.
+      """
+      def child_spec(opts) do
+        %{
+          id: {__MODULE__, Keyword.get(opts, :name, __MODULE__)},
+          start: {__MODULE__, :start_link, [opts]},
+          type: :worker,
+          restart: :permanent
+        }
+      end
+
+      defoverridable child_spec: 1
 
       @impl true
       def init(opts), do: Solve.Runtime.init(__MODULE__, opts)

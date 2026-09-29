@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.1] - 2026-09-29
+
+### Added
+- `use Solve` now generates an overridable `child_spec/1`, allowing apps to be added directly to supervision trees as permanent workers.
+- Default child IDs include the app module and configured name, allowing differently named instances of the same app under one supervisor.
+
 ## [0.3.0] - 2026-09-27
 
 ### Added
