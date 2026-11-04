@@ -275,9 +275,13 @@ defmodule Solve.Lookup do
   defp app_gone?(app, _reason), do: locally_dead?(app)
   defp locally_dead?(pid), do: node(pid) == node() and not Process.alive?(pid)
 
-  @type dispatch_event ::
+  @type event_binding ::
           {pid(), {:solve_event, atom()}} | {pid(), {:solve_event, atom(), term()}}
 
+  @type dispatch_event ::
+          event_binding() | {pid(), {:solve_event, atom(), term(), term()}}
+
+  @doc "Sends a direct event tuple, including one with an appended runtime payload."
   @spec dispatch(dispatch_event()) :: :ok
   def dispatch({pid, {:solve_event, _} = message}) when is_pid(pid) do
     send(pid, message)
@@ -289,9 +293,24 @@ defmodule Solve.Lookup do
     :ok
   end
 
-  @spec dispatch(target() | dispatch_event(), term()) :: :ok
+  def dispatch({pid, {:solve_event, _, _, _} = message}) when is_pid(pid) do
+    send(pid, message)
+    :ok
+  end
+
+  @doc """
+  Dispatches a named event to a target, or attaches a runtime payload to a direct
+  binding returned by `event/2` or `event/3`.
+
+  For `dispatch(binding, payload)`, the handler receives `payload` if the binding
+  has no fixed argument, or `{argument, payload}` if it does.
+  """
+  @spec dispatch(target() | event_binding(), term()) :: :ok
   def dispatch({pid, {:solve_event, event}}, payload) when is_pid(pid),
     do: dispatch({pid, {:solve_event, event, payload}})
+
+  def dispatch({pid, {:solve_event, event, argument}}, payload) when is_pid(pid),
+    do: dispatch({pid, {:solve_event, event, argument, payload}})
 
   def dispatch(target, event), do: dispatch(nil, target, event, %{})
 
@@ -304,7 +323,7 @@ defmodule Solve.Lookup do
   end
 
   @doc "Reads an instance-bound direct event tuple from a lookup item."
-  @spec event(map() | nil, atom()) :: dispatch_event() | nil
+  @spec event(map() | nil, atom()) :: event_binding() | nil
   def event(controller, event_name) when is_atom(event_name) do
     case events(controller) do
       nil -> nil
@@ -312,7 +331,15 @@ defmodule Solve.Lookup do
     end
   end
 
-  @spec event(map() | nil, atom(), term()) :: dispatch_event() | nil
+  @doc """
+  Builds an instance-bound direct event tuple with a fixed argument.
+
+  The handler receives the argument unchanged when no runtime payload is added.
+  If a sender appends a runtime payload to the message, or `dispatch/2` supplies one,
+  the handler receives `{argument, payload}` instead. Tuple arguments remain
+  nested, and `nil` and `false` are preserved as values.
+  """
+  @spec event(map() | nil, atom(), term()) :: event_binding() | nil
   def event(controller, event_name, payload) when is_atom(event_name) do
     case event(controller, event_name) do
       {pid, {:solve_event, ^event_name}} -> {pid, {:solve_event, event_name, payload}}

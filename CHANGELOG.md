@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.2] - 2026-11-04
+
+### Fixed
+- Deliver fixed arguments and appended event payloads together as `{argument, payload}`. Existing two- and three-field messages keep their behavior; four-field messages now use declared event handlers instead of controller `handle_info`.
+- Accept bindings with fixed arguments in `Solve.Lookup.dispatch/2`, and direct event tuples with appended payloads in `dispatch/1`.
+
 ## [0.3.1] - 2026-09-29
 
 ### Added

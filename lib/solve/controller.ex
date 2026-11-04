@@ -83,6 +83,13 @@ defmodule Solve.Controller do
 
   Declaring the same event at multiple arities is a compile error.
 
+  Senders can append a runtime payload to a direct event binding returned by
+  `Solve.Lookup.event/2` or `Solve.Lookup.event/3`. With no fixed argument, the
+  handler receives the runtime payload. With both a fixed argument and a runtime
+  payload, it receives `{argument, payload}` as its first input; the remaining
+  inputs (state, dependencies, callbacks and init params) are unchanged. Without
+  an appended payload, a fixed argument is delivered unchanged.
+
   ## Subscription Helpers
 
   - `subscribe(controller, subscriber \\ self())` registers the subscriber and returns the
@@ -110,6 +117,7 @@ defmodule Solve.Controller do
 
   - `{:solve_event, event}`
   - `{:solve_event, event, payload}`
+  - `{:solve_event, event, argument, payload}` (delivers `{argument, payload}`)
   - `%Solve.Message{}`
   - `%Solve.DependencyUpdate{}`
   - subscriber monitor `{:DOWN, ref, :process, pid, reason}` messages owned by Solve
@@ -356,6 +364,10 @@ defmodule Solve.Controller do
 
   def __handle_info__({:solve_event, event, payload}, state, _fallback) when is_atom(event),
     do: __handle_direct_event__(event, payload, state)
+
+  def __handle_info__({:solve_event, event, argument, payload}, state, _fallback)
+      when is_atom(event),
+      do: __handle_direct_event__(event, {argument, payload}, state)
 
   def __handle_info__(
         %Solve.Message{type: :update, payload: %Update{} = update},

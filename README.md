@@ -44,7 +44,7 @@ Add `solve` to your dependencies:
 ```elixir
 def deps do
   [
-    {:solve, "~> 0.3.1"}
+    {:solve, "~> 0.3.2"}
   ]
 end
 ```
@@ -882,6 +882,22 @@ We are using a few convenience helpers from Solve.Lookup here `solve`, `event`, 
 `solve` and `collection` are cached fetchers. `solve(app, :n_counters)` will fetch the state of the n_counters
 controller, subscribe to it and cache it to the process dictionary. Next time it is called it will
 use the value cached in process dictionary.
+
+Event bindings can carry a fixed argument alongside a payload supplied at
+dispatch time:
+
+```elixir
+binding = Solve.Lookup.event(controller, :update_item, 42)
+Solve.Lookup.dispatch(binding, %{title: "Updated"})
+# Calls update_item({42, %{title: "Updated"}}, state) on the controller.
+```
+
+Without a fixed argument (`event(controller, :update_item)`), the handler receives the
+runtime payload directly. With a fixed argument and runtime data, it receives
+`{argument, payload}` as its first input; state and the other callback inputs do
+not move. Sending a binding without runtime data keeps the fixed argument
+unchanged, or supplies `%{}` when there is no fixed argument. Tuple arguments are
+not flattened; `nil` and `false` remain ordinary values.
 
 You can use
 

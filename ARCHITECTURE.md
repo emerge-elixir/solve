@@ -175,6 +175,12 @@ This raw API does not clear lookup caches or drain queued messages.
 - Unknown/stopped targets and virtual collection sources silently ignore dispatch.
 - `controller_pid/2`, `controller_events/2`, and `controller_variant/2` expose routing metadata.
 - Undeclared events are logged and discarded.
+- Direct event messages accept `{:solve_event, event}`, `{:solve_event, event, payload}`,
+  and `{:solve_event, event, argument, payload}`. Their handler payloads are `%{}`, `payload`,
+  and `{argument, payload}` respectively. All three forms are reserved from controller
+  `handle_info`; callback arities and the remaining inputs are unchanged.
+- `Solve.Lookup.dispatch/1` sends direct event tuples, including appended runtime payloads.
+  `dispatch(binding, payload)` attaches runtime data to a binding from `event/2` or `event/3`.
 
 ## Solve.Lookup
 
