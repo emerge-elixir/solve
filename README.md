@@ -44,7 +44,7 @@ Add `solve` to your dependencies:
 ```elixir
 def deps do
   [
-    {:solve, "~> 0.3.2"}
+    {:solve, "~> 0.3.3"}
   ]
 end
 ```
@@ -511,6 +511,33 @@ make the whole graph eventually consistent but also for clarity. One of the
 main advantages of Solve is high level overview of application visible in singular file.
 Opposed to component systems that force you to read implementation
 of every component and its view function in order to figure out the topology.
+
+## I can also remember what happened around me
+
+If you need to update controller state whenever a dependency changes, before
+`expose/3` runs, use the optional `deps_changed/3` callback. For example, this
+controller remembers the highest credit count it has seen:
+
+```elixir
+defmodule MyApp.HighestCredits do
+  use Solve.Controller
+
+  @impl true
+  def init(_params, _dependencies), do: %{highest: nil}
+
+  @impl true
+  def deps_changed(state, %{credits: nil}, _params), do: state
+
+  def deps_changed(%{highest: nil}, %{credits: %{count: count}}, _params), do: %{highest: count}
+
+  def deps_changed(%{highest: highest}, %{credits: %{count: count}}, _params),
+    do: %{highest: max(highest, count)}
+end
+```
+
+Solve calls `deps_changed/3` before `expose/3` at startup and when a dependency
+value changes. The returned state is passed to `expose/3`; if the exposed value
+hasn't changed, no update is broadcast.
 
 ## By calling back I can reach anyone
 
