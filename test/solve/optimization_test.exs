@@ -1,7 +1,7 @@
 defmodule Solve.OptimizationTest do
   use ExUnit.Case, async: false
 
-  alias Solve.{Collection, Controller}
+  alias Solve.{Collection, Controller, DependencyUpdate}
 
   defmodule Item do
     use Solve.Controller, events: [:set]
@@ -113,6 +113,31 @@ defmodule Solve.OptimizationTest do
     def deps_changed(state, dependencies, params), do: super(state, dependencies, params)
   end
 
+  test "absent hooks do no callback/context work, while macro and super overrides remain enabled" do
+    patterns = [{Item, :deps_changed, 3}, {Controller, :run_deps_changed, 5}]
+
+    assert {_, [0, 0]} =
+             counts(patterns, fn ->
+               pid = start_supervised!({Item, params: true})
+               for value <- 1..3, do: send(pid, DependencyUpdate.replace(nil, :source, value))
+               assert :sys.get_state(pid).dependencies.source == 3
+             end)
+
+    macro = start_supervised!({MacroHook, params: true})
+    assert Controller.subscribe(macro).value == 1
+    send(macro, DependencyUpdate.replace(nil, :source, 1))
+    assert Controller.subscribe(macro).value == 2
+    super = start_supervised!({SuperHook, params: true})
+    assert Controller.subscribe(super).value == 0
+    send(super, DependencyUpdate.replace(nil, :special, true))
+    assert Controller.subscribe(super).value == 42
+
+    late = start_supervised!({LateHook, params: true})
+    assert Controller.subscribe(late).value == 1
+    send(late, DependencyUpdate.replace(nil, :source, 1))
+    assert Controller.subscribe(late).value == 2
+  end
+
   test "projection is reused during startup and updates; literal inactive targets never filter" do
     patterns = [{Graph, :keep, 2}, {Graph, :inactive_filter, 2}]
     assert {app, [10, 0]} = counts(patterns, fn -> start_supervised!({Graph, name: nil}) end)
@@ -144,6 +169,36 @@ defmodule Solve.OptimizationTest do
     assert Enum.to_list(valid) === [{1, nil}, {1.0, :float}, {:last, 3}]
     assert Enum.count(valid) == 3
     assert Collection.delete(valid, :missing) === valid
+  end
+
+  test "external fanout constructs one common snapshot, without merging encoded or aliased subscriptions" do
+    pid = start_supervised!({Item, params: true, solve_app: self(), generation: 1})
+
+    subscribers =
+      for _ <- 1..10,
+          do:
+            spawn(fn ->
+              receive do
+                :stop -> :ok
+              end
+            end)
+
+    on_exit(fn -> Enum.each(subscribers, &send(&1, :stop)) end)
+    Enum.each(subscribers, &Controller.subscribe(pid, &1))
+    Controller.subscribe_dependency(pid, self(), :left)
+    Controller.subscribe_dependency(pid, self(), :right)
+    Controller.subscribe_with(pid, self(), fn value -> {:encoded, value} end)
+    Controller.subscribe_with(pid, self(), fn _ -> nil end)
+
+    assert {_, [1]} =
+             counts([{Controller, :__snapshot__, 1}], fn ->
+               Controller.dispatch(pid, :set, 1)
+               :sys.get_state(pid)
+             end)
+
+    assert_receive %DependencyUpdate{key: :left, value: %{value: 1}, version: {1, 1}}
+    assert_receive %DependencyUpdate{key: :right, value: %{value: 1}, version: {1, 1}}
+    assert_receive {:encoded, %{value: 1}}
   end
 
   test "three failed bindings have one bounded retry chain even during repeated reconciliations" do

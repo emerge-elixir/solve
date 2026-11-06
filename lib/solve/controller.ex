@@ -212,6 +212,8 @@ defmodule Solve.Controller do
       @behaviour Solve.Controller
       @before_compile Solve.Controller
       @solve_controller_events events
+      Module.register_attribute(__MODULE__, :solve_controller_user_deps_changed, persist: true)
+
       Module.register_attribute(__MODULE__, :solve_controller_user_handle_info_arities,
         accumulate: true
       )
@@ -283,6 +285,10 @@ defmodule Solve.Controller do
     Module.put_attribute(env.module, :solve_controller_user_handle_info_arities, length(args))
   end
 
+  def __on_definition__(env, :def, :deps_changed, [_, _, _], _guards, _body) do
+    Module.put_attribute(env.module, :solve_controller_user_deps_changed, true)
+  end
+
   def __on_definition__(_env, _kind, _name, _args, _guards, _body), do: :ok
 
   defmacro __before_compile__(env) do
@@ -332,6 +338,10 @@ defmodule Solve.Controller do
       end
 
       def __solve_handle_info_arity__, do: @solve_controller_handle_info_arity
+      # Persisted metadata also includes definitions injected by later before_compile hooks.
+      # This capability is resolved once at initialization, never on the update path.
+      def __solve_deps_changed__,
+        do: __MODULE__.__info__(:attributes)[:solve_controller_user_deps_changed] == [true]
 
       defoverridable handle_info: 2
 
@@ -538,8 +548,13 @@ defmodule Solve.Controller do
     else
       dependencies = normalize_optional_map(Keyword.get(opts, :dependencies))
       callbacks = normalize_optional_map(Keyword.get(opts, :callbacks))
+      deps_changed? = module.__solve_deps_changed__()
       state = module.init(params, dependencies)
-      state = run_deps_changed(module, state, dependencies, params, solve_app)
+
+      state =
+        if deps_changed?,
+          do: run_deps_changed(module, state, dependencies, params, solve_app),
+          else: state
 
       exposed_state =
         validate_exposed_state!(
@@ -561,6 +576,7 @@ defmodule Solve.Controller do
          generation: Keyword.get(opts, :generation),
          revision: 0,
          dependency_versions: Keyword.get(opts, :dependency_versions, %{}),
+         deps_changed?: deps_changed?,
          subscribers: %{},
          subscriber_monitor_refs_by_pid: %{},
          external_subscription_refs_by_pid: %{}
@@ -628,23 +644,9 @@ defmodule Solve.Controller do
   end
 
   @doc false
-  def __handle_unsubscribe__(subscription_ref, %{subscribers: subscribers} = server_state)
+  def __handle_unsubscribe__(subscription_ref, server_state)
       when is_reference(subscription_ref) do
-    server_state =
-      case Map.get(subscribers, subscription_ref) do
-        nil ->
-          server_state
-
-        %{subscriber: subscriber, kind: {:external, _, _}} ->
-          server_state
-          |> delete_subscription(subscription_ref)
-          |> update_in([:external_subscription_refs_by_pid], &Map.delete(&1, subscriber))
-
-        _entry ->
-          delete_subscription(server_state, subscription_ref)
-      end
-
-    {:reply, :ok, server_state}
+    {:reply, :ok, delete_subscription(server_state, subscription_ref)}
   end
 
   @doc false
@@ -906,6 +908,11 @@ defmodule Solve.Controller do
     event in module.__events__()
   end
 
+  defp apply_versioned_dependency_update(%{deps_changed?: false} = server_state, update) do
+    server_state = apply_dependency_update(update, server_state)
+    put_in(server_state.dependency_versions[update.key], update.version)
+  end
+
   defp apply_versioned_dependency_update(server_state, update) do
     previous = Map.fetch(server_state.dependencies, update.key)
     server_state = apply_dependency_update(update, server_state)
@@ -1023,12 +1030,17 @@ defmodule Solve.Controller do
   end
 
   defp remove_subscriber(%{subscribers: subscribers} = server_state, subscriber) do
-    subscription_refs =
-      subscribers
-      |> Enum.filter(fn {_ref, entry} -> entry.subscriber == subscriber end)
-      |> Enum.map(fn {subscription_ref, _entry} -> subscription_ref end)
+    {monitor, monitors} = Map.pop(server_state.subscriber_monitor_refs_by_pid, subscriber)
+    if monitor, do: Process.demonitor(monitor, [:flush])
 
-    Enum.reduce(subscription_refs, server_state, &delete_subscription(&2, &1))
+    %{
+      server_state
+      | subscribers:
+          Map.reject(subscribers, fn {_ref, entry} -> entry.subscriber == subscriber end),
+        subscriber_monitor_refs_by_pid: monitors,
+        external_subscription_refs_by_pid:
+          Map.delete(server_state.external_subscription_refs_by_pid, subscriber)
+    }
   end
 
   defp refresh_exposed_state(server_state) do
@@ -1045,7 +1057,7 @@ defmodule Solve.Controller do
 
   defp maybe_broadcast_update(server_state, new_exposed_state) do
     if server_state.exposed_state === new_exposed_state do
-      %{server_state | exposed_state: new_exposed_state}
+      server_state
     else
       server_state = %{
         server_state
@@ -1059,8 +1071,20 @@ defmodule Solve.Controller do
   end
 
   defp broadcast_update(server_state, new_exposed_state) do
+    external_message =
+      if map_size(server_state.external_subscription_refs_by_pid) > 0,
+        do: Update.message(__snapshot__(server_state))
+
+    version = if server_state.generation, do: {server_state.generation, server_state.revision}
+
     Enum.each(server_state.subscribers, fn {_subscription_ref, entry} ->
-      case build_subscriber_message(entry, server_state, new_exposed_state) do
+      case build_subscriber_message(
+             entry,
+             server_state,
+             new_exposed_state,
+             external_message,
+             version
+           ) do
         nil -> :ok
         message -> send(entry.subscriber, message)
       end
@@ -1069,22 +1093,36 @@ defmodule Solve.Controller do
 
   defp build_subscriber_message(
          %{kind: {:external, _solve_app, _controller_name}},
-         server_state,
-         _new_exposed_state
+         _server_state,
+         _new_exposed_state,
+         external_message,
+         _version
        ) do
-    Update.message(__snapshot__(server_state))
+    external_message
   end
 
-  defp build_subscriber_message(%{kind: {:dependency, key}}, server_state, new_exposed_state) do
+  defp build_subscriber_message(
+         %{kind: {:dependency, key}},
+         server_state,
+         new_exposed_state,
+         _external_message,
+         version
+       ) do
     DependencyUpdate.replace(
       server_state.solve_app,
       key,
       new_exposed_state,
-      __snapshot__(server_state).version
+      version
     )
   end
 
-  defp build_subscriber_message(%{kind: {:internal, encoder}}, _server_state, new_exposed_state) do
+  defp build_subscriber_message(
+         %{kind: {:internal, encoder}},
+         _server_state,
+         new_exposed_state,
+         _external_message,
+         _version
+       ) do
     encoder.(new_exposed_state)
   end
 
