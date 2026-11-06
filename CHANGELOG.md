@@ -7,6 +7,13 @@
 
 ### Changed
 - Reserve `:deps_changed` from declared controller events; it names the new lifecycle callback.
+- Skip hook invocation, context setup and binding-value comparison for controllers without a `deps_changed/3` override.
+- Make already-owned, connected Lookup reads read-only while preserving local resolution and remote recovery/ownership semantics.
+- Reuse deterministic dependency projections within reconciliation and avoid filters for literal inactive params. Ordinary collection child revisions update one item without rebuilding membership/order/routes.
+- Enumerate collections incrementally, construct common broadcast snapshots once, and remove dead controller subscribers in one pass.
+
+### Fixed
+- Bound failed dependency attachment work to one fenced retry chain per target (initial attempt plus three retry rounds), preserving healthy bindings and preventing unrelated reconciliation from resetting the budget.
 
 ## [0.3.2] - 2026-11-04
 

@@ -118,12 +118,19 @@ Controllers may implement `deps_changed(state, dependencies, init_params)` to
 return new user state before exposure. The generated default is identity; the
 lifecycle name `:deps_changed` is reserved from declared events.
 
-Startup calls `init/2`, then `deps_changed/3` once with the full initial dependency
-map (including an empty map), stores its result, and calls `expose/3`. The initial
+For controllers implementing the hook, startup calls `init/2`, then `deps_changed/3`
+once with the full initial dependency map (including an empty map), stores its result,
+and calls `expose/3`. The initial
 exposed revision remains zero. Later dependency messages pass the existing app/
 version admission checks, install the binding and version, then run the hook only
 if the binding value changed under exact comparison (`!==`). Comparing
 `Map.fetch/2` results distinguishes an absent binding from a present `nil`.
+
+Compile-time definition metadata identifies hook overrides, including macros and
+`super`; the capability is resolved once at controller initialization. Controllers
+without an override skip the identity call, hook context setup and old/new binding
+comparison entirely. Their existing exposure schedule and version checks remain
+unchanged. The overridable identity function remains available to explicit callers.
 
 The hook sees the complete current dependency map, with aliases and collection
 order preserved. Its result is stored before exposure and survives even if the
@@ -151,13 +158,29 @@ A dependent subscribes directly to its running singleton source. The initial han
 later `%Solve.DependencyUpdate{op: :replace}` messages carry a complete value and version.
 The dependent atomically replaces that binding and recomputes exposure only for newer versions.
 On source replacement, the app reattaches the dependent; on stop it sends a versioned nil value.
-Failed attachment attempts are retried a bounded number of times.
+Failed attachments share one retry chain per dependent target, fenced by target
+generation and a chain token. Only missing attachments are retried; healthy bindings
+remain attached. There are at most three retry rounds after the initial attempt.
+Ordinary reconciliation neither adds parallel timers nor resets an exhausted budget.
+A changed failed source PID starts a fresh chain; success or target retirement cancels
+it. Exhaustion alone does not restart a live controller. This bookkeeping concerns
+subscription acquisition, not scheduling graph computation.
 
 ### Collection bindings: app-owned atomic snapshots
 
-The app already observes each collection child for lifecycle decisions. Accepted child updates
-rebuild the collection source. Filtered and unfiltered dependency values are derived exclusively
-from that accepted source snapshot and sent as versioned `:replace` dependency messages.
+The app already observes each collection child for lifecycle decisions. An ordinary
+accepted child value revision replaces one item in the collection snapshot, retaining
+its order and routes. Membership/order and lifecycle changes still materialize the
+collection. Filtered and unfiltered dependency values are derived exclusively from
+that accepted source snapshot and sent as versioned `:replace` dependency messages.
+
+Reconciliation avoids dependency projection for literal inactive params, and normalizes
+the built-in default params function once at runtime setup. Active reconciliation
+reuses projected dependency values across params, startup and snapshot binding delivery.
+Filters must return deterministic results for a given snapshot; invocation counts
+are not a callback contract. Arbitrary dynamic params/collect callbacks are not cached
+across updates. Live singleton subscription handshakes still supply their current
+snapshot, even when it is newer than the coordinator's accepted value.
 
 The dependent installs the whole collection before running `expose/3`. It never sees membership,
 items, and order from different revisions. There are no runtime direct child-to-dependent
@@ -171,7 +194,9 @@ writer and apply its batch atomically.
 Low-level standalone controller tests/clients may still use the existing collection patch
 constructors. Public `Collection.reorder/2` requires a unique permutation of current keys and
 rejects invalid input immediately. `Collection.new/1` builds ordered collections in one pass and
-rejects duplicates. Numeric keys such as `1` and `1.0` are distinct.
+rejects duplicates. Numeric keys such as `1` and `1.0` are distinct. Enumerable reduction
+fetches items in ID order only as consumed, including correct halt/suspend continuations;
+count uses the items-map size. Explicit `to_list/1` still materializes the whole collection.
 
 ## External APIs
 
@@ -222,6 +247,11 @@ Aliases share refs, not reference counts. Warm remote PID reads and remote `{nam
 use that cache with **zero RPC, resolver or snapshot calls**. Nil inactive refs and empty
 collections are real hits. Update acceptance and cleanup also avoid remote liveness probes.
 Local/global/via names retain resolver semantics; reserved global names are not remote tuples.
+
+A connected address already owning the requested target/kind takes a read-only path:
+no configuration/visibility scans, intent re-registration or unchanged cache writes.
+First use through another alias/PID still records that address's intent. This fast
+path does not bypass local name rebinding, local death checks or staged recovery.
 
 A warm remote name stays pinned while its owned app monitor is valid, even if the registration
 is rebound while the old process lives. A new target (or unsubscribe followed by reacquisition)
