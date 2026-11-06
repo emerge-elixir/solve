@@ -102,7 +102,7 @@ defmodule Solve.Runtime do
         if same_generation?(update.version, current.version) and
              Update.newer?(update.version, current.version) do
           state = put_in(state.targets[update.controller_name].snapshot, update)
-          state = refresh_collection_item(update.controller_name, state)
+          state = refresh_collection_value(update.controller_name, state)
           noreply(reconcile_dependents(source_name(update.controller_name), state))
         else
           {:noreply, state}
@@ -147,11 +147,15 @@ defmodule Solve.Runtime do
     end
   end
 
-  def handle_info({:retry_bindings, target, generation, attempt}, state) do
-    if target_generation(target, state) == generation do
-      {:noreply, sync_bindings(target, state, attempt)}
-    else
-      {:noreply, state}
+  def handle_info({:retry_bindings, target, generation, token, attempt}, state) do
+    case Map.get(state.targets, target) do
+      %{binding_retry: %{token: ^token, attempt: ^attempt, timer: timer}} when timer != nil ->
+        if target_generation(target, state) == generation,
+          do: {:noreply, sync_bindings(target, state, true)},
+          else: {:noreply, state}
+
+      _ ->
+        {:noreply, state}
     end
   end
 
@@ -163,6 +167,18 @@ defmodule Solve.Runtime do
   def handle_info(_message, state), do: {:noreply, state}
 
   defp build_state(graph, supervisor, params, start_timeout) do
+    specs =
+      Map.new(graph.controller_specs_by_name, fn {name, spec} ->
+        spec =
+          if spec.params == (&ControllerSpec.default_params/1),
+            do: %{spec | params: true},
+            else: spec
+
+        {name, spec}
+      end)
+
+    graph = %{graph | controller_specs_by_name: specs}
+
     events =
       Map.new(graph.controller_specs_by_name, fn {name, spec} ->
         Code.ensure_loaded(spec.module)
@@ -238,20 +254,20 @@ defmodule Solve.Runtime do
 
   defp reconcile_source(name, state) do
     spec = Map.fetch!(state.controller_specs_by_name, name)
-    context = %{dependencies: dependency_values(spec, state), app_params: state.app_params}
-    params = if is_function(spec.params, 1), do: spec.params.(context), else: spec.params
+    {params, context} = reconciliation_inputs(spec, state)
+    dependencies = if context, do: context.dependencies, else: %{}
     previous = snapshot(name, state)
 
     case spec.variant do
       :singleton ->
-        case reconcile_target(name, spec, params, spec.callbacks, state) do
+        case reconcile_target(name, spec, params, spec.callbacks, state, dependencies) do
           {:ok, state} -> {:ok, previous !== snapshot(name, state), state}
           stop -> stop
         end
 
       :collection ->
         with {:ok, entries} <- collected_entries(spec, params, context),
-             {:ok, state} <- reconcile_items(spec, entries, state) do
+             {:ok, state} <- reconcile_items(spec, entries, state, dependencies) do
           ids = Enum.map(entries, &elem(&1, 0))
           state = materialize_collection(name, ids, state)
           {:ok, previous !== snapshot(name, state), state}
@@ -262,7 +278,20 @@ defmodule Solve.Runtime do
     end
   end
 
-  defp reconcile_items(spec, entries, state) do
+  defp reconciliation_inputs(spec, state) do
+    context = if is_function(spec.params, 1), do: dependency_context(spec, state)
+    params = if context, do: spec.params.(context), else: spec.params
+
+    context =
+      if params in [nil, false], do: context, else: context || dependency_context(spec, state)
+
+    {params, context}
+  end
+
+  defp dependency_context(spec, state),
+    do: %{dependencies: dependency_values(spec, state), app_params: state.app_params}
+
+  defp reconcile_items(spec, entries, state, dependencies) do
     desired = MapSet.new(entries, &elem(&1, 0))
 
     state =
@@ -276,7 +305,8 @@ defmodule Solve.Runtime do
              spec,
              opts.params,
              Map.merge(spec.callbacks, opts.callbacks),
-             acc
+             acc,
+             dependencies
            ) do
         {:ok, next} -> {:cont, {:ok, next}}
         stop -> {:halt, stop}
@@ -284,7 +314,7 @@ defmodule Solve.Runtime do
     end)
   end
 
-  defp reconcile_target(target, spec, params, callbacks, state) do
+  defp reconcile_target(target, spec, params, callbacks, state, dependencies) do
     current = Map.get(state.targets, target)
 
     cond do
@@ -292,18 +322,22 @@ defmodule Solve.Runtime do
         {:ok, stop_target(target, state)}
 
       current != nil and current.params == params ->
-        if current.callbacks !== callbacks,
-          do: Controller.update_callbacks(current.pid, callbacks)
+        state =
+          if current.callbacks !== callbacks do
+            Controller.update_callbacks(current.pid, callbacks)
+            put_in(state.targets[target].callbacks, callbacks)
+          else
+            state
+          end
 
-        state = put_in(state.targets[target].callbacks, callbacks)
-        {:ok, sync_bindings(target, state)}
+        {:ok, sync_bindings(target, state, false, dependencies)}
 
       true ->
-        start_target(target, spec, params, callbacks, state)
+        start_target(target, spec, params, callbacks, state, dependencies)
     end
   end
 
-  defp start_target(target, spec, params, callbacks, state) do
+  defp start_target(target, spec, params, callbacks, state, dependencies) do
     generation = state.generation + 1
     state = %{state | generation: generation}
 
@@ -313,7 +347,7 @@ defmodule Solve.Runtime do
       generation: generation,
       timeout: state.start_timeout,
       params: params,
-      dependencies: dependency_values(spec, state),
+      dependencies: dependencies,
       dependency_versions: dependency_versions(spec, state),
       callbacks: callbacks
     ]
@@ -337,7 +371,8 @@ defmodule Solve.Runtime do
           snapshot: initial,
           params: params,
           callbacks: callbacks,
-          bindings: %{}
+          bindings: %{},
+          binding_retry: nil
         }
 
         state = %{
@@ -350,13 +385,13 @@ defmodule Solve.Runtime do
           if is_atom(target), do: update_in(state.sources, &Map.delete(&1, target)), else: state
 
         if old, do: terminate_child(state.supervisor, old.pid)
-        state = sync_bindings(target, state)
+        state = sync_bindings(target, state, false, dependencies)
         state = attach_subscribers(target, state)
         {:ok, state}
 
       {:error, reason} ->
         case record_failure(target, reason, state) do
-          {:ok, state} -> start_target(target, spec, params, callbacks, state)
+          {:ok, state} -> start_target(target, spec, params, callbacks, state, dependencies)
           stop -> stop
         end
     end
@@ -413,6 +448,7 @@ defmodule Solve.Runtime do
         state
 
       {current, targets} ->
+        cancel_binding_retry(current.binding_retry)
         Enum.each(current.bindings, fn {_, entry} -> unsubscribe_binding(entry) end)
         Process.demonitor(current.monitor, [:flush])
         pending = Map.reject(state.pending_attachments, fn {{name, _}, _} -> name === target end)
@@ -438,60 +474,124 @@ defmodule Solve.Runtime do
     end
   end
 
-  defp sync_bindings(target, state, attempt \\ 0) do
+  defp sync_bindings(target, state, retry?, dependencies \\ nil) do
     spec = Map.fetch!(state.controller_specs_by_name, source_name(target))
+    retry = state.targets[target].binding_retry
 
-    Enum.reduce(spec.dependency_bindings, state, fn binding, acc ->
-      source = snapshot(binding.source, acc)
+    {state, failed} =
+      Enum.reduce(spec.dependency_bindings, {state, %{}}, fn binding, {acc, failed} ->
+        source = snapshot(binding.source, acc)
 
-      if binding.kind == :single and source.pid != nil,
-        do: sync_single_binding(target, binding, source, acc, attempt),
-        else: sync_snapshot_binding(target, binding, source, acc)
-    end)
+        attempt? = retry? or retry == nil or Map.get(retry.sources, binding.key) != source.pid
+        {acc, attached?} = sync_binding(target, binding, source, acc, attempt?, dependencies)
+        failed = if attached?, do: failed, else: Map.put(failed, binding.key, source.pid)
+        {acc, failed}
+      end)
+
+    finish_binding_retry(target, state, failed, retry, retry?)
   end
 
-  defp sync_single_binding(target, binding, source, state, attempt) do
+  defp sync_binding(
+         target,
+         %{kind: :single} = binding,
+         %{pid: pid} = source,
+         state,
+         attempt?,
+         _dependencies
+       )
+       when is_pid(pid),
+       do: sync_single_binding(target, binding, source, state, attempt?)
+
+  defp sync_binding(target, binding, source, state, _attempt?, dependencies),
+    do: {sync_snapshot_binding(target, binding, source, state, dependencies), true}
+
+  defp sync_single_binding(target, binding, source, state, attempt?) do
     record = Map.fetch!(state.targets, target)
     old = Map.get(record.bindings, binding.key)
 
-    if old != nil and old.pid == source.pid do
-      state
-    else
-      unsubscribe_binding(old)
+    cond do
+      old != nil and old.pid == source.pid ->
+        {state, true}
 
-      case safe_dependency_subscribe(source.pid, record.pid, binding.key) do
-        {:ok, value, ref} ->
-          send(record.pid, dependency_message(binding, value))
-          put_in(state.targets[target].bindings[binding.key], %{pid: source.pid, ref: ref})
+      not attempt? ->
+        {state, false}
 
-        :failed ->
-          schedule_binding_retry(target, target_generation(target, state), attempt)
-          update_in(state.targets[target].bindings, &Map.delete(&1, binding.key))
-      end
+      true ->
+        unsubscribe_binding(old)
+
+        case safe_dependency_subscribe(source.pid, record.pid, binding.key) do
+          {:ok, value, ref} ->
+            send(record.pid, dependency_message(binding, value))
+
+            {put_in(state.targets[target].bindings[binding.key], %{pid: source.pid, ref: ref}),
+             true}
+
+          :failed ->
+            {update_in(state.targets[target].bindings, &Map.delete(&1, binding.key)), false}
+        end
     end
   end
 
-  defp sync_snapshot_binding(target, binding, source, state) do
+  defp sync_snapshot_binding(target, binding, source, state, dependencies) do
     record = Map.fetch!(state.targets, target)
     old = Map.get(record.bindings, binding.key)
 
     if old == nil or Map.get(old, :version) != source.version do
       unsubscribe_binding(old)
-      send(record.pid, dependency_message(binding, source))
+      send(record.pid, dependency_message(binding, source, dependencies))
+      put_in(state.targets[target].bindings[binding.key], %{pid: nil, version: source.version})
+    else
+      state
     end
-
-    put_in(state.targets[target].bindings[binding.key], %{pid: nil, version: source.version})
   end
 
-  defp schedule_binding_retry(_target, _generation, attempt) when attempt >= @attachment_attempts,
-    do: :ok
+  defp finish_binding_retry(target, state, failed, retry, retry?) do
+    next =
+      cond do
+        map_size(failed) == 0 ->
+          cancel_binding_retry(retry)
+          nil
 
-  defp schedule_binding_retry(target, generation, attempt) do
-    Process.send_after(self(), {:retry_bindings, target, generation, attempt + 1}, @retry_delay)
+        retry == nil or Enum.any?(failed, fn {key, pid} -> Map.get(retry.sources, key) != pid end) ->
+          cancel_binding_retry(retry)
+          schedule_binding_retry(target, state, failed, make_ref(), 1)
+
+        retry? and retry.attempt < @attachment_attempts ->
+          schedule_binding_retry(target, state, failed, retry.token, retry.attempt + 1)
+
+        retry? ->
+          %{retry | sources: failed, timer: nil}
+
+        true ->
+          %{retry | sources: failed}
+      end
+
+    put_in(state.targets[target].binding_retry, next)
   end
 
-  defp dependency_message(binding, source) do
-    DependencyUpdate.replace(self(), binding.key, binding_value(binding, source), source.version)
+  defp schedule_binding_retry(target, state, sources, token, attempt) do
+    timer =
+      Process.send_after(
+        self(),
+        {:retry_bindings, target, target_generation(target, state), token, attempt},
+        @retry_delay
+      )
+
+    %{sources: sources, token: token, attempt: attempt, timer: timer}
+  end
+
+  defp cancel_binding_retry(%{timer: timer}) when is_reference(timer),
+    do: Process.cancel_timer(timer)
+
+  defp cancel_binding_retry(_retry), do: :ok
+
+  defp dependency_message(binding, source, dependencies \\ nil) do
+    value =
+      if dependencies,
+        do: Map.fetch!(dependencies, binding.key),
+        else: binding_value(binding, source)
+
+    DependencyUpdate.replace(self(), binding.key, value, source.version)
   end
 
   defp dependency_values(spec, state) do
@@ -534,15 +634,32 @@ defmodule Solve.Runtime do
     old = Map.fetch!(state.sources, source)
 
     if value !== old.exposed_state or routes !== old.routes do
-      {generation, revision} = old.version
-      next = %{old | exposed_state: value, routes: routes, version: {generation, revision + 1}}
-      state = put_in(state.sources[source], next)
-      notify(source, next, state)
-      state
+      publish_collection(old, value, routes, state)
     else
       state
     end
   end
+
+  defp publish_collection(old, value, routes, state) do
+    {generation, revision} = old.version
+    next = %{old | exposed_state: value, routes: routes, version: {generation, revision + 1}}
+    state = put_in(state.sources[old.controller_name], next)
+    notify(old.controller_name, next, state)
+    state
+  end
+
+  defp refresh_collection_value({source, id} = target, state) do
+    old = state.sources[source]
+    value = state.targets[target].snapshot.exposed_state
+
+    if Map.fetch!(old.exposed_state.items, id) === value do
+      state
+    else
+      publish_collection(old, Collection.put(old.exposed_state, id, value), old.routes, state)
+    end
+  end
+
+  defp refresh_collection_value(_target, state), do: state
 
   defp refresh_collection_item({source, _id}, state) do
     materialize_collection(source, state.sources[source].exposed_state.ids, state)
@@ -660,7 +777,10 @@ defmodule Solve.Runtime do
   end
 
   defp notify(target, value, state) do
-    Enum.each(Map.get(state.subscribers, target, MapSet.new()), &send(&1, Update.message(value)))
+    if subscribers = Map.get(state.subscribers, target) do
+      message = Update.message(value)
+      Enum.each(subscribers, &send(&1, message))
+    end
   end
 
   defp register_subscriber(target, subscriber, state) do

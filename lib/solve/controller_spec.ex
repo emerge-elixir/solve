@@ -51,6 +51,13 @@ defmodule Solve.ControllerSpec do
   @spec collection(atom()) :: collection_binding()
   def collection(source) when is_atom(source), do: {:solve_collection_binding, source, nil}
 
+  @doc """
+  Binds a filtered collection snapshot.
+
+  The predicate must return a deterministic result for an ID and exposed value.
+  Projections can be reused within one reconciliation; do not depend on how many
+  times the predicate is invoked. Filters are not evaluated for literal inactive params.
+  """
   @spec collection(atom(), (Solve.Collection.id(), map() -> boolean())) :: collection_binding()
   def collection(source, filter) when is_atom(source),
     do: {:solve_collection_binding, source, filter}

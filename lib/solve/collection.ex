@@ -49,11 +49,15 @@ defmodule Solve.Collection do
 
   @spec delete(t(item), id()) :: t(item) when item: var
   def delete(%__MODULE__{} = collection, id) do
-    %__MODULE__{
+    if Map.has_key?(collection.items, id) do
+      %__MODULE__{
+        collection
+        | ids: Enum.reject(collection.ids, &(&1 === id)),
+          items: Map.delete(collection.items, id)
+      }
+    else
       collection
-      | ids: Enum.reject(collection.ids, &(&1 === id)),
-        items: Map.delete(collection.items, id)
-    }
+    end
   end
 
   @doc "Reorders existing items. Raises ArgumentError unless IDs are a unique permutation of the keys."
@@ -68,9 +72,18 @@ defmodule Solve.Collection do
   end
 
   defimpl Enumerable do
-    def reduce(collection, acc, fun) do
-      Enumerable.List.reduce(Solve.Collection.to_list(collection), acc, fun)
-    end
+    def reduce(%Solve.Collection{ids: ids, items: items}, acc, fun),
+      do: reduce_ids(ids, items, acc, fun)
+
+    defp reduce_ids(_ids, _items, {:halt, acc}, _fun), do: {:halted, acc}
+
+    defp reduce_ids(ids, items, {:suspend, acc}, fun),
+      do: {:suspended, acc, &reduce_ids(ids, items, &1, fun)}
+
+    defp reduce_ids([], _items, {:cont, acc}, _fun), do: {:done, acc}
+
+    defp reduce_ids([id | rest], items, {:cont, acc}, fun),
+      do: reduce_ids(rest, items, fun.({id, Map.fetch!(items, id)}, acc), fun)
 
     def member?(collection, {id, item}) do
       case Solve.Collection.fetch(collection, id) do
@@ -81,7 +94,7 @@ defmodule Solve.Collection do
 
     def member?(_collection, _value), do: {:ok, false}
 
-    def count(%Solve.Collection{ids: ids}), do: {:ok, length(ids)}
+    def count(%Solve.Collection{items: items}), do: {:ok, map_size(items)}
 
     def slice(_collection), do: {:error, __MODULE__}
   end
