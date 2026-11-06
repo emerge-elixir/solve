@@ -193,7 +193,7 @@ defmodule Solve.Lookup.Recovery do
 
   def take_notifications do
     s = state()
-    store(%{s | notifications: %{}})
+    if map_size(s.notifications) > 0, do: store(%{s | notifications: %{}})
 
     Enum.flat_map(s.notifications, fn {app, expected} ->
       current = status(app)

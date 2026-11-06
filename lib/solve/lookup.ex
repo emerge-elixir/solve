@@ -498,6 +498,9 @@ defmodule Solve.Lookup do
     Recovery.request(app, target, kind)
 
     case cached_ref(app, target, kind) do
+      {:warm, ref} ->
+        ref
+
       nil ->
         acquire(app, target, kind)
 
@@ -518,6 +521,7 @@ defmodule Solve.Lookup do
 
   defp cached_ref(app, target, kind) do
     pid = cached_pid(app)
+    ref = lookup_ref(pid, target)
 
     cond do
       pid == nil ->
@@ -528,13 +532,26 @@ defmodule Solve.Lookup do
         Recovery.pending!(app)
         nil
 
-      lookup_ref(pid, target) != nil and not Recovery.visible?(pid, target) ->
+      owned_ref?(Recovery.get_binding(app), ref, target, kind) ->
+        {:warm, ref}
+
+      ref != nil and not Recovery.visible?(pid, target) ->
         pending_read(app, pid, target, kind)
 
       true ->
-        lookup_ref(pid, target)
+        ref
     end
   end
+
+  defp owned_ref?(
+         %{phase: :connected, pid: pid, targets: targets},
+         %Ref{app: pid, kind: kind},
+         target,
+         kind
+       ),
+       do: Map.get(targets, target) == kind
+
+  defp owned_ref?(_binding, _ref, _target, _kind), do: false
 
   defp pending_read(app, pid, target, kind) do
     config = Recovery.config_for(pid)

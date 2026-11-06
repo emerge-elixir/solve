@@ -1,7 +1,7 @@
 defmodule Solve.OptimizationTest do
   use ExUnit.Case, async: false
 
-  alias Solve.{Collection, Controller, DependencyUpdate}
+  alias Solve.{Collection, Controller, DependencyUpdate, Lookup}
 
   defmodule Item do
     use Solve.Controller, events: [:set]
@@ -136,6 +136,44 @@ defmodule Solve.OptimizationTest do
     assert Controller.subscribe(late).value == 1
     send(late, DependencyUpdate.replace(nil, :source, 1))
     assert Controller.subscribe(late).value == 2
+  end
+
+  test "warm reads and an empty notification drain perform no recovery writes or scans" do
+    app = start_supervised!({Graph, name: nil})
+    assert Lookup.solve(app, :sum).sum == 0
+    Lookup.collection(app, :items)
+    assert Lookup.solve(app, :inactive) == nil
+
+    patterns = [
+      {Lookup.Recovery, :config_for, 1},
+      {Lookup.Recovery, :visible?, 2},
+      {Lookup.Recovery, :remember, 5},
+      {Lookup.Recovery, :store, 1}
+    ]
+
+    assert {_, [0, 0, 0, 0]} =
+             counts(patterns, fn ->
+               for _ <- 1..100 do
+                 assert Lookup.solve(app, :sum).sum == 0
+                 assert Enum.count(Lookup.collection(app, :items)) == 10
+                 assert Lookup.solve(app, :inactive) == nil
+                 assert Lookup.Recovery.take_notifications() == []
+               end
+             end)
+  end
+
+  test "a new address for an existing ref records intent once, not on every read" do
+    app = start_supervised!({Graph, name: __MODULE__.Named})
+    Lookup.solve(__MODULE__.Named, :sum)
+    assert Lookup.status(app) == :unknown
+
+    assert {_, [1]} =
+             counts([{Lookup.Recovery, :remember, 5}], fn ->
+               Lookup.solve(app, :sum)
+               Lookup.solve(app, :sum)
+             end)
+
+    assert Lookup.status(app) == {:connected, app}
   end
 
   test "projection is reused during startup and updates; literal inactive targets never filter" do
