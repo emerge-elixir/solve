@@ -112,6 +112,39 @@ waiting for a child's initialization acknowledgement.
 
 ## Dependency propagation
 
+### Stateful dependency computation
+
+Controllers may implement `deps_changed(state, dependencies, init_params)` to
+return new user state before exposure. The generated default is identity; the
+lifecycle name `:deps_changed` is reserved from declared events.
+
+Startup calls `init/2`, then `deps_changed/3` once with the full initial dependency
+map (including an empty map), stores its result, and calls `expose/3`. The initial
+exposed revision remains zero. Later dependency messages pass the existing app/
+version admission checks, install the binding and version, then run the hook only
+if the binding value changed under exact comparison (`!==`). Comparing
+`Map.fetch/2` results distinguishes an absent binding from a present `nil`.
+
+The hook sees the complete current dependency map, with aliases and collection
+order preserved. Its result is stored before exposure and survives even if the
+exposed map is unchanged. Ordinary events and external messages do not invoke it.
+Equal-value/new-version updates still advance the version fence and retain the
+existing exposure schedule, but skip the hook. Startup handshakes with the
+already-installed version cannot repeat the initial computation. Routing-only
+collection changes likewise do not invalidate equal dependency data.
+
+The hook runs synchronously in the controller under `with_solve_app/2`; that
+context is restored before exposure, including on failure. Existing `init/2`
+and `expose/3` context behaviour is unchanged. Exceptions use normal startup/
+controller restart handling, not stale-state fallback. A replacement or restarted
+controller seeds fresh state from its available dependencies. Do not make
+synchronous coordinator calls from the hook during startup.
+
+This hook provides stateful local computation, not a durable event log or a
+transaction across the graph. It may see `nil` for stopped dependencies and
+intermediate snapshots across independent upstream updates. It introduces no
+new messages, subscription routes, transport metadata or implicit source dispatch.
+
 ### Single bindings: direct versioned updates
 
 A dependent subscribes directly to its running singleton source. The initial handshake and

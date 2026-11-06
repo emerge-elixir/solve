@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- Optional controller `deps_changed/3` lifecycle callback for stateful dependency computation. It runs after initialization and accepted dependency-value changes, and its returned user state is stored before exposure. Duplicate, stale and equal-valued updates do not rerun the hook; existing controllers retain identity behaviour by default.
+
+### Changed
+- Reserve `:deps_changed` from declared controller events; it names the new lifecycle callback.
+
 ## [0.3.2] - 2026-11-04
 
 ### Fixed

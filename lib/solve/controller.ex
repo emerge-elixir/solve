@@ -66,6 +66,30 @@ defmodule Solve.Controller do
         end
       end
 
+  ## Stateful Dependency Computation
+
+  Implement `c:deps_changed/3` to update user state before exposure when dependencies
+  change. The sequence at startup is `init/2`, `deps_changed/3`, then `expose/3`.
+  Later accepted dependency-value changes run `deps_changed/3` followed by `expose/3`.
+  The returned user state is retained for subsequent callbacks, so incremental
+  aggregates and input cursors can live in controller state rather than an external cache.
+
+  The callback receives the complete dependency map, using local alias keys and
+  complete collection snapshots. It is not a transport-message or collection-item
+  callback. Keep any previous input needed for incremental work in user state.
+
+  Ordinary events and user `handle_info` calls do not run this hook. Neither do
+  stale updates or newer versions with exactly equal dependency values. A source
+  replacement with identical data is not a value change; expose source identity
+  explicitly if it matters to the computation. Updates are ordered within this
+  controller, not atomically across the graph. Stopped dependencies may be `nil`.
+
+  `deps_changed/3` runs in Solve app context, like event handlers. Prefer state
+  transformations; synchronous calls back to the app during startup can deadlock.
+  Exceptions follow normal controller failure/restart handling. A restarted
+  controller initializes from its current dependency snapshot, not its old state.
+  The callback name `:deps_changed` is reserved and cannot be declared in `events:`.
+
   ## Params and Callbacks
 
   `init_params` can have any shape, but it must be truthy. If it is `nil` or `false`, the
@@ -162,7 +186,22 @@ defmodule Solve.Controller do
   """
   @callback expose(state(), dependencies(), init_params()) :: map()
 
-  @optional_callbacks expose: 3
+  @doc """
+  Updates user state from the current dependency snapshot before exposure.
+
+  Runs once after `init/2` (even with no dependencies), and after each accepted
+  update that changes a dependency value under exact comparison (`!==`). The
+  result becomes the controller's stored user state and is passed to `expose/3`.
+  Return user state directly, not a GenServer response tuple.
+
+  Defaults to returning the state unchanged. This hook does not run after ordinary
+  events or external messages, or for duplicate, stale or equal-valued dependency
+  updates. A private-state change is retained even when exposure does not change
+  and no update is broadcast.
+  """
+  @callback deps_changed(state(), dependencies(), init_params()) :: state()
+
+  @optional_callbacks expose: 3, deps_changed: 3
 
   defmacro __using__(opts) do
     events = validate_events_option!(opts, __CALLER__)
@@ -179,6 +218,9 @@ defmodule Solve.Controller do
 
       @impl Solve.Controller
       def expose(state, _dependencies, _init_params), do: state
+
+      @impl Solve.Controller
+      def deps_changed(state, _dependencies, _init_params), do: state
 
       def __events__, do: @solve_controller_events
 
@@ -231,7 +273,7 @@ defmodule Solve.Controller do
 
       def handle_info(_message, state), do: state
 
-      defoverridable expose: 3, handle_info: 2
+      defoverridable expose: 3, deps_changed: 3, handle_info: 2
       @on_definition Solve.Controller
     end
   end
@@ -497,6 +539,7 @@ defmodule Solve.Controller do
       dependencies = normalize_optional_map(Keyword.get(opts, :dependencies))
       callbacks = normalize_optional_map(Keyword.get(opts, :callbacks))
       state = module.init(params, dependencies)
+      state = run_deps_changed(module, state, dependencies, params, solve_app)
 
       exposed_state =
         validate_exposed_state!(
@@ -795,6 +838,12 @@ defmodule Solve.Controller do
           description:
             "Solve.Controller events must be a list of unique atoms, got: #{inspect(events)}"
 
+      :deps_changed in events ->
+        raise CompileError,
+          file: caller.file,
+          line: caller.line,
+          description: ":deps_changed is reserved for the deps_changed/3 lifecycle callback"
+
       true ->
         events
     end
@@ -858,8 +907,28 @@ defmodule Solve.Controller do
   end
 
   defp apply_versioned_dependency_update(server_state, update) do
+    previous = Map.fetch(server_state.dependencies, update.key)
     server_state = apply_dependency_update(update, server_state)
-    put_in(server_state.dependency_versions[update.key], update.version)
+    server_state = put_in(server_state.dependency_versions[update.key], update.version)
+
+    if previous !== Map.fetch(server_state.dependencies, update.key) do
+      state =
+        run_deps_changed(
+          server_state.module,
+          server_state.state,
+          server_state.dependencies,
+          server_state.params,
+          server_state.solve_app
+        )
+
+      %{server_state | state: state}
+    else
+      server_state
+    end
+  end
+
+  defp run_deps_changed(module, state, dependencies, params, solve_app) do
+    with_solve_app(solve_app, fn -> module.deps_changed(state, dependencies, params) end)
   end
 
   defp apply_dependency_update(

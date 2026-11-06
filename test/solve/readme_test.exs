@@ -60,6 +60,7 @@ defmodule Solve.ReadmeTest do
   alias Solve.ReadmeTest.Greeting
   alias Solve.ReadmeTest.Negative
   alias Solve.ReadmeTest.Presenter
+  alias Solve.ReadmeTest.Stateful
   alias Solve.ReadmeTest.Timers
 
   @readme_path Path.expand("../../README.md", __DIR__)
@@ -73,6 +74,16 @@ defmodule Solve.ReadmeTest do
   dependencies =
     Examples.modules(@readme, "There might be others and we may depend on each other")
 
+  stateful =
+    counter ++
+      Examples.modules(@readme, "Keeping derived state when dependencies change") ++
+      [
+        Examples.app("""
+        controller!(name: :credits, module: MyApp.Counter),
+        controller!(name: :highest_credits, module: MyApp.HighestCredits, dependencies: [:credits])
+        """)
+      ]
+
   callbacks = Examples.modules(@readme, "By calling back I can reach anyone")
   timers = Examples.modules(@readme, "In a nutshell I am a GenServer")
   collections = Examples.modules(@readme, "In a collective I retain my identity")
@@ -84,6 +95,7 @@ defmodule Solve.ReadmeTest do
         {__MODULE__.Counter, counter},
         {__MODULE__.Greeting, counter ++ Enum.take(dependencies, 2)},
         {__MODULE__.Negative, counter ++ dependencies},
+        {__MODULE__.Stateful, stateful},
         {__MODULE__.Callbacks, callbacks},
         {__MODULE__.Timers, callbacks ++ timers},
         {__MODULE__.Collections, [Enum.at(callbacks, 1)] ++ collections},
@@ -206,6 +218,45 @@ defmodule Solve.ReadmeTest do
     assert_update(app, :hello, %{greeting: "Hello Anon, you have 100 credits"})
     assert_update(app, :negative, nil)
     assert_receive {:DOWN, ^monitor, :process, ^alert, _}, 1_000
+  end
+
+  test "dependency computation example retains the highest credits and only broadcasts new highs" do
+    app = start_app(Stateful.App)
+    highest = Solve.controller_pid(app, :highest_credits)
+    assert Solve.subscribe(app, :highest_credits) == %{highest: 0}
+
+    Solve.dispatch(app, :credits, :increment, 100)
+    assert_update(app, :highest_credits, %{highest: 100})
+
+    for {event, amount, count} <- [{:decrement, 40, 60}, {:increment, 40, 100}] do
+      Solve.dispatch(app, :credits, event, amount)
+      assert Solve.subscribe(app, :credits) == %{count: count}
+      assert Solve.Controller.subscribe(highest) == %{highest: 100}
+
+      refute_received %Solve.Message{
+        payload: %Solve.Update{app: ^app, controller_name: :highest_credits}
+      }
+    end
+
+    Solve.dispatch(app, :credits, :increment, 1)
+    assert_update(app, :highest_credits, %{highest: 101})
+    assert Solve.controller_pid(app, :highest_credits) == highest
+  end
+
+  test "highest-credit example handles inactive dependencies and initially negative credits" do
+    highest =
+      start_supervised!({Stateful.HighestCredits, params: true, dependencies: %{credits: nil}})
+
+    assert Solve.Controller.subscribe(highest) == %{highest: nil}
+    send(highest, Solve.DependencyUpdate.replace(nil, :credits, %{count: -5}))
+    assert Solve.Controller.subscribe(highest) == %{highest: -5}
+    assert_receive %Solve.Message{payload: %Solve.Update{exposed_state: %{highest: -5}}}
+
+    for value <- [nil, %{count: -10}, %{count: -5}] do
+      send(highest, Solve.DependencyUpdate.replace(nil, :credits, value))
+      assert Solve.Controller.subscribe(highest) == %{highest: -5}
+      refute_received %Solve.Message{type: :update}
+    end
   end
 
   test "callbacks route credit changes to the notifications controller" do
