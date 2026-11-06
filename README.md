@@ -44,7 +44,7 @@ Add `solve` to your dependencies:
 ```elixir
 def deps do
   [
-    {:solve, "~> 0.3.2"}
+    {:solve, "~> 0.3.3"}
   ]
 end
 ```

@@ -1,16 +1,17 @@
 # Changelog
 
-## Unreleased
+## [0.3.3] - 2026-11-06
 
 ### Added
 - Optional controller `deps_changed/3` lifecycle callback for stateful dependency computation. It runs after initialization and accepted dependency-value changes, and its returned user state is stored before exposure. Duplicate, stale and equal-valued updates do not rerun the hook; existing controllers retain identity behaviour by default.
 
 ### Changed
-- Reserve `:deps_changed` from declared controller events; it names the new lifecycle callback.
+- **Breaking:** Reserve `:deps_changed` from declared controller events; it names the new lifecycle callback. Rename any existing event using this name before upgrading.
 - Skip hook invocation, context setup and binding-value comparison for controllers without a `deps_changed/3` override.
 - Make already-owned, connected Lookup reads read-only while preserving local resolution and remote recovery/ownership semantics.
 - Reuse deterministic dependency projections within reconciliation and avoid filters for literal inactive params. Ordinary collection child revisions update one item without rebuilding membership/order/routes.
 - Enumerate collections incrementally, construct common broadcast snapshots once, and remove dead controller subscribers in one pass.
+- Replace heading-dependent README scenarios with a compilation smoke test for complete module examples, without fixed prose or expected-output assertions.
 
 ### Fixed
 - Bound failed dependency attachment work to one fenced retry chain per target (initial attempt plus three retry rounds), preserving healthy bindings and preventing unrelated reconciliation from resetting the budget.
